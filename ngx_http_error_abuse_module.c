@@ -120,6 +120,9 @@ static ngx_int_t ngx_http_error_abuse_save(
     ngx_http_error_abuse_zone_t *zone, ngx_log_t *log);
 static ngx_int_t ngx_http_error_abuse_load(
     ngx_http_error_abuse_zone_t *zone, ngx_log_t *log);
+static ngx_int_t ngx_http_error_abuse_validate_snapshot(
+    ngx_http_error_abuse_zone_t *zone, u_char *p, u_char *last,
+    uint32_t records);
 static ngx_int_t ngx_http_error_abuse_variable_status(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_error_abuse_variable_count(
@@ -1247,11 +1250,40 @@ ngx_http_error_abuse_write_all(ngx_fd_t fd, u_char *data, size_t len)
 
     while (len != 0) {
         n = ngx_write_fd(fd, data, len);
-        if (n == NGX_ERROR) {
-            return NGX_ERROR;
+        if (n > 0) {
+            data += n;
+            len -= (size_t) n;
+            continue;
         }
-        data += n;
-        len -= n;
+
+        if (n == NGX_ERROR && ngx_errno == NGX_EINTR) {
+            continue;
+        }
+
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_error_abuse_read_all(ngx_fd_t fd, u_char *data, size_t len)
+{
+    ssize_t  n;
+
+    while (len != 0) {
+        n = ngx_read_fd(fd, data, len);
+        if (n > 0) {
+            data += n;
+            len -= (size_t) n;
+            continue;
+        }
+
+        if (n == NGX_ERROR && ngx_errno == NGX_EINTR) {
+            continue;
+        }
+
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -1297,6 +1329,7 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
             break;
         }
 
+        ngx_memzero(&record, sizeof(record));
         record.key_len = ean->key_len;
         record.event_count = (uint16_t) ean->event_count;
         record.blocked_until = (int64_t) ean->blocked_until;
@@ -1353,6 +1386,10 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     if (ngx_close_file(fd) == NGX_FILE_ERROR) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       ngx_close_file_n " \"%s\" failed", tmp);
+        (void) ngx_delete_file(tmp);
+        ngx_free(tmp);
+        ngx_free(buffer);
+        return NGX_ERROR;
     }
 
     if (ngx_rename_file(tmp, zone->persist.data) == NGX_FILE_ERROR) {
@@ -1375,7 +1412,6 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 {
     u_char                              *buffer, *p, *last;
     off_t                                file_size;
-    ssize_t                              n;
     uint32_t                             hash, record_index;
     ngx_fd_t                             fd;
     ngx_file_info_t                      fi;
@@ -1421,14 +1457,17 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         return NGX_ERROR;
     }
 
-    n = ngx_read_fd(fd, buffer, (size_t) file_size);
-    (void) ngx_close_file(fd);
-    if (n != file_size) {
+    if (ngx_http_error_abuse_read_all(fd, buffer, (size_t) file_size)
+        != NGX_OK)
+    {
         ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
                       ngx_read_fd_n " \"%V\" failed", &zone->persist);
+        (void) ngx_close_file(fd);
         ngx_free(buffer);
         return NGX_OK;
     }
+
+    (void) ngx_close_file(fd);
 
     header = (ngx_http_error_abuse_file_header_t *) buffer;
     if (ngx_memcmp(header->magic, NGX_HTTP_ERROR_ABUSE_FILE_MAGIC,
@@ -1445,6 +1484,18 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 
     p = buffer + sizeof(*header);
     last = buffer + file_size;
+
+    if (ngx_http_error_abuse_validate_snapshot(zone, p, last,
+                                               header->records)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "error_abuse persistence file \"%V\" is malformed",
+                      &zone->persist);
+        ngx_free(buffer);
+        return NGX_OK;
+    }
+
     now = ngx_time();
 
     ngx_shmtx_lock(&zone->shpool->mutex);
@@ -1486,7 +1537,9 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 
         ean->blocked_until = (record.blocked_until > (int64_t) now)
                              ? (time_t) record.blocked_until : 0;
-        ean->last_seen = (time_t) record.last_seen;
+        ean->last_seen = (record.last_seen > 0
+                          && record.last_seen <= (int64_t) now)
+                         ? (time_t) record.last_seen : now;
         ean->event_head = 0;
         ean->event_count = 0;
         events = ngx_http_error_abuse_events(ean);
@@ -1505,6 +1558,38 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     ngx_shmtx_unlock(&zone->shpool->mutex);
     ngx_free(buffer);
     return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_error_abuse_validate_snapshot(ngx_http_error_abuse_zone_t *zone,
+    u_char *p, u_char *last, uint32_t records)
+{
+    uint32_t                            i;
+    size_t                              payload;
+    ngx_http_error_abuse_file_record_t  record;
+
+    for (i = 0; i < records; i++) {
+        if ((size_t) (last - p) < sizeof(record)) {
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(&record, p, sizeof(record));
+        p += sizeof(record);
+
+        if (record.key_len == 0 || record.event_count > zone->threshold) {
+            return NGX_ERROR;
+        }
+
+        payload = (size_t) record.key_len
+                  + (size_t) record.event_count * sizeof(int64_t);
+        if ((size_t) (last - p) < payload) {
+            return NGX_ERROR;
+        }
+
+        p += payload;
+    }
+
+    return (p == last) ? NGX_OK : NGX_ERROR;
 }
 
 static ngx_http_error_abuse_req_ctx_t *
