@@ -8,6 +8,8 @@
 #include <ngx_http.h>
 #include <hiredis/async.h>
 #include <hiredis/adapters/poll.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
 #define NGX_HTTP_ERROR_ABUSE_VERSION       1
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
@@ -17,10 +19,13 @@
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN 8
 #define NGX_HTTP_ERROR_ABUSE_REDIS_TICK     5
 #define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT 1000
+#define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD 5
+#define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION 30
 
 typedef struct {
     ngx_str_t   host;
     ngx_str_t   prefix;
+    ngx_str_t   hmac_key;
     in_port_t   port;
     ngx_msec_t  timeout;
     ngx_flag_t  configured;
@@ -106,6 +111,8 @@ typedef struct {
     ngx_log_t                           *log;
     ngx_uint_t                           sequence;
     uint64_t                             nonce;
+    ngx_uint_t                           consecutive_failures;
+    time_t                               circuit_breaker_until;
     unsigned                             ready:1;
     unsigned                             exiting:1;
 } ngx_http_error_abuse_redis_worker_t;
@@ -115,7 +122,7 @@ typedef struct {
     uint32_t  version;
     uint32_t  threshold;
     uint32_t  records;
-    uint32_t  reserved;
+    uint32_t  crc32;
 } ngx_http_error_abuse_file_header_t;
 
 typedef struct {
@@ -553,16 +560,28 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     }
 
     if (ctx->zone == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: empty key, bypassing");
         return NGX_DECLINED;
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "error_abuse: preaccess check for client \"%V\" "
+                   "in zone \"%V\"",
+                   &ctx->key, &ctx->zone->name);
 
     if (ctx->zone->redis && !ctx->redis_checked) {
         rc = ngx_http_error_abuse_redis_check(r, ctx);
         if (rc == NGX_AGAIN) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "error_abuse: waiting for Redis response");
             return NGX_AGAIN;
         }
     }
     if (ctx->redis_blocked) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: client \"%V\" blocked by Redis",
+                       &ctx->key);
         if (conf->dry_run) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
             return NGX_DECLINED;
@@ -577,23 +596,31 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
                                          &ctx->count,
                                          &ctx->blocked_until);
     if (rc != NGX_OK) {
-        return NGX_DECLINED;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: client \"%V\" in zone \"%V\" "
+                       "currently blocked",
+                       &ctx->key, &ctx->zone->name);
+        if (conf->dry_run) {
+            ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
+            return NGX_DECLINED;
+        }
+
+        ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
+        ctx->own_rejection = 1;
+
+        ngx_log_error(conf->log_level, r->connection->log, 0,
+                      "error_abuse blocked client \"%V\" in zone \"%V\" until %T",
+                      &r->connection->addr_text, &conf->zone->name,
+                      ctx->blocked_until);
+
+        return conf->reject_status;
     }
 
-    if (conf->dry_run) {
-        ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
-        return NGX_DECLINED;
-    }
-
-    ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
-    ctx->own_rejection = 1;
-
-    ngx_log_error(conf->log_level, r->connection->log, 0,
-                  "error_abuse blocked client \"%V\" in zone \"%V\" until %T",
-                  &r->connection->addr_text, &conf->zone->name,
-                  ctx->blocked_until);
-
-    return conf->reject_status;
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "error_abuse: client \"%V\" in zone \"%V\" passed, "
+                   "count=%ui",
+                   &ctx->key, &ctx->zone->name, ctx->count);
+    return NGX_DECLINED;
 }
 
 static ngx_int_t
@@ -608,10 +635,14 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
+    /* Optimization: early return for common case (200 OK) */
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_error_abuse_module);
+    if (!conf->enabled || conf->zone == NULL) {
+        return ngx_http_error_abuse_next_header_filter(r);
+    }
+
     ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
     if (ctx == NULL) {
-        conf = ngx_http_get_module_loc_conf(r,
-                                            ngx_http_error_abuse_module);
         if (conf->enabled && conf->zone != NULL) {
             ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
         }
@@ -629,9 +660,14 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
+    /* Early return for non-error responses (common case optimization) */
     if (!ngx_http_error_abuse_status_matches(ctx->zone,
                                              r->headers_out.status))
     {
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: status %ui not tracked in zone \"%V\" "
+                       "for client \"%V\"",
+                       r->headers_out.status, &ctx->zone->name, &ctx->key);
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
@@ -646,9 +682,18 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
                       "error_abuse zone \"%V\" has insufficient shared memory",
                       &ctx->zone->name);
     } else if (rc == NGX_BUSY) {
+        ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: client \"%V\" blocked in zone \"%V\", "
+                       "count=%ui, blocked_until=%T",
+                       &ctx->key, &ctx->zone->name, ctx->count,
+                       ctx->blocked_until);
         ctx->state = ctx->dry_run ? NGX_HTTP_ERROR_ABUSE_DRY_RUN
                                   : NGX_HTTP_ERROR_ABUSE_BLOCKED;
     } else {
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: status %ui counted for client \"%V\" "
+                       "in zone \"%V\", count=%ui",
+                       r->headers_out.status, &ctx->key, &ctx->zone->name);
         ctx->state = NGX_HTTP_ERROR_ABUSE_COUNTED;
     }
 
@@ -1315,14 +1360,15 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_int_t                         n;
     ngx_uint_t                        i, seen;
     ngx_msec_t                        timeout;
-    ngx_str_t                        *value, host, prefix;
+    ngx_str_t                        *value, host, prefix, hmac_key;
     ngx_http_error_abuse_main_conf_t *mcf;
 
     enum {
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST = 1 << 0,
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PORT = 1 << 1,
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PREFIX = 1 << 2,
-        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT = 1 << 3
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT = 1 << 3,
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HMAC_KEY = 1 << 4
     };
 
     mcf = conf;
@@ -1333,6 +1379,8 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
     host.data = NULL;
     host.len = 0;
+    hmac_key.data = NULL;
+    hmac_key.len = 0;
     ngx_str_set(&prefix, "error_abuse:");
     timeout = 100;
     seen = 0;
@@ -1386,6 +1434,13 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             if (timeout == (ngx_msec_t) NGX_ERROR || timeout == 0) {
                 goto invalid;
             }
+        } else if (ngx_strncmp(value[i].data, "hmac_key=", 9) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HMAC_KEY) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HMAC_KEY;
+            hmac_key.data = value[i].data + 9;
+            hmac_key.len = value[i].len - 9;
         } else {
             goto invalid;
         }
@@ -1407,6 +1462,24 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     mcf->redis.host.len = host.len;
     ngx_memcpy(mcf->redis.prefix.data, prefix.data, prefix.len);
     mcf->redis.prefix.len = prefix.len;
+
+    if (hmac_key.len > 0) {
+        mcf->redis.hmac_key.data = ngx_pnalloc(cf->pool, hmac_key.len);
+        if (mcf->redis.hmac_key.data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memcpy(mcf->redis.hmac_key.data, hmac_key.data, hmac_key.len);
+        mcf->redis.hmac_key.len = hmac_key.len;
+        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                           "error_abuse_redis: HMAC integrity protection enabled");
+    } else {
+        mcf->redis.hmac_key.len = 0;
+        mcf->redis.hmac_key.data = NULL;
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "error_abuse_redis: HMAC not configured, "
+                           "Redis data is not integrity-protected");
+    }
+
     mcf->redis.timeout = timeout;
     mcf->redis.configured = 1;
 
@@ -1530,6 +1603,63 @@ ngx_http_error_abuse_init(ngx_conf_t *cf)
 }
 
 static ngx_int_t
+ngx_http_error_abuse_redis_compute_hmac(ngx_pool_t *pool, ngx_str_t *key,
+    ngx_str_t *data, ngx_str_t *result)
+{
+    unsigned int  len;
+    u_char       *hmac;
+
+    if (key->len == 0) {
+        result->len = 0;
+        result->data = NULL;
+        return NGX_OK;
+    }
+
+    hmac = ngx_pnalloc(pool, EVP_MAX_MD_SIZE);
+    if (hmac == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (HMAC(EVP_sha256(), key->data, key->len, data->data, data->len,
+             hmac, &len) == NULL)
+    {
+        return NGX_ERROR;
+    }
+
+    result->data = hmac;
+    result->len = len;
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_error_abuse_redis_verify_hmac(ngx_str_t *key, ngx_str_t *data,
+    ngx_str_t *received_hmac)
+{
+    unsigned int  len;
+    u_char        computed_hmac[EVP_MAX_MD_SIZE];
+
+    if (key->len == 0) {
+        return NGX_OK;  /* HMAC not enabled */
+    }
+
+    if (received_hmac->len == 0 || received_hmac->len > EVP_MAX_MD_SIZE) {
+        return NGX_ERROR;
+    }
+
+    if (HMAC(EVP_sha256(), key->data, key->len, data->data, data->len,
+             computed_hmac, &len) == NULL || len != received_hmac->len)
+    {
+        return NGX_ERROR;
+    }
+
+    if (ngx_memcmp(computed_hmac, received_hmac->data, len) != 0) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
 ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
     ngx_http_error_abuse_req_ctx_t *ctx, ngx_str_t *events, ngx_str_t *block)
 {
@@ -1574,6 +1704,7 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     ngx_http_error_abuse_req_ctx_t *ctx)
 {
     int         rc;
+    time_t      now;
     ngx_str_t   events, block;
     const char *argv[2];
     size_t      argvlen[2];
@@ -1582,9 +1713,23 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
         return NGX_AGAIN;
     }
 
+    /* Circuit breaker: skip Redis if too many consecutive failures */
+    now = ngx_time();
+    if (ngx_http_error_abuse_redis_worker.circuit_breaker_until > now) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: Redis circuit breaker active, "
+                       "skipping check (recovers in %T seconds)",
+                       ngx_http_error_abuse_redis_worker.circuit_breaker_until
+                       - now);
+        ctx->redis_checked = 1;
+        return NGX_DECLINED;
+    }
+
     if (!ngx_http_error_abuse_redis_worker.ready
         || ngx_http_error_abuse_redis_worker.context == NULL)
     {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: Redis not ready, skipping check");
         ctx->redis_checked = 1;
         return NGX_DECLINED;
     }
@@ -1596,6 +1741,11 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "error_abuse: checking Redis block key \"%V\" "
+                   "for client \"%V\"",
+                   &block, &ctx->key);
+
     argv[0] = "GET";
     argvlen[0] = 3;
     argv[1] = (const char *) block.data;
@@ -1605,6 +1755,25 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
                                ngx_http_error_abuse_redis_check_callback,
                                r, 2, argv, argvlen);
     if (rc != REDIS_OK) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "error_abuse: failed to queue Redis GET command");
+        ngx_http_error_abuse_redis_worker.consecutive_failures++;
+
+        /* Trigger circuit breaker if threshold reached */
+        if (ngx_http_error_abuse_redis_worker.consecutive_failures
+            >= NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD)
+        {
+            ngx_http_error_abuse_redis_worker.circuit_breaker_until =
+                now + NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "error_abuse: Redis circuit breaker triggered "
+                          "after %ui consecutive failures, "
+                          "suspending for %ui seconds",
+                          ngx_http_error_abuse_redis_worker.consecutive_failures,
+                          NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION);
+            ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
+        }
+
         ctx->redis_pending = 0;
         ctx->redis_checked = 1;
         return NGX_DECLINED;
@@ -1631,6 +1800,22 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     ctx->redis_pending = 0;
     ctx->redis_checked = 1;
     ctx->redis_blocked = reply != NULL && reply->type == REDIS_REPLY_STRING;
+
+    /* Reset circuit breaker on successful response */
+    if (reply != NULL) {
+        ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: Redis check for client \"%V\" "
+                       "returned %s",
+                       &ctx->key,
+                       ctx->redis_blocked ? "BLOCKED" : "not blocked");
+    } else {
+        ngx_http_error_abuse_redis_worker.consecutive_failures++;
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "error_abuse: Redis check failed (consecutive=%ui)",
+                      ngx_http_error_abuse_redis_worker.consecutive_failures);
+    }
+
     ngx_http_core_run_phases(r);
 }
 
@@ -1644,17 +1829,34 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     char        inactive[NGX_INT64_LEN + 1];
     char        nonce[NGX_INT64_LEN * 2 + 2];
     u_char     *p;
+    time_t      now;
     ngx_str_t   events, block;
     const char *argv[10];
     size_t      argvlen[10];
+
+    /* Circuit breaker: skip Redis if too many consecutive failures */
+    now = ngx_time();
+    if (ngx_http_error_abuse_redis_worker.circuit_breaker_until > now) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: Redis circuit breaker active, "
+                       "skipping record");
+        return;
+    }
 
     if (!ngx_http_error_abuse_redis_worker.ready
         || ngx_http_error_abuse_redis_worker.context == NULL
         || ngx_http_error_abuse_redis_keys(r->pool, ctx, &events, &block)
            != NGX_OK)
     {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: Redis not available for record");
         return;
     }
+
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "error_abuse: recording event to Redis for client \"%V\", "
+                   "events_key=\"%V\", block_key=\"%V\"",
+                   &ctx->key, &events, &block);
 
 #define NGX_ERROR_ABUSE_REDIS_NUMBER(buf, value)                              \
     (size_t) (ngx_snprintf((u_char *) (buf), sizeof(buf), "%L",               \
@@ -2021,6 +2223,10 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     header->threshold = (uint32_t) zone->threshold;
     header->records = records;
 
+    /* Compute CRC32 over payload (everything after header) */
+    header->crc32 = ngx_crc32_long(buffer + sizeof(*header),
+                                    p - buffer - sizeof(*header));
+
     tmp = ngx_alloc(zone->persist.len + 64, log);
     if (tmp == NULL) {
         ngx_free(buffer);
@@ -2149,6 +2355,17 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 
     p = buffer + sizeof(*header);
     last = buffer + file_size;
+
+    /* Verify CRC32 checksum to detect corruption */
+    if (header->crc32 != ngx_crc32_long(p, last - p)) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "error_abuse persistence file \"%V\" is corrupted "
+                      "(CRC32 mismatch), deleting",
+                      &zone->persist);
+        ngx_free(buffer);
+        (void) ngx_delete_file((u_char *) zone->persist.data);
+        return NGX_OK;
+    }
 
     if (ngx_http_error_abuse_validate_snapshot(zone, p, last,
                                                header->records)
