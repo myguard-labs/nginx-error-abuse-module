@@ -1,6 +1,7 @@
 name: CodeQL
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NGINX_VERSION: "1.31.1"
 
 on:
@@ -41,8 +42,9 @@ jobs:
         with:
           languages: c-cpp
           queries: security-extended
-          paths: |
-            ngx_http_error_abuse_module.c
+          config: |
+            paths:
+              - ngx_http_error_abuse_module.c
 
       - name: Build traced source
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug

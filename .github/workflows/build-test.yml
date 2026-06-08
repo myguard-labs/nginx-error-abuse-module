@@ -100,11 +100,15 @@ jobs:
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           # cflags and incs are compiler flag lists and must word-split.
           # shellcheck disable=SC2086
-          gcc -c -fPIC $cflags \
-            -Wall -Wextra -Wshadow -Wstrict-prototypes \
-            -Wstrict-aliasing -Wunreachable-code -Werror \
-            -Wno-unused-parameter \
-            $incs ngx_http_error_abuse_module.c -o /tmp/module.o
+          (
+            cd "$build"
+            gcc -c -fPIC $cflags \
+              -Wall -Wextra -Wshadow -Wstrict-prototypes \
+              -Wstrict-aliasing -Wunreachable-code -Werror \
+              -Wno-unused-parameter \
+              $incs "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" \
+              -o /tmp/module.o
+          )
 
       - name: Stage artifact
         if: matrix.name == 'nginx-mainline'
