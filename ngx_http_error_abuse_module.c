@@ -8,8 +8,6 @@
 #include <ngx_http.h>
 #include <hiredis/async.h>
 #include <hiredis/adapters/poll.h>
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
 
 #define NGX_HTTP_ERROR_ABUSE_VERSION       1
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
@@ -25,7 +23,6 @@
 typedef struct {
     ngx_str_t   host;
     ngx_str_t   prefix;
-    ngx_str_t   hmac_key;
     in_port_t   port;
     ngx_msec_t  timeout;
     ngx_flag_t  configured;
@@ -1360,15 +1357,14 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_int_t                         n;
     ngx_uint_t                        i, seen;
     ngx_msec_t                        timeout;
-    ngx_str_t                        *value, host, prefix, hmac_key;
+    ngx_str_t                        *value, host, prefix;
     ngx_http_error_abuse_main_conf_t *mcf;
 
     enum {
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST = 1 << 0,
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PORT = 1 << 1,
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PREFIX = 1 << 2,
-        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT = 1 << 3,
-        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HMAC_KEY = 1 << 4
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT = 1 << 3
     };
 
     mcf = conf;
@@ -1379,8 +1375,6 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
     host.data = NULL;
     host.len = 0;
-    hmac_key.data = NULL;
-    hmac_key.len = 0;
     ngx_str_set(&prefix, "error_abuse:");
     timeout = 100;
     seen = 0;
@@ -1434,13 +1428,6 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             if (timeout == (ngx_msec_t) NGX_ERROR || timeout == 0) {
                 goto invalid;
             }
-        } else if (ngx_strncmp(value[i].data, "hmac_key=", 9) == 0) {
-            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HMAC_KEY) {
-                goto duplicate;
-            }
-            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HMAC_KEY;
-            hmac_key.data = value[i].data + 9;
-            hmac_key.len = value[i].len - 9;
         } else {
             goto invalid;
         }
@@ -1462,23 +1449,6 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     mcf->redis.host.len = host.len;
     ngx_memcpy(mcf->redis.prefix.data, prefix.data, prefix.len);
     mcf->redis.prefix.len = prefix.len;
-
-    if (hmac_key.len > 0) {
-        mcf->redis.hmac_key.data = ngx_pnalloc(cf->pool, hmac_key.len);
-        if (mcf->redis.hmac_key.data == NULL) {
-            return NGX_CONF_ERROR;
-        }
-        ngx_memcpy(mcf->redis.hmac_key.data, hmac_key.data, hmac_key.len);
-        mcf->redis.hmac_key.len = hmac_key.len;
-        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
-                           "error_abuse_redis: HMAC integrity protection enabled");
-    } else {
-        mcf->redis.hmac_key.len = 0;
-        mcf->redis.hmac_key.data = NULL;
-        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                           "error_abuse_redis: HMAC not configured, "
-                           "Redis data is not integrity-protected");
-    }
 
     mcf->redis.timeout = timeout;
     mcf->redis.configured = 1;
@@ -1603,63 +1573,6 @@ ngx_http_error_abuse_init(ngx_conf_t *cf)
 }
 
 static ngx_int_t
-ngx_http_error_abuse_redis_compute_hmac(ngx_pool_t *pool, ngx_str_t *key,
-    ngx_str_t *data, ngx_str_t *result)
-{
-    unsigned int  len;
-    u_char       *hmac;
-
-    if (key->len == 0) {
-        result->len = 0;
-        result->data = NULL;
-        return NGX_OK;
-    }
-
-    hmac = ngx_pnalloc(pool, EVP_MAX_MD_SIZE);
-    if (hmac == NULL) {
-        return NGX_ERROR;
-    }
-
-    if (HMAC(EVP_sha256(), key->data, key->len, data->data, data->len,
-             hmac, &len) == NULL)
-    {
-        return NGX_ERROR;
-    }
-
-    result->data = hmac;
-    result->len = len;
-    return NGX_OK;
-}
-
-static ngx_int_t
-ngx_http_error_abuse_redis_verify_hmac(ngx_str_t *key, ngx_str_t *data,
-    ngx_str_t *received_hmac)
-{
-    unsigned int  len;
-    u_char        computed_hmac[EVP_MAX_MD_SIZE];
-
-    if (key->len == 0) {
-        return NGX_OK;  /* HMAC not enabled */
-    }
-
-    if (received_hmac->len == 0 || received_hmac->len > EVP_MAX_MD_SIZE) {
-        return NGX_ERROR;
-    }
-
-    if (HMAC(EVP_sha256(), key->data, key->len, data->data, data->len,
-             computed_hmac, &len) == NULL || len != received_hmac->len)
-    {
-        return NGX_ERROR;
-    }
-
-    if (ngx_memcmp(computed_hmac, received_hmac->data, len) != 0) {
-        return NGX_ERROR;
-    }
-
-    return NGX_OK;
-}
-
-static ngx_int_t
 ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
     ngx_http_error_abuse_req_ctx_t *ctx, ngx_str_t *events, ngx_str_t *block)
 {
@@ -1716,7 +1629,7 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     /* Circuit breaker: skip Redis if too many consecutive failures */
     now = ngx_time();
     if (ngx_http_error_abuse_redis_worker.circuit_breaker_until > now) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: Redis circuit breaker active, "
                        "skipping check (recovers in %T seconds)",
                        ngx_http_error_abuse_redis_worker.circuit_breaker_until

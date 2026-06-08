@@ -30,8 +30,6 @@ module requires `libhiredis`.
 - Can optionally persist state to disk across stop/start and host restarts
   with CRC32 corruption detection.
 - Can aggregate counters and blocks across multiple NGINX hosts with Redis.
-- Optional HMAC-SHA256 integrity protection for Redis data (prevents state
-  poisoning attacks).
 - Circuit breaker pattern: automatically suspends Redis operations after
   consecutive failures to prevent log spam and wasted syscalls.
 - Supports dry-run mode and logging variables.
@@ -45,8 +43,7 @@ load_module modules/ngx_http_error_abuse_module.so;
 
 http {
     error_abuse_redis host=127.0.0.1 port=6379
-                      prefix=error-abuse: timeout=100ms
-                      hmac_key=your-secret-key-here;
+                      prefix=error-abuse: timeout=100ms;
 
     error_abuse_zone zone=client_errors:10m
                      key=$binary_remote_addr
@@ -144,8 +141,7 @@ Syntax:
 
 ```nginx
 error_abuse_redis host=name [port=6379]
-                  [prefix=error_abuse:] [timeout=100ms]
-                  [hmac_key=secret];
+                  [prefix=error_abuse:] [timeout=100ms];
 ```
 
 Context: `http`
@@ -154,13 +150,6 @@ Configures one Redis endpoint per NGINX configuration. `prefix` namespaces all
 module keys and may not contain `{` or `}`. Event and block keys use the same
 Redis hash tag, which keeps each client's keys in one slot when the configured
 endpoint provides Redis Cluster routing.
-
-`hmac_key` enables HMAC-SHA256 integrity protection for Redis data. When set,
-all Redis writes include an HMAC signature, and all reads verify the signature
-before trusting the data. This prevents state poisoning attacks if the Redis
-server is compromised. The key should be a strong random secret shared across
-all NGINX hosts participating in the same zone. Without `hmac_key`, Redis data
-is not integrity-protected (see Security Notes below).
 
 Each worker maintains one asynchronous Redis connection. Block lookups pause
 the request phase without blocking the worker; matching responses queue an
@@ -232,8 +221,8 @@ The automated test and sanitizer matrix is documented in
 - The persistence format is versioned but intentionally local and binary.
   Delete an incompatible file after changing to a future module version.
 - Debug logging is available at `error_log ... debug;` level for
-  troubleshooting. Logs track Redis circuit breaker state, HMAC verification,
-  shared-memory operations, and per-request decision flow.
+  troubleshooting. Logs track Redis circuit breaker state, shared-memory
+  operations, and per-request decision flow.
 
 ## Security Notes
 
@@ -243,16 +232,10 @@ When using Redis cluster mode (`redis=on`), the Redis server becomes a trust
 boundary. A compromised Redis instance could inject false block states or
 manipulate event counters.
 
-**Mitigation**: Use the `hmac_key` parameter to enable HMAC-SHA256 integrity
-protection. With HMAC enabled, all Redis writes include a signature, and all
-reads verify the signature before trusting the data. The HMAC key should be:
-- A strong random secret (32+ bytes recommended)
-- Shared across all NGINX hosts in the same zone
-- Protected with appropriate file permissions (0600)
-- Rotated periodically
-
-Without `hmac_key`, ensure Redis runs on a trusted network isolated from
-potential attackers.
+**Mitigation**: Ensure Redis runs on a trusted network isolated from potential
+attackers. Use firewalls, VPNs, or Redis AUTH to restrict access. Future
+versions may add HMAC-SHA256 integrity protection for an additional security
+layer.
 
 ### Persistence File Integrity
 
