@@ -4,20 +4,25 @@
 [![Valgrind](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml)
 
-This module temporarily blocks clients that generate too many HTTP errors.
-For example, after five `403` or `404` responses within ten seconds, further
-requests from that client can receive `429 Too Many Requests` for twenty
+**What it is:** a dynamic NGINX module, written in C (no Lua, no JavaScript),
+that automatically blocks clients who trigger too many HTTP errors. Think
+fail2ban for `403`/`404`/`5xx` storms, but enforced inside NGINX itself with no
+external log-scanning daemon.
+
+**What it does:** you choose which status codes count as abuse, how many are
+allowed, over what time window, and how long the block lasts. When a client
+crosses the threshold it starts receiving `429 Too Many Requests` (or a status
+you pick) until the block expires. Example: after five `403` or `404` responses
+within ten seconds, further requests from that client get `429` for twenty
 minutes.
 
-You choose which response codes count, how many are allowed, the time window,
-and how long the block lasts. Clients are usually identified by IP address,
-but the key can also be an account ID or any other NGINX variable. Counters
-are shared by all workers, can optionally survive a full restart, and can be
-aggregated across multiple NGINX hosts through Redis.
+Clients are identified by IP address by default, but the key can also be an
+account ID or any other NGINX variable. Counters are shared by all workers, can
+optionally survive a full restart, and can be aggregated across multiple NGINX
+hosts through Redis.
 
-The module is written in C and does not use Lua or JavaScript. Local
-shared-memory and disk persistence work without a Redis server; building the
-module requires `libhiredis`.
+Local shared-memory and disk persistence work without a Redis server; building
+the module requires `libhiredis`.
 
 ## Features
 
@@ -43,7 +48,10 @@ load_module modules/ngx_http_error_abuse_module.so;
 
 http {
     error_abuse_redis host=127.0.0.1 port=6379
-                      prefix=error-abuse: timeout=100ms;
+                      prefix=ea_ timeout=100ms;
+    # TLS + ACL auth example:
+    # error_abuse_redis host=tls://redis.internal port=6380
+    #                   user=erroruser password=secret db=3 prefix=ea_;
 
     error_abuse_zone zone=client_errors:10m
                      key=$binary_remote_addr
@@ -140,16 +148,32 @@ block duration, and Redis prefix.
 Syntax:
 
 ```nginx
-error_abuse_redis host=name [port=6379]
-                  [prefix=error_abuse:] [timeout=100ms];
+error_abuse_redis host=[tls://]name [port=6379]
+                  [user=name] [password=secret] [db=0]
+                  [prefix=ea_] [timeout=100ms];
 ```
 
 Context: `http`
 
-Configures one Redis endpoint per NGINX configuration. `prefix` namespaces all
-module keys and may not contain `{` or `}`. Event and block keys use the same
-Redis hash tag, which keeps each client's keys in one slot when the configured
-endpoint provides Redis Cluster routing.
+Configures one Redis (or Valkey — same RESP protocol) endpoint per NGINX
+configuration. `prefix` namespaces all module keys, defaults to `ea_`, and may
+not contain `{` or `}`. Event and block keys use the same Redis hash tag, which
+keeps each client's keys in one slot when the configured endpoint provides
+Redis Cluster routing.
+
+**Authentication** (optional): `password=` sends `AUTH` after connect; add
+`user=` as well for Redis 6+ ACL authentication (`AUTH user password`). `user=`
+requires `password=`. Both default to empty (no `AUTH` sent), so an
+unauthenticated server still connects.
+
+**Database** (optional): `db=N` issues `SELECT N` after connect (after `AUTH`).
+Defaults to `0` (no `SELECT`; the default database is used).
+
+**TLS** (optional): prefix the host with `tls://` (or `rediss://`) to wrap the
+connection in TLS, e.g. `host=tls://redis.internal`. The server certificate is
+verified against the system CA store (`/etc/ssl/certs`) and the hostname.
+Self-signed server certificates are not yet supported (no `cacert=` parameter).
+Requires `libhiredis_ssl` at build and run time.
 
 Each worker maintains one asynchronous Redis connection. Block lookups pause
 the request phase without blocking the worker; matching responses queue an
@@ -198,6 +222,10 @@ make modules
 
 Install `objs/ngx_http_error_abuse_module.so` in the NGINX module directory.
 
+The `config` links `-lhiredis_ssl` for the `tls://` Redis transport, so a build
+host needs the hiredis TLS library as well (Debian/Ubuntu ship it inside
+`libhiredis-dev`; on some distros it is a separate `libhiredis-ssl` package).
+
 The automated test and sanitizer matrix is documented in
 [`.github/CI.md`](.github/CI.md).
 
@@ -233,9 +261,9 @@ boundary. A compromised Redis instance could inject false block states or
 manipulate event counters.
 
 **Mitigation**: Ensure Redis runs on a trusted network isolated from potential
-attackers. Use firewalls, VPNs, or Redis AUTH to restrict access. Future
-versions may add HMAC-SHA256 integrity protection for an additional security
-layer.
+attackers. Use firewalls, VPNs, Redis AUTH (`user=`/`password=`), and TLS
+(`tls://` host prefix) to restrict and encrypt access. Future versions may add
+HMAC-SHA256 integrity protection for an additional security layer.
 
 ### Persistence File Integrity
 
@@ -281,6 +309,6 @@ error_abuse_zone zone=external:10m
 
 ## See also
 
-- Project article: TODO
+- Project article: [Auto-Ban Abusive Clients in NGINX with the error-abuse module](https://deb.myguard.nl/2026/06/auto-ban-abusive-clients-in-nginx-with-the-error-abuse-module/)
 - Docker integration README: TODO
 - Docker Hub overview: TODO

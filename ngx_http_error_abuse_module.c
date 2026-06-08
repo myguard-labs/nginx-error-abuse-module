@@ -8,6 +8,7 @@
 #include <ngx_http.h>
 #include <hiredis/async.h>
 #include <hiredis/adapters/poll.h>
+#include <hiredis/hiredis_ssl.h>
 
 #define NGX_HTTP_ERROR_ABUSE_VERSION       1
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
@@ -23,8 +24,12 @@
 typedef struct {
     ngx_str_t   host;
     ngx_str_t   prefix;
+    ngx_str_t   user;
+    ngx_str_t   password;
     in_port_t   port;
+    ngx_int_t   db;
     ngx_msec_t  timeout;
+    ngx_flag_t  tls;
     ngx_flag_t  configured;
 } ngx_http_error_abuse_redis_conf_t;
 
@@ -102,6 +107,7 @@ typedef struct {
 
 typedef struct {
     redisAsyncContext                   *context;
+    redisSSLContext                     *ssl;
     ngx_http_error_abuse_redis_conf_t   *conf;
     ngx_event_t                          tick;
     ngx_event_t                          reconnect;
@@ -176,6 +182,8 @@ static void ngx_http_error_abuse_redis_connect_callback(
 static void ngx_http_error_abuse_redis_disconnect_callback(
     const redisAsyncContext *ac, int status);
 static void ngx_http_error_abuse_redis_check_callback(
+    redisAsyncContext *ac, void *reply, void *privdata);
+static void ngx_http_error_abuse_redis_handshake_callback(
     redisAsyncContext *ac, void *reply, void *privdata);
 
 static ngx_http_output_header_filter_pt ngx_http_error_abuse_next_header_filter;
@@ -1354,17 +1362,20 @@ duplicate:
 static char *
 ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_int_t                         n;
-    ngx_uint_t                        i, seen;
+    ngx_int_t                         n, db;
+    ngx_uint_t                        i, seen, tls;
     ngx_msec_t                        timeout;
-    ngx_str_t                        *value, host, prefix;
+    ngx_str_t                        *value, host, prefix, user, password;
     ngx_http_error_abuse_main_conf_t *mcf;
 
     enum {
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST = 1 << 0,
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PORT = 1 << 1,
         NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PREFIX = 1 << 2,
-        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT = 1 << 3
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT = 1 << 3,
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_USER = 1 << 4,
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PASSWORD = 1 << 5,
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_DB = 1 << 6
     };
 
     mcf = conf;
@@ -1375,7 +1386,13 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
     host.data = NULL;
     host.len = 0;
-    ngx_str_set(&prefix, "error_abuse:");
+    ngx_str_set(&prefix, "ea_");
+    user.data = NULL;
+    user.len = 0;
+    password.data = NULL;
+    password.len = 0;
+    db = 0;
+    tls = 0;
     timeout = 100;
     seen = 0;
 
@@ -1387,6 +1404,20 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST;
             host.data = value[i].data + 5;
             host.len = value[i].len - 5;
+            /* optional tls:// (or rediss://) scheme enables TLS transport */
+            if (host.len > 6
+                && ngx_strncmp(host.data, "tls://", 6) == 0)
+            {
+                tls = 1;
+                host.data += 6;
+                host.len -= 6;
+            } else if (host.len > 9
+                       && ngx_strncmp(host.data, "rediss://", 9) == 0)
+            {
+                tls = 1;
+                host.data += 9;
+                host.len -= 9;
+            }
             if (host.len == 0) {
                 goto invalid;
             }
@@ -1428,6 +1459,35 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             if (timeout == (ngx_msec_t) NGX_ERROR || timeout == 0) {
                 goto invalid;
             }
+        } else if (ngx_strncmp(value[i].data, "user=", 5) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_USER) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_USER;
+            user.data = value[i].data + 5;
+            user.len = value[i].len - 5;
+            if (user.len == 0) {
+                goto invalid;
+            }
+        } else if (ngx_strncmp(value[i].data, "password=", 9) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PASSWORD) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PASSWORD;
+            password.data = value[i].data + 9;
+            password.len = value[i].len - 9;
+            if (password.len == 0) {
+                goto invalid;
+            }
+        } else if (ngx_strncmp(value[i].data, "db=", 3) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_DB) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_DB;
+            db = ngx_atoi(value[i].data + 3, value[i].len - 3);
+            if (db < 0 || db > 65535) {
+                goto invalid;
+            }
         } else {
             goto invalid;
         }
@@ -1436,6 +1496,13 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if (host.len == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "error_abuse_redis requires host");
+        return NGX_CONF_ERROR;
+    }
+
+    /* a username only makes sense with a password (Redis 6 ACL AUTH) */
+    if (user.len != 0 && password.len == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "error_abuse_redis user= requires password=");
         return NGX_CONF_ERROR;
     }
 
@@ -1450,6 +1517,26 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_memcpy(mcf->redis.prefix.data, prefix.data, prefix.len);
     mcf->redis.prefix.len = prefix.len;
 
+    if (user.len != 0) {
+        mcf->redis.user.data = ngx_pnalloc(cf->pool, user.len);
+        if (mcf->redis.user.data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memcpy(mcf->redis.user.data, user.data, user.len);
+        mcf->redis.user.len = user.len;
+    }
+
+    if (password.len != 0) {
+        mcf->redis.password.data = ngx_pnalloc(cf->pool, password.len);
+        if (mcf->redis.password.data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memcpy(mcf->redis.password.data, password.data, password.len);
+        mcf->redis.password.len = password.len;
+    }
+
+    mcf->redis.db = db;
+    mcf->redis.tls = tls ? 1 : 0;
     mcf->redis.timeout = timeout;
     mcf->redis.configured = 1;
 
@@ -1828,6 +1915,25 @@ ngx_http_error_abuse_redis_tick(ngx_event_t *ev)
 }
 
 static void
+ngx_http_error_abuse_redis_handshake_callback(redisAsyncContext *ac,
+    void *data, void *privdata)
+{
+    redisReply                          *reply = data;
+    ngx_http_error_abuse_redis_worker_t *worker = ac->data;
+
+    if (reply == NULL) {
+        /* connection-level error; disconnect callback drives reconnect */
+        return;
+    }
+    if (reply->type == REDIS_REPLY_ERROR) {
+        worker->ready = 0;
+        ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+                      "error_abuse: Redis handshake (AUTH/SELECT) failed: %s",
+                      reply->str ? reply->str : "(unknown)");
+    }
+}
+
+static void
 ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
     int status)
 {
@@ -1839,6 +1945,31 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
         ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
                       "error_abuse connected to Redis at \"%V:%ui\"",
                       &worker->conf->host, worker->conf->port);
+
+        /* Send AUTH and SELECT first; hiredis preserves command order so
+         * these complete before any GET/EVAL queued by a request. */
+        if (worker->conf->password.len) {
+            if (worker->conf->user.len) {
+                (void) redisAsyncCommand(worker->context,
+                    ngx_http_error_abuse_redis_handshake_callback, NULL,
+                    "AUTH %b %b",
+                    worker->conf->user.data,
+                    (size_t) worker->conf->user.len,
+                    worker->conf->password.data,
+                    (size_t) worker->conf->password.len);
+            } else {
+                (void) redisAsyncCommand(worker->context,
+                    ngx_http_error_abuse_redis_handshake_callback, NULL,
+                    "AUTH %b",
+                    worker->conf->password.data,
+                    (size_t) worker->conf->password.len);
+            }
+        }
+        if (worker->conf->db > 0) {
+            (void) redisAsyncCommand(worker->context,
+                ngx_http_error_abuse_redis_handshake_callback, NULL,
+                "SELECT %d", (int) worker->conf->db);
+        }
     } else {
         worker->ready = 0;
         ngx_log_error(NGX_LOG_WARN, worker->log, 0,
@@ -1874,7 +2005,40 @@ ngx_http_error_abuse_redis_connect(void)
     if (ac == NULL) {
         return NGX_ERROR;
     }
-    if (ac->err || redisPollAttach(ac) != REDIS_OK) {
+    if (ac->err) {
+        redisAsyncFree(ac);
+        return NGX_ERROR;
+    }
+
+    /* TLS: must initiate the SSL session before attaching the event adapter
+     * and before any command is queued. Verifies the server certificate
+     * against the system CA store (capath) and the hostname (server_name). */
+    if (worker->conf->tls) {
+        if (worker->ssl == NULL) {
+            redisSSLContextError ssl_err = REDIS_SSL_CTX_NONE;
+
+            redisInitOpenSSL();
+            worker->ssl = redisCreateSSLContext(
+                NULL, "/etc/ssl/certs", NULL, NULL,
+                (char *) worker->conf->host.data, &ssl_err);
+            if (worker->ssl == NULL) {
+                ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+                    "error_abuse: Redis TLS context init failed: %s",
+                    redisSSLContextGetError(ssl_err));
+                redisAsyncFree(ac);
+                return NGX_ERROR;
+            }
+        }
+        if (redisInitiateSSLWithContext(&ac->c, worker->ssl) != REDIS_OK) {
+            ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+                "error_abuse: Redis TLS handshake init failed: %s",
+                ac->c.errstr);
+            redisAsyncFree(ac);
+            return NGX_ERROR;
+        }
+    }
+
+    if (redisPollAttach(ac) != REDIS_OK) {
         redisAsyncFree(ac);
         return NGX_ERROR;
     }
@@ -1990,6 +2154,10 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
         if (ngx_http_error_abuse_redis_worker.context != NULL) {
             redisAsyncFree(ngx_http_error_abuse_redis_worker.context);
             ngx_http_error_abuse_redis_worker.context = NULL;
+        }
+        if (ngx_http_error_abuse_redis_worker.ssl != NULL) {
+            redisFreeSSLContext(ngx_http_error_abuse_redis_worker.ssl);
+            ngx_http_error_abuse_redis_worker.ssl = NULL;
         }
     }
 
