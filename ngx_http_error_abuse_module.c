@@ -640,7 +640,7 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
-    /* Optimization: early return for common case (200 OK) */
+    /* skip when module disabled or no zone bound */
     conf = ngx_http_get_module_loc_conf(r, ngx_http_error_abuse_module);
     if (!conf->enabled || conf->zone == NULL) {
         return ngx_http_error_abuse_next_header_filter(r);
@@ -1699,6 +1699,39 @@ ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
     return NGX_OK;
 }
 
+static ngx_flag_t
+ngx_http_error_abuse_redis_available(time_t now)
+{
+    ngx_http_error_abuse_redis_worker_t *worker;
+
+    worker = &ngx_http_error_abuse_redis_worker;
+
+    return worker->circuit_breaker_until <= now
+           && worker->ready
+           && worker->context != NULL;
+}
+
+static void
+ngx_http_error_abuse_redis_record_failure(time_t now)
+{
+    ngx_http_error_abuse_redis_worker_t *worker;
+
+    worker = &ngx_http_error_abuse_redis_worker;
+
+    if (++worker->consecutive_failures
+        >= NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD)
+    {
+        worker->circuit_breaker_until =
+            now + NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION;
+        worker->consecutive_failures = 0;
+        ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+                      "error_abuse: Redis circuit breaker triggered, "
+                      "suspending for %ui seconds",
+                      (ngx_uint_t)
+                      NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION);
+    }
+}
+
 static ngx_int_t
 ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     ngx_http_error_abuse_req_ctx_t *ctx)
@@ -1713,23 +1746,11 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
         return NGX_AGAIN;
     }
 
-    /* Circuit breaker: skip Redis if too many consecutive failures */
+    /* Circuit breaker / readiness: skip Redis when unavailable */
     now = ngx_time();
-    if (ngx_http_error_abuse_redis_worker.circuit_breaker_until > now) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: Redis circuit breaker active, "
-                       "skipping check (recovers in %T seconds)",
-                       ngx_http_error_abuse_redis_worker.circuit_breaker_until
-                       - now);
-        ctx->redis_checked = 1;
-        return NGX_DECLINED;
-    }
-
-    if (!ngx_http_error_abuse_redis_worker.ready
-        || ngx_http_error_abuse_redis_worker.context == NULL)
-    {
+    if (!ngx_http_error_abuse_redis_available(now)) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: Redis not ready, skipping check");
+                       "error_abuse: Redis unavailable, skipping check");
         ctx->redis_checked = 1;
         return NGX_DECLINED;
     }
@@ -1757,27 +1778,17 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     if (rc != REDIS_OK) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "error_abuse: failed to queue Redis GET command");
-        ngx_http_error_abuse_redis_worker.consecutive_failures++;
-
-        /* Trigger circuit breaker if threshold reached */
-        if (ngx_http_error_abuse_redis_worker.consecutive_failures
-            >= NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD)
-        {
-            ngx_http_error_abuse_redis_worker.circuit_breaker_until =
-                now + NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION;
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "error_abuse: Redis circuit breaker triggered "
-                          "after %ui consecutive failures, "
-                          "suspending for %ui seconds",
-                          ngx_http_error_abuse_redis_worker.consecutive_failures,
-                          NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION);
-            ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
-        }
+        ngx_http_error_abuse_redis_record_failure(now);
 
         ctx->redis_pending = 0;
         ctx->redis_checked = 1;
         return NGX_DECLINED;
     }
+
+    /* Async park: hold a reference so the request survives until the Redis
+     * callback resumes it. Released by ngx_http_finalize_request(NGX_DONE)
+     * in ngx_http_error_abuse_redis_check_callback. */
+    r->main->count++;
 
     return NGX_AGAIN;
 }
@@ -1793,6 +1804,8 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     r = privdata;
     ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
     if (ctx == NULL) {
+        /* release the reference taken at park time */
+        ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
@@ -1810,13 +1823,17 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
                        &ctx->key,
                        ctx->redis_blocked ? "BLOCKED" : "not blocked");
     } else {
-        ngx_http_error_abuse_redis_worker.consecutive_failures++;
+        ngx_http_error_abuse_redis_record_failure(ngx_time());
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "error_abuse: Redis check failed (consecutive=%ui)",
                       ngx_http_error_abuse_redis_worker.consecutive_failures);
     }
 
+    /* Resume the parked request, then release the reference taken at park
+     * time. finalize(NGX_DONE) frees the request if nothing else holds it. */
     ngx_http_core_run_phases(r);
+    ngx_http_run_posted_requests(r->connection);
+    ngx_http_finalize_request(r, NGX_DONE);
 }
 
 static void
@@ -1834,22 +1851,14 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     const char *argv[10];
     size_t      argvlen[10];
 
-    /* Circuit breaker: skip Redis if too many consecutive failures */
+    /* Circuit breaker / readiness: skip Redis when unavailable */
     now = ngx_time();
-    if (ngx_http_error_abuse_redis_worker.circuit_breaker_until > now) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: Redis circuit breaker active, "
-                       "skipping record");
-        return;
-    }
-
-    if (!ngx_http_error_abuse_redis_worker.ready
-        || ngx_http_error_abuse_redis_worker.context == NULL
+    if (!ngx_http_error_abuse_redis_available(now)
         || ngx_http_error_abuse_redis_keys(r->pool, ctx, &events, &block)
            != NGX_OK)
     {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: Redis not available for record");
+                       "error_abuse: Redis unavailable for record");
         return;
     }
 
@@ -2610,12 +2619,8 @@ ngx_http_error_abuse_variable_count(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    v->data = p;
-    v->len = ngx_sprintf(p, "%ui", ctx ? ctx->count : 0) - p;
-    v->valid = 1;
-    v->no_cacheable = 0;
-    v->not_found = 0;
-    return NGX_OK;
+    return ngx_http_error_abuse_set_variable(v, p,
+        ngx_sprintf(p, "%ui", ctx ? ctx->count : 0) - p);
 }
 
 static ngx_int_t
@@ -2631,10 +2636,6 @@ ngx_http_error_abuse_variable_blocked_until(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    v->data = p;
-    v->len = ngx_sprintf(p, "%T", ctx ? ctx->blocked_until : 0) - p;
-    v->valid = 1;
-    v->no_cacheable = 0;
-    v->not_found = 0;
-    return NGX_OK;
+    return ngx_http_error_abuse_set_variable(v, p,
+        ngx_sprintf(p, "%T", ctx ? ctx->blocked_until : 0) - p);
 }
