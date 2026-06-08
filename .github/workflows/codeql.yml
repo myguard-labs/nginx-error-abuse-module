@@ -45,6 +45,8 @@ jobs:
           config: |
             paths:
               - ngx_http_error_abuse_module.c
+            paths-ignore:
+              - .build/**
 
       - name: Build traced source
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
