@@ -68,6 +68,22 @@ def expect(port: int, path: str, expected: int) -> None:
     if actual != expected:
         # Debug: dump Redis state on mismatch
         print(f"ERROR: {path}: expected {expected}, got {actual}")
+        
+        # Try to get nginx error log for debugging
+        try:
+            import glob
+            logs = glob.glob("/tmp/error-abuse-ci-*/redis-nginx-*/logs/error.log")
+            if logs:
+                print(f"DEBUG: Found error logs: {logs}")
+                for log in logs[:2]:  # Show first 2 log files
+                    with open(log, 'r') as f:
+                        lines = f.readlines()
+                        print(f"DEBUG: Last 20 lines of {log}:")
+                        for line in lines[-20:]:
+                            print(f"  {line.rstrip()}")
+        except Exception as e:
+            print(f"DEBUG: Could not read logs: {e}")
+        
         raise AssertionError(f"{path}: expected {expected}, got {actual}")
 
 
@@ -100,7 +116,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
 """
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
-error_log {root}/logs/error.log notice;
+error_log {root}/logs/error.log debug;
 
 events {{
     worker_connections 512;
