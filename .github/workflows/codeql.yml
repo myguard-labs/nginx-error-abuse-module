@@ -30,7 +30,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install build dependencies
         run: |
@@ -38,7 +38,7 @@ jobs:
           sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@458d36d7d4f47d0dd16ca424c1d3cda0060f1360 # v3
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
         with:
           languages: c-cpp
           queries: security-extended
@@ -50,6 +50,6 @@ jobs:
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
 
       - name: Analyze
-        uses: github/codeql-action/analyze@458d36d7d4f47d0dd16ca424c1d3cda0060f1360 # v3
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
         with:
           category: /language:c-cpp
