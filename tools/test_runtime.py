@@ -353,7 +353,7 @@ def test_redis_multi_host(binary: pathlib.Path,
                           single_process: bool, nginx_port: int,
                           redis_binary: pathlib.Path) -> None:
     redis_port = nginx_port + 20
-    prefix = f"error-abuse-ci-{os.getpid()}:"
+    prefix = f"error-abuse-ci-{os.getpid()}-{int(time.time()*1000)}:"
     redis = RedisServer(redis_binary, root / "redis", redis_port)
     first = Nginx(
         binary, module, root / "redis-nginx-a", nginx_port + 1, runner,
