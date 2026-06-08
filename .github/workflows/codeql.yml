@@ -1,0 +1,53 @@
+name: CodeQL
+
+env:
+  NGINX_VERSION: "1.31.1"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "47 4 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze C
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@458d36d7d4f47d0dd16ca424c1d3cda0060f1360 # v3
+        with:
+          languages: c-cpp
+          queries: security-extended
+          paths: |
+            ngx_http_error_abuse_module.c
+
+      - name: Build traced source
+        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@458d36d7d4f47d0dd16ca424c1d3cda0060f1360 # v3
+        with:
+          category: /language:c-cpp

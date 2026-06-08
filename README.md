@@ -1,5 +1,9 @@
 # nginx-error-abuse-module
 
+[![Build and Test](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/build-test.yml)
+[![Valgrind](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml)
+[![CodeQL](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml)
+
 Pure C dynamic module for NGINX and compatible servers. It counts configured
 HTTP error responses per key and temporarily blocks keys that exceed a
 threshold in a sliding time window.
@@ -141,6 +145,9 @@ make modules
 ```
 
 Install `objs/ngx_http_error_abuse_module.so` in the NGINX module directory.
+
+The automated test and sanitizer matrix is documented in
+[`.github/CI.md`](.github/CI.md).
 
 ## Operational notes
 

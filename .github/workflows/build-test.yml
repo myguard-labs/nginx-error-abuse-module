@@ -1,0 +1,169 @@
+name: Build and Test
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NGINX_VERSION: "1.31.1"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck shellcheck
+
+      - name: Validate scripts and source
+        run: |
+          bash -n tools/ci-build.sh
+          shellcheck tools/ci-build.sh
+          python3 -m py_compile tools/test_runtime.py
+          cppcheck \
+            --enable=warning,performance,portability \
+            --error-exitcode=1 \
+            --suppress=missingIncludeSystem \
+            --suppress=normalCheckLevelMaxBranches \
+            --suppress=unusedFunction \
+            ngx_http_error_abuse_module.c
+          git diff --check
+
+      - name: Lint workflows
+        run: |
+          version=1.7.7
+          curl -fsSL -o /tmp/actionlint.tgz \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
+          /tmp/actionlint -color .github/workflows/*.yml
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nginx-mainline
+            flavor: nginx
+            version: "1.31.1"
+            binary: nginx
+          - name: nginx-stable
+            flavor: nginx
+            version: "1.30.2"
+            binary: nginx
+          - name: angie
+            flavor: angie
+            version: "1.11.6"
+            binary: angie
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev
+
+      - name: Build server and dynamic module
+        run: |
+          bash tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
+          build=".build/${{ matrix.flavor }}-${{ matrix.version }}/objs"
+          test -x "$build/${{ matrix.binary }}"
+          test -f "$build/ngx_http_error_abuse_module.so"
+          "$build/${{ matrix.binary }}" -V 2>&1
+
+      - name: Strict module compile
+        run: |
+          build=".build/${{ matrix.flavor }}-${{ matrix.version }}"
+          cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
+          incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
+          # cflags and incs are compiler flag lists and must word-split.
+          # shellcheck disable=SC2086
+          gcc -c -fPIC $cflags \
+            -Wall -Wextra -Wshadow -Wstrict-prototypes \
+            -Wstrict-aliasing -Wunreachable-code -Werror \
+            -Wno-unused-parameter \
+            $incs ngx_http_error_abuse_module.c -o /tmp/module.o
+
+      - name: Stage artifact
+        if: matrix.name == 'nginx-mainline'
+        run: |
+          mkdir artifact
+          cp ".build/nginx-${NGINX_VERSION}/objs/nginx" artifact/
+          cp ".build/nginx-${NGINX_VERSION}/objs/ngx_http_error_abuse_module.so" artifact/
+
+      - name: Upload nginx artifact
+        if: matrix.name == 'nginx-mainline'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nginx-mainline
+          path: artifact/
+          retention-days: 1
+
+  runtime:
+    name: Runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download nginx artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nginx-mainline
+          path: nginx-bin
+
+      - name: Run multi-worker runtime suite
+        run: |
+          chmod +x nginx-bin/nginx
+          python3 tools/test_runtime.py \
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+            --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module.so"
+
+  asan:
+    name: ASan and UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libpcre2-dev zlib1g-dev
+
+      - name: Build with sanitizers
+        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
+
+      - name: Run runtime suite under ASan and UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          python3 tools/test_runtime.py \
+            --single-process \
+            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
