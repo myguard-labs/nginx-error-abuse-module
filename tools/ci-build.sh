@@ -56,9 +56,12 @@ cd "$ROOT/$DIR"
 if [ "$MODE" != "asan" ]; then
     make -j"$(nproc)" modules
 fi
-make -j"$(nproc)"
 
-printf 'binary=%s\n' "$ROOT/$DIR/objs/$BINARY"
+if [ "$MODE" != "module" ]; then
+    make -j"$(nproc)"
+    printf 'binary=%s\n' "$ROOT/$DIR/objs/$BINARY"
+fi
+
 if [ "$MODE" != "asan" ]; then
     printf 'module=%s\n' "$ROOT/$DIR/objs/ngx_http_error_abuse_module.so"
 fi
