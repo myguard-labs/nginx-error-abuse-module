@@ -74,7 +74,8 @@ def expect(port: int, path: str, expected: int) -> None:
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  workers: int, keyed_key: str = "$arg_client",
                  redis_port: int | None = None,
-                 redis_prefix: str = "error-abuse-ci:") -> str:
+                 redis_prefix: str = "error-abuse-ci:",
+                 zone_suffix: str = "") -> str:
     load = f"load_module {module};\n" if module else ""
     redis = ""
     redis_zone = ""
@@ -84,17 +85,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             f"    error_abuse_redis host=127.0.0.1 port={redis_port} "
             f"prefix={redis_prefix} timeout=250ms;\n"
         )
-        redis_zone = """    error_abuse_zone zone=cluster:1m key=$arg_client
+        zone_name = f"cluster{zone_suffix}"
+        redis_zone = f"""    error_abuse_zone zone={zone_name}:1m key=$arg_client
                      statuses=404 interval=5s threshold=3 block=10s
                      redis=on;
 """
         redis_locations = f"""
         location = /redis-error {{
-            error_abuse zone=cluster status=429;
+            error_abuse zone={zone_name} status=429;
             root {root}/empty;
         }}
         location = /redis-ok {{
-            error_abuse zone=cluster status=429;
+            error_abuse zone={zone_name} status=429;
             empty_gif;
         }}
 """
@@ -189,7 +191,8 @@ class Nginx:
     def __init__(self, binary: pathlib.Path, module: pathlib.Path | None,
                  root: pathlib.Path, port: int, runner: str,
                  single_process: bool, redis_port: int | None = None,
-                 redis_prefix: str = "error-abuse-ci:") -> None:
+                 redis_prefix: str = "error-abuse-ci:",
+                 zone_suffix: str = "") -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -198,6 +201,7 @@ class Nginx:
         self.single_process = single_process
         self.redis_port = redis_port
         self.redis_prefix = redis_prefix
+        self.zone_suffix = zone_suffix
         self.process: subprocess.Popen[str] | None = None
         self.output_path = root / "nginx-output.log"
 
@@ -209,7 +213,7 @@ class Nginx:
         (self.root / "conf" / "nginx.conf").write_text(
             nginx_config(
                 self.root, self.port, self.module, workers, keyed_key,
-                self.redis_port, self.redis_prefix,
+                self.redis_port, self.redis_prefix, self.zone_suffix,
             ),
             encoding="ascii",
         )
@@ -359,11 +363,11 @@ def test_redis_multi_host(binary: pathlib.Path,
     redis = RedisServer(redis_binary, root / "redis", redis_port)
     first = Nginx(
         binary, module, root / "redis-nginx-a", nginx_port + 1, runner,
-        single_process, redis_port, prefix,
+        single_process, redis_port, prefix, zone_suffix="-a",
     )
     second = Nginx(
         binary, module, root / "redis-nginx-b", nginx_port + 2, runner,
-        single_process, redis_port, prefix,
+        single_process, redis_port, prefix, zone_suffix="-b",
     )
 
     try:
