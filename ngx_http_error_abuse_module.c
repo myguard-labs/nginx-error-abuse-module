@@ -1331,6 +1331,7 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     value = cf->args->elts;
+    host.data = NULL;
     host.len = 0;
     ngx_str_set(&prefix, "error_abuse:");
     timeout = 100;
