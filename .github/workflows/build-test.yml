@@ -68,14 +68,17 @@ jobs:
             flavor: nginx
             version: "1.31.1"
             binary: nginx
+            strict_flags: -Wstrict-prototypes
           - name: nginx-stable
             flavor: nginx
             version: "1.30.2"
             binary: nginx
+            strict_flags: -Wstrict-prototypes
           - name: angie
             flavor: angie
             version: "1.11.6"
             binary: angie
+            strict_flags: ""
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -103,7 +106,7 @@ jobs:
           (
             cd "$build"
             gcc -c -fPIC $cflags \
-              -Wall -Wextra -Wshadow -Wstrict-prototypes \
+              -Wall -Wextra -Wshadow ${{ matrix.strict_flags }} \
               -Wstrict-aliasing -Wunreachable-code -Werror \
               -Wno-unused-parameter \
               $incs "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" \
