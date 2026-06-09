@@ -7,8 +7,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <hiredis/async.h>
-#include <hiredis/adapters/poll.h>
 #include <hiredis/hiredis_ssl.h>
+#include <poll.h>
 
 #define NGX_HTTP_ERROR_ABUSE_VERSION       1
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
@@ -16,7 +16,6 @@
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC    "NGEAB01"
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN 8
-#define NGX_HTTP_ERROR_ABUSE_REDIS_TICK     5
 #define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT 1000
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD 5
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION 30
@@ -105,11 +104,20 @@ typedef struct {
     unsigned                      redis_blocked:1;
 } ngx_http_error_abuse_req_ctx_t;
 
+/* Binds the hiredis async context's socket into nginx's own epoll, so I/O is
+ * fully event-driven instead of polled on a recurring timer. */
+typedef struct {
+    redisAsyncContext  *context;
+    ngx_connection_t   *conn;
+    ngx_event_t         timeout;
+    ngx_log_t          *log;
+} ngx_http_error_abuse_redis_event_t;
+
 typedef struct {
     redisAsyncContext                   *context;
     redisSSLContext                     *ssl;
     ngx_http_error_abuse_redis_conf_t   *conf;
-    ngx_event_t                          tick;
+    ngx_http_error_abuse_redis_event_t   adapter;
     ngx_event_t                          reconnect;
     ngx_log_t                           *log;
     ngx_uint_t                           sequence;
@@ -175,7 +183,10 @@ static ngx_int_t ngx_http_error_abuse_redis_check(
 static void ngx_http_error_abuse_redis_record(
     ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx);
 static ngx_int_t ngx_http_error_abuse_redis_connect(void);
-static void ngx_http_error_abuse_redis_tick(ngx_event_t *ev);
+static ngx_int_t ngx_http_error_abuse_redis_attach(redisAsyncContext *ac,
+    ngx_log_t *log);
+static void ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev);
+static void ngx_http_error_abuse_redis_write_handler(ngx_event_t *wev);
 static void ngx_http_error_abuse_redis_reconnect(ngx_event_t *ev);
 static void ngx_http_error_abuse_redis_connect_callback(
     const redisAsyncContext *ac, int status);
@@ -1909,18 +1920,222 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
 #undef NGX_ERROR_ABUSE_REDIS_NUMBER
 }
 
+/* nginx epoll is edge-triggered only, and redisAsyncHandleRead does a single
+ * recv() per call, so a single notification can leave replies buffered in the
+ * socket with no further edge. Drain: keep handling while poll() still reports
+ * the fd readable. The context may be freed mid-drain (a reply callback can
+ * trigger disconnect), so re-check it each iteration — the cleanup callback
+ * NULLs adapter.context synchronously before the context is freed. */
 static void
-ngx_http_error_abuse_redis_tick(ngx_event_t *ev)
+ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev)
 {
-    ngx_http_error_abuse_redis_worker_t *worker;
+    ngx_connection_t                    *c;
+    struct pollfd                        pfd;
+    ngx_http_error_abuse_redis_event_t  *ev;
 
-    worker = ev->data;
-    if (worker->context != NULL) {
-        (void) redisPollTick(worker->context, 0.0);
+    c = rev->data;
+    ev = c->data;
+
+    while (ev->context != NULL) {
+        redisAsyncHandleRead(ev->context);
+
+        if (ev->context == NULL) {
+            break;
+        }
+
+        pfd.fd = c->fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) {
+            break;
+        }
     }
-    if (!worker->exiting && worker->context != NULL) {
-        ngx_add_timer(ev, NGX_HTTP_ERROR_ABUSE_REDIS_TICK);
+}
+
+static void
+ngx_http_error_abuse_redis_write_handler(ngx_event_t *wev)
+{
+    ngx_connection_t                    *c;
+    ngx_http_error_abuse_redis_event_t  *ev;
+
+    c = wev->data;
+    ev = c->data;
+
+    if (ev->context != NULL) {
+        /* redisAsyncHandleWrite drains its own write buffer to EAGAIN */
+        redisAsyncHandleWrite(ev->context);
     }
+}
+
+static void
+ngx_http_error_abuse_redis_timeout_handler(ngx_event_t *t)
+{
+    ngx_http_error_abuse_redis_event_t *ev = t->data;
+
+    if (ev->context != NULL) {
+        redisAsyncHandleTimeout(ev->context);
+    }
+}
+
+/* hiredis asks us to (re)arm a one-shot command-timeout timer. */
+static void
+ngx_http_error_abuse_redis_schedule_timer(void *privdata, struct timeval tv)
+{
+    ngx_msec_t                           t;
+    ngx_http_error_abuse_redis_event_t  *ev = privdata;
+
+    if (ev->conn == NULL) {
+        return;
+    }
+
+    t = (ngx_msec_t) tv.tv_sec * 1000 + (ngx_msec_t) tv.tv_usec / 1000;
+    if (t == 0) {
+        t = 1;
+    }
+
+    if (ev->timeout.timer_set) {
+        ngx_del_timer(&ev->timeout);
+    }
+    ngx_add_timer(&ev->timeout, t);
+}
+
+static void
+ngx_http_error_abuse_redis_add_read(void *privdata)
+{
+    ngx_http_error_abuse_redis_event_t *ev = privdata;
+
+    if (ev->conn != NULL && !ev->conn->read->active) {
+        (void) ngx_handle_read_event(ev->conn->read, 0);
+    }
+}
+
+static void
+ngx_http_error_abuse_redis_del_read(void *privdata)
+{
+    ngx_http_error_abuse_redis_event_t *ev = privdata;
+
+    if (ev->conn != NULL && ev->conn->read->active) {
+        (void) ngx_del_event(ev->conn->read, NGX_READ_EVENT, 0);
+    }
+}
+
+static void
+ngx_http_error_abuse_redis_add_write(void *privdata)
+{
+    ngx_http_error_abuse_redis_event_t *ev = privdata;
+
+    if (ev->conn == NULL) {
+        return;
+    }
+
+    if (!ev->conn->write->active) {
+        (void) ngx_handle_write_event(ev->conn->write, 0);
+    }
+
+    /* Edge-triggered epoll only signals empty->writable transitions. Once the
+     * connect edge is consumed the socket stays writable with no further edge,
+     * so a freshly queued command would never flush. If the socket is already
+     * writable, post the write handler to run it this event cycle. */
+    if (ev->conn->write->ready) {
+        ngx_post_event(ev->conn->write, &ngx_posted_events);
+    }
+}
+
+static void
+ngx_http_error_abuse_redis_del_write(void *privdata)
+{
+    ngx_http_error_abuse_redis_event_t *ev = privdata;
+
+    if (ev->conn != NULL && ev->conn->write->active) {
+        (void) ngx_del_event(ev->conn->write, NGX_WRITE_EVENT, 0);
+    }
+}
+
+/* hiredis calls this just before it closes the fd and frees the context.
+ * Detach the nginx connection (delete its epoll events, return the slot) but
+ * leave the fd open — hiredis closes it. Never free the adapter struct itself;
+ * it lives in the worker and may be on the stack of redis_read_handler. */
+static void
+ngx_http_error_abuse_redis_cleanup(void *privdata)
+{
+    ngx_connection_t                    *c;
+    ngx_http_error_abuse_redis_event_t  *ev = privdata;
+
+    c = ev->conn;
+    ev->context = NULL;
+    ev->conn = NULL;
+
+    if (c == NULL) {
+        return;
+    }
+
+    if (c->read->active) {
+        (void) ngx_del_event(c->read, NGX_READ_EVENT, 0);
+    }
+    if (c->write->active) {
+        (void) ngx_del_event(c->write, NGX_WRITE_EVENT, 0);
+    }
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+    if (ev->timeout.timer_set) {
+        ngx_del_timer(&ev->timeout);
+    }
+    if (c->read->posted) {
+        ngx_delete_posted_event(c->read);
+    }
+    if (c->write->posted) {
+        ngx_delete_posted_event(c->write);
+    }
+
+    ngx_free_connection(c);
+    c->fd = (ngx_socket_t) -1;
+}
+
+static ngx_int_t
+ngx_http_error_abuse_redis_attach(redisAsyncContext *ac, ngx_log_t *log)
+{
+    ngx_connection_t                    *c;
+    ngx_http_error_abuse_redis_event_t  *ev;
+
+    if (ac->ev.addRead != NULL) {
+        /* already attached to an event loop */
+        return NGX_ERROR;
+    }
+
+    c = ngx_get_connection(ac->c.fd, log);
+    if (c == NULL) {
+        return NGX_ERROR;
+    }
+
+    c->log = log;
+    c->read->log = log;
+    c->write->log = log;
+    c->read->handler = ngx_http_error_abuse_redis_read_handler;
+    c->write->handler = ngx_http_error_abuse_redis_write_handler;
+
+    ev = &ngx_http_error_abuse_redis_worker.adapter;
+    ev->context = ac;
+    ev->conn = c;
+    ev->log = log;
+    ev->timeout.handler = ngx_http_error_abuse_redis_timeout_handler;
+    ev->timeout.data = ev;
+    ev->timeout.log = log;
+    ev->timeout.cancelable = 1;
+    c->data = ev;
+
+    ac->ev.data = ev;
+    ac->ev.addRead = ngx_http_error_abuse_redis_add_read;
+    ac->ev.delRead = ngx_http_error_abuse_redis_del_read;
+    ac->ev.addWrite = ngx_http_error_abuse_redis_add_write;
+    ac->ev.delWrite = ngx_http_error_abuse_redis_del_write;
+    ac->ev.scheduleTimer = ngx_http_error_abuse_redis_schedule_timer;
+    ac->ev.cleanup = ngx_http_error_abuse_redis_cleanup;
+
+    return NGX_OK;
 }
 
 static void
@@ -2047,13 +2262,13 @@ ngx_http_error_abuse_redis_connect(void)
         }
     }
 
-    if (redisPollAttach(ac) != REDIS_OK) {
+    ac->data = worker;
+    if (ngx_http_error_abuse_redis_attach(ac, worker->log) != NGX_OK) {
         redisAsyncFree(ac);
         return NGX_ERROR;
     }
 
     worker->context = ac;
-    ac->data = worker;
     timeout.tv_sec = worker->conf->timeout / 1000;
     timeout.tv_usec = (worker->conf->timeout % 1000) * 1000;
     (void) redisAsyncSetTimeout(ac, timeout);
@@ -2061,9 +2276,6 @@ ngx_http_error_abuse_redis_connect(void)
         ac, ngx_http_error_abuse_redis_connect_callback);
     (void) redisAsyncSetDisconnectCallback(
         ac, ngx_http_error_abuse_redis_disconnect_callback);
-    if (!worker->tick.timer_set) {
-        ngx_add_timer(&worker->tick, NGX_HTTP_ERROR_ABUSE_REDIS_TICK);
-    }
 
     return NGX_OK;
 }
@@ -2102,12 +2314,6 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
             ((uint64_t) ngx_current_msec << 32)
             ^ (uint64_t) ngx_random()
             ^ (uint64_t) ngx_pid;
-        ngx_http_error_abuse_redis_worker.tick.handler =
-            ngx_http_error_abuse_redis_tick;
-        ngx_http_error_abuse_redis_worker.tick.data =
-            &ngx_http_error_abuse_redis_worker;
-        ngx_http_error_abuse_redis_worker.tick.log = cycle->log;
-        ngx_http_error_abuse_redis_worker.tick.cancelable = 1;
         ngx_http_error_abuse_redis_worker.reconnect.handler =
             ngx_http_error_abuse_redis_reconnect;
         ngx_http_error_abuse_redis_worker.reconnect.data =
@@ -2154,9 +2360,6 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
 
     if (ngx_http_error_abuse_redis_worker.conf != NULL) {
         ngx_http_error_abuse_redis_worker.exiting = 1;
-        if (ngx_http_error_abuse_redis_worker.tick.timer_set) {
-            ngx_del_timer(&ngx_http_error_abuse_redis_worker.tick);
-        }
         if (ngx_http_error_abuse_redis_worker.reconnect.timer_set) {
             ngx_del_timer(&ngx_http_error_abuse_redis_worker.reconnect);
         }
