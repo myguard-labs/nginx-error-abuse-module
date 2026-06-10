@@ -14,6 +14,11 @@
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
 #define NGX_HTTP_ERROR_ABUSE_STATUS_BYTES  75
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
+#define NGX_HTTP_ERROR_ABUSE_DEFAULT_KEY       "$binary_remote_addr"
+#define NGX_HTTP_ERROR_ABUSE_DEFAULT_STATUSES  "403,404,500-599"
+#define NGX_HTTP_ERROR_ABUSE_DEFAULT_INTERVAL  300
+#define NGX_HTTP_ERROR_ABUSE_DEFAULT_THRESHOLD 100
+#define NGX_HTTP_ERROR_ABUSE_DEFAULT_BLOCK     3600
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC    "NGEAB01"
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN 8
 #define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT 1000
@@ -1111,13 +1116,26 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
     }
 
-    if (zone->name.len == 0 || size == 0 || key.len == 0
-        || statuses.len == 0 || zone->interval == 0
-        || zone->threshold == 0 || zone->block == 0)
-    {
+    if (zone->name.len == 0 || size == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "error_abuse_zone is missing a required parameter");
+                           "error_abuse_zone requires zone=name:size");
         return NGX_CONF_ERROR;
+    }
+
+    if (key.len == 0) {
+        ngx_str_set(&key, NGX_HTTP_ERROR_ABUSE_DEFAULT_KEY);
+    }
+    if (statuses.len == 0) {
+        ngx_str_set(&statuses, NGX_HTTP_ERROR_ABUSE_DEFAULT_STATUSES);
+    }
+    if (zone->interval == 0) {
+        zone->interval = NGX_HTTP_ERROR_ABUSE_DEFAULT_INTERVAL;
+    }
+    if (zone->threshold == 0) {
+        zone->threshold = NGX_HTTP_ERROR_ABUSE_DEFAULT_THRESHOLD;
+    }
+    if (zone->block == 0) {
+        zone->block = NGX_HTTP_ERROR_ABUSE_DEFAULT_BLOCK;
     }
 
     if (ngx_http_error_abuse_find_zone(mcf, &zone->name) != NULL) {

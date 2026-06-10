@@ -4,308 +4,160 @@
 [![Valgrind](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml)
 
-**What it is:** a dynamic NGINX module, written in C (no Lua, no JavaScript),
-that automatically blocks clients who trigger too many HTTP errors. Think
-fail2ban for `403`/`404`/`5xx` storms, but enforced inside NGINX itself with no
-external log-scanning daemon.
+## What is this?
 
-**What it does:** you choose which status codes count as abuse, how many are
-allowed, over what time window, and how long the block lasts. When a client
-crosses the threshold it starts receiving `429 Too Many Requests` (or a status
-you pick) until the block expires. Example: after five `403` or `404` responses
-within ten seconds, further requests from that client get `429` for twenty
-minutes.
+Imagine someone keeps poking your website with requests that don't exist —
+hammering random URLs (lots of `404`s), banging on stuff they're not allowed to
+see (lots of `403`s), or spamming requests until your server starts coughing up
+`500` errors. That's abuse, and it wastes your server's time.
 
-Clients are identified by IP address by default, but the key can also be an
-account ID or any other NGINX variable. Counters are shared by all workers, can
-optionally survive a full restart, and can be aggregated across multiple NGINX
-hosts through Redis.
+This is a small NGINX module, written in plain C, that watches those error
+responses and **bans the troublemaker automatically**. Think of it like
+fail2ban, except it lives *inside* NGINX — no extra daemon reading log files, no
+Lua, no JavaScript. You pick which error codes count, how many are allowed, and
+for how long the offender gets locked out.
 
-Local shared-memory and disk persistence work without a Redis server; building
-the module requires `libhiredis`.
+When a client crosses the line, it starts getting `429 Too Many Requests`
+(or any status you choose) until the ban expires. Counters are shared across all
+NGINX worker processes, can survive a restart (disk snapshots), and can even be
+shared between multiple servers using Redis.
 
-## Features
-
-- Counts configurable status codes and ranges, such as `403,404,429` or
-  `400-499`.
-- Uses an exact sliding window rather than a fixed window.
-- Stores state in an NGINX shared-memory zone across all workers.
-- Supports multiple independently configured zones.
-- Preserves state across graceful reloads automatically.
-- Can optionally persist state to disk across stop/start and host restarts
-  with CRC32 corruption detection.
-- Can aggregate counters and blocks across multiple NGINX hosts with Redis.
-- Circuit breaker pattern: automatically suspends Redis operations after
-  consecutive failures to prevent log spam and wasted syscalls.
-- Supports dry-run mode and logging variables.
-- Uses non-blocking Redis I/O and retains local protection if Redis is down.
-- Optimized for the common case: minimal overhead for non-error responses.
-
-## Configuration
+## Full configuration example
 
 ```nginx
 load_module modules/ngx_http_error_abuse_module.so;
 
 http {
-    error_abuse_redis host=127.0.0.1 port=6379
-                      prefix=ea_ timeout=100ms;
-    # TLS + ACL auth example:
-    # error_abuse_redis host=tls://redis.internal port=6380
-    #                   user=erroruser password=secret db=3 prefix=ea_;
+    # Optional: share bans across servers (see the Redis section).
+    error_abuse_redis host=127.0.0.1 port=6379 prefix=ea_ timeout=100ms;
 
+    # Define a zone: a shared-memory area that holds the counters.
     error_abuse_zone zone=client_errors:10m
                      key=$binary_remote_addr
-                     statuses=403,404,429,500-599
-                     interval=10s
-                     threshold=5
-                     block=20m
+                     statuses=403,404,500-599
+                     interval=300s
+                     threshold=100
+                     block=60m
                      inactive=1h
-                     redis=on
                      persist=/var/lib/nginx/error-abuse-client_errors.state
                      persist_interval=5s;
 
+    # Handy log line so you can see what the module decided.
     log_format main '$remote_addr $request $status '
                     'error_abuse=$error_abuse_status '
                     'count=$error_abuse_count';
 
     server {
         location / {
-            error_abuse zone=client_errors status=429;
+            error_abuse zone=client_errors;   # turn it on here
         }
     }
 }
 ```
 
-The state directory must already exist and be writable by the NGINX worker
-user. Persistence and Redis are independent and optional. Without `persist=`,
-local state survives graceful reloads but not a full process restart. With
-`redis=on`, active Redis blocks survive an NGINX restart and are shared by
-every host using the same prefix and zone configuration.
+Read that zone line as: *"if one IP causes 100 of these error responses within
+any 5-minute window, ban it for 60 minutes."* The `persist=` file lets bans
+survive a full NGINX restart; the directory must already exist and be writable
+by the worker user.
 
-### Excluding clients
+**Good news:** almost everything has a sensible default. The shortest config
+that actually works is just:
 
-The module ignores empty keys. This makes `map` the preferred integration
-point for allowlists and other modules:
+```nginx
+error_abuse_zone zone=client_errors:10m;     # uses all defaults below
+location / { error_abuse zone=client_errors; }
+```
+
+## Synopsis (directives + defaults)
+
+### `error_abuse_zone zone=name:size [...]` — context: `http`
+
+Declares a zone. Only `zone=name:size` is required; the rest default to a
+deliberately relaxed policy that catches *sustained* abuse, not the odd 404.
+
+| Parameter          | Default               | Meaning                                            |
+| ------------------ | --------------------- | -------------------------------------------------- |
+| `zone`             | *(required)*          | Name and shared-memory size, e.g. `client:10m`.    |
+| `key`              | `$binary_remote_addr` | What identifies a client (an NGINX variable).      |
+| `statuses`         | `403,404,500-599`     | Which status codes count. Exact codes or ranges.   |
+| `interval`         | `300s`                | Sliding time window the counting happens over.     |
+| `threshold`        | `100`                 | Hits in the window before a ban (max `1024`).       |
+| `block`            | `60m`                 | How long the ban lasts.                            |
+| `inactive`         | max(1h, interval, block) | Idle clients are forgotten after this.          |
+| `redis`            | `off`                 | Share this zone's state via Redis.                 |
+| `persist`          | *(none)*              | File path to snapshot state to disk.               |
+| `persist_interval` | `5s`                  | How often to write the snapshot.                   |
+
+### `error_abuse zone=name [status=code] [dry_run=on|off] [log_level=level]` — context: `http`, `server`, `location`
+
+Switches a declared zone on for that location. `error_abuse off;` turns it back
+off. Default ban response is `429`; log levels are `info`, `notice`, `warn`,
+`error`. `dry_run=on` logs what *would* happen without actually banning — great
+for testing. The module never counts its own ban responses or subrequests.
+
+### `error_abuse_redis host=[tls://]name [port] [user] [password] [db] [prefix] [timeout]` — context: `http`
+
+Points the module at one Redis server (see below).
+
+### Variables
+
+- `$error_abuse_status` — `BYPASSED`, `PASSED`, `COUNTED`, `BLOCKED`, or `DRY_RUN`.
+- `$error_abuse_count` — matching responses currently in the window.
+- `$error_abuse_blocked_until` — Unix timestamp the ban ends, or `0`.
+
+## About Redis (optional)
+
+By default each NGINX server bans on its own. If you run several servers behind
+a load balancer, an attacker banned on one could just hit another. Add
+`error_abuse_redis` and set `redis=on` on a zone, and all servers sharing the
+same `prefix` and zone settings count together and share bans. It speaks plain
+RESP, so **Valkey works too**. Connections are non-blocking, so a slow or dead
+Redis never freezes a request — the module just falls back to its own local
+counters (fail-open), and a circuit breaker pauses Redis for 30s after repeated
+failures so your logs don't fill up. You can lock it down with AUTH
+(`user=`/`password=`), pick a database (`db=N`), and encrypt with TLS by
+prefixing the host: `host=tls://redis.internal`. **Treat Redis as a trust
+boundary** — a compromised Redis could inject fake bans, so keep it on a private
+network.
+
+## Excluding clients (allowlists)
+
+The module ignores **empty keys**. So the cleanest way to allowlist someone is a
+`map` that returns an empty string for trusted IPs:
 
 ```nginx
 map $remote_addr $error_abuse_key {
-    127.0.0.1  "";
-    10.0.0.0/8 "";
-    default    $binary_remote_addr;
+    127.0.0.1   "";            # localhost: never banned
+    10.0.0.0/8  "";            # internal network: never banned
+    default     $binary_remote_addr;
 }
 
-error_abuse_zone zone=client_errors:10m
-                 key=$error_abuse_key
-                 statuses=403,404
-                 interval=30s
-                 threshold=10
-                 block=15m;
+error_abuse_zone zone=client_errors:10m key=$error_abuse_key;
 ```
 
-When NGINX is behind a trusted proxy or CDN, configure the standard
-`real_ip` module correctly and keep `$binary_remote_addr` as the key. Do not
-use an untrusted `X-Forwarded-For` header directly.
-
-## Directives
-
-### `error_abuse_zone`
-
-Syntax:
+**Behind a proxy or CDN?** Don't trust `X-Forwarded-For` directly — that's
+spoofable. Set up the standard `realip` module so `$binary_remote_addr` becomes
+the *real* client IP:
 
 ```nginx
-error_abuse_zone zone=name:size
-                 key=complex_value
-                 statuses=code[,code|range...]
-                 interval=time
-                 threshold=number
-                 block=time
-                 [inactive=time]
-                 [redis=on|off]
-                 [persist=path]
-                 [persist_interval=time];
+set_real_ip_from 10.0.0.0/8;
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
 ```
 
-Context: `http`
-
-All required parameters are zone-specific. `threshold` is limited to 1024 to
-keep per-key shared-memory use bounded. `inactive` defaults to the larger of
-one hour, `interval`, or `block`.
-
-The status list accepts exact codes and inclusive ranges from 100 through
-599. Example: `statuses=403,404,429,500-599`.
-
-`persist_interval` defaults to 5 seconds when `persist` is configured. The
-file is replaced atomically. A crash can lose changes since the last
-snapshot; graceful worker shutdown also writes a final snapshot.
-
-`redis=on` enables cluster-wide counting for this zone and requires an
-`error_abuse_redis` directive in the same `http` block. Every NGINX host
-participating in a zone must use the same zone name, interval, threshold,
-block duration, and Redis prefix.
-
-### `error_abuse_redis`
-
-Syntax:
-
-```nginx
-error_abuse_redis host=[tls://]name [port=6379]
-                  [user=name] [password=secret] [db=0]
-                  [prefix=ea_] [timeout=100ms];
-```
-
-Context: `http`
-
-Configures one Redis (or Valkey — same RESP protocol) endpoint per NGINX
-configuration. `prefix` namespaces all module keys, defaults to `ea_`, and may
-not contain `{` or `}`. Event and block keys use the same Redis hash tag, which
-keeps each client's keys in one slot when the configured endpoint provides
-Redis Cluster routing.
-
-**Authentication** (optional): `password=` sends `AUTH` after connect; add
-`user=` as well for Redis 6+ ACL authentication (`AUTH user password`). `user=`
-requires `password=`. Both default to empty (no `AUTH` sent), so an
-unauthenticated server still connects.
-
-**Database** (optional): `db=N` issues `SELECT N` after connect (after `AUTH`).
-Defaults to `0` (no `SELECT`; the default database is used).
-
-**TLS** (optional): prefix the host with `tls://` (or `rediss://`) to wrap the
-connection in TLS, e.g. `host=tls://redis.internal`. The server certificate is
-verified against the system CA store (`/etc/ssl/certs`) and the hostname.
-Self-signed server certificates are not yet supported (no `cacert=` parameter).
-Requires `libhiredis_ssl` at build and run time.
-
-Each worker maintains one asynchronous Redis connection. Block lookups pause
-the request phase without blocking the worker; matching responses queue an
-atomic sliding-window update. Redis errors are fail-open and the local
-shared-memory zone continues to enforce its own counters.
-
-**Circuit breaker**: After 5 consecutive Redis failures, the module
-automatically suspends Redis operations for 30 seconds to prevent log spam
-and wasted syscalls. Local shared-memory protection remains active.
-
-### `error_abuse`
-
-Syntax:
-
-```nginx
-error_abuse zone=name [status=code] [dry_run=on|off] [log_level=level];
-error_abuse off;
-```
-
-Context: `http`, `server`, `location`
-
-Enables a previously declared zone. The default block response is `429`.
-Supported log levels are `info`, `notice`, `warn`, and `error`.
-
-Subrequests are not counted. A response generated by the module itself is
-also not counted, so a blocked request does not extend its own block.
-
-## Variables
-
-- `$error_abuse_status`: `BYPASSED`, `PASSED`, `COUNTED`, `BLOCKED`, or
-  `DRY_RUN`.
-- `$error_abuse_count`: number of matching responses currently in the
-  sliding window.
-- `$error_abuse_blocked_until`: Unix timestamp at which the block expires,
-  or `0`.
-
-## Building
+## Building from source
 
 ```bash
-apt-get install libhiredis-dev
+apt-get install libhiredis-dev        # provides hiredis + its TLS lib
 
 ./configure --with-compat \
     --add-dynamic-module=/path/to/nginx-error-abuse-module
 make modules
 ```
 
-Install `objs/ngx_http_error_abuse_module.so` in the NGINX module directory.
-
-The `config` links `-lhiredis_ssl` for the `tls://` Redis transport, so a build
-host needs the hiredis TLS library as well (Debian/Ubuntu ship it inside
-`libhiredis-dev`; on some distros it is a separate `libhiredis-ssl` package).
-
-The automated test and sanitizer matrix is documented in
+Copy `objs/ngx_http_error_abuse_module.so` into your NGINX module directory and
+`load_module` it. The full CI/sanitizer matrix lives in
 [`.github/CI.md`](.github/CI.md).
-
-## Operational notes
-
-- Shared-memory exhaustion is fail-open: the response is served and an error
-  is logged, but that event cannot be recorded.
-- A zone's `key` and `threshold` cannot change during a graceful reload.
-  Declare a new zone name when either value must change.
-- Each persistent zone must use its own persistence file.
-- Persistence files include CRC32 checksums. Corrupted files are automatically
-  deleted and logged as errors.
-- Persistence files are local snapshots, not a cluster synchronization
-  mechanism.
-- Redis synchronizes thresholds across multiple NGINX hosts. Disk snapshots
-  still preserve each host's local fallback.
-- Redis event keys expire after `inactive`; block keys expire after the
-  configured block duration.
-- A key is removed after `inactive` when it has no live block. Choose a zone
-  size appropriate for the number of distinct clients and threshold.
-- The persistence format is versioned but intentionally local and binary.
-  Delete an incompatible file after changing to a future module version.
-- Debug logging is available at `error_log ... debug;` level for
-  troubleshooting. Logs track Redis circuit breaker state, shared-memory
-  operations, and per-request decision flow.
-
-## Security Notes
-
-### Redis Trust Boundary
-
-When using Redis cluster mode (`redis=on`), the Redis server becomes a trust
-boundary. A compromised Redis instance could inject false block states or
-manipulate event counters.
-
-**Mitigation**: Ensure Redis runs on a trusted network isolated from potential
-attackers. Use firewalls, VPNs, Redis AUTH (`user=`/`password=`), and TLS
-(`tls://` host prefix) to restrict and encrypt access. Future versions may add
-HMAC-SHA256 integrity protection for an additional security layer.
-
-### Persistence File Integrity
-
-Persistence files include CRC32 checksums to detect corruption (disk errors,
-incomplete writes, crashes during write). Corrupted files are automatically
-deleted and logged as errors. The module starts fresh with an empty zone state.
-
-### Variable Key Sources
-
-The module trusts the `key` value from the configured nginx variable. Best
-practices:
-
-**Recommended**: Use `$binary_remote_addr` with the `ngx_http_realip_module`
-when behind a trusted proxy/CDN:
-
-```nginx
-set_real_ip_from 10.0.0.0/8;
-set_real_ip_from 2001:db8::/32;
-real_ip_header X-Forwarded-For;
-real_ip_recursive on;
-
-error_abuse_zone zone=client:10m
-                 key=$binary_remote_addr
-                 statuses=404 interval=30s threshold=10 block=15m;
-```
-
-**Not recommended**: Directly using untrusted headers like `X-Forwarded-For`
-without `ngx_http_realip_module` allows client IP spoofing.
-
-**Allowlists**: Empty keys bypass tracking. Use `map` to implement allowlists:
-
-```nginx
-map $remote_addr $error_abuse_key {
-    127.0.0.1  "";      # Localhost bypassed
-    10.0.0.0/8 "";      # Internal network bypassed
-    default    $binary_remote_addr;
-}
-
-error_abuse_zone zone=external:10m
-                 key=$error_abuse_key
-                 statuses=403,404 interval=30s threshold=10 block=15m;
-```
 
 ## See also
 
