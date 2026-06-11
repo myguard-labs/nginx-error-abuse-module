@@ -49,8 +49,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang
 
-      - name: Build fuzz target
-        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz_snapshot"
+      - name: Build fuzz targets
+        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"
 
       - name: Select fuzz duration
         run: |
@@ -63,31 +63,39 @@ jobs:
             echo "FUZZ_SECS=900" >> "$GITHUB_ENV"
           fi
 
-      - name: Run fuzzer
+      - name: Run fuzzers
         run: |
           cd fuzz
-          set +e
-          ../fuzz_snapshot \
-            -max_total_time="$FUZZ_SECS" \
-            -print_final_stats=1 \
-            -artifact_prefix=crash- \
-            corpus/
-          rc=$?
-          set -e
-          if [ $rc -ne 0 ]; then
-            echo "❌ Fuzzer found a crash (exit $rc)"
-            exit 1
-          fi
-          echo "✓ No crashes in ${FUZZ_SECS}s"
+          # target:corpus-dir pairs — each gets the full per-target budget.
+          targets="fuzz_snapshot:corpus fuzz_statuses:corpus_statuses"
+          for t in $targets; do
+            bin="${t%%:*}"; corp="${t##*:}"
+            echo "=== $bin over $corp ($FUZZ_SECS s) ==="
+            set +e
+            "./$bin" \
+              -max_total_time="$FUZZ_SECS" \
+              -print_final_stats=1 \
+              -artifact_prefix="crash-${bin}-" \
+              "$corp/"
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+              echo "❌ $bin found a crash (exit $rc)"
+              exit 1
+            fi
+            echo "✓ $bin: no crashes in ${FUZZ_SECS}s"
+          done
 
       - name: Minimize and persist corpus growth
         if: success() && github.event_name == 'schedule'
         run: |
           cd fuzz
-          mkdir -p corpus-min
-          ../fuzz_snapshot -merge=1 corpus-min/ corpus/
-          merged=$(find corpus-min -type f | wc -l)
-          echo "Merged corpus: $merged units"
+          for t in fuzz_snapshot:corpus fuzz_statuses:corpus_statuses; do
+            bin="${t%%:*}"; corp="${t##*:}"
+            mkdir -p "${corp}-min"
+            "./$bin" -merge=1 "${corp}-min/" "$corp/"
+            echo "Merged $corp: $(find "${corp}-min" -type f | wc -l) units"
+          done
 
       - name: Upload crash artifacts
         if: failure()
@@ -103,5 +111,5 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/fuzz/corpus-min
+          path: ${{ github.workspace }}/fuzz/*-min
           retention-days: 30

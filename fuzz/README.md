@@ -1,9 +1,22 @@
 # Fuzzing
 
-Coverage-guided fuzzing of `ngx_http_error_abuse_validate_snapshot()` in
-[`../ngx_http_error_abuse_module.c`](../ngx_http_error_abuse_module.c) — the
-gate that walks the untrusted on-disk persistence snapshot before
-`ngx_http_error_abuse_load()` reads it back into shared memory.
+Coverage-guided fuzzing of the two untrusted-input parsers in
+[`../ngx_http_error_abuse_module.c`](../ngx_http_error_abuse_module.c):
+
+- **`fuzz_snapshot`** → `ngx_http_error_abuse_validate_snapshot()` — the
+  gate that walks the untrusted on-disk persistence snapshot before
+  `ngx_http_error_abuse_load()` reads it back into shared memory.
+- **`fuzz_statuses`** → `ngx_http_error_abuse_parse_statuses()` — the
+  `"403,404,500-599"` status-list parser. It walks the list with
+  `ngx_strlchr`/`ngx_atoi` and, for each status in each range, sets a bit
+  in `zone->statuses[status >> 3]` — an **OOB-write** surface if the
+  `first<100 / final<first / final>MAX_STATUS` guard is ever weakened.
+  The harness puts the bitmap at the tail of an exact-sized heap object
+  so any single-byte over-write is an immediate ASAN failure.
+
+Both parsers are sliced verbatim into `generated_parser.inc`; the section
+below describes the snapshot target in detail and the no-copy-drift setup
+that applies to both.
 
 ## Why this target
 

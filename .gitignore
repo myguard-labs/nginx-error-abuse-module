@@ -6,5 +6,6 @@ build/
 objs/
 fuzz/generated_parser.inc
 fuzz/fuzz_snapshot
+fuzz/fuzz_statuses
 fuzz/crash-*
-fuzz/corpus-min/
+fuzz/*-min/

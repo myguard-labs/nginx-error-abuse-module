@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
-# Slice the verbatim body of ngx_http_error_abuse_validate_snapshot() out
-# of the shipped ../ngx_http_error_abuse_module.c into
-# generated_parser.inc. That function is the security gate that walks the
-# untrusted on-disk snapshot with pointer arithmetic against p/last before
-# load() consumes it.
+# Slice the verbatim bodies of the untrusted-input parsers out of the
+# shipped ../ngx_http_error_abuse_module.c into generated_parser.inc:
 #
-# This keeps the fuzz target locked to production code: there is no
-# hand-maintained copy of the validator. If the signature or body changes
-# upstream, the next fuzz build picks it up automatically. If the function
-# can no longer be found, we fail loudly rather than fuzz nothing.
+#   ngx_http_error_abuse_parse_statuses()     - the "404,500-599" status
+#       list parser; walks attacker-shaped bytes with ngx_strlchr/ngx_atoi
+#       and sets bits in zone->statuses[status >> 3] (an OOB-WRITE surface).
+#   ngx_http_error_abuse_validate_snapshot()  - the on-disk snapshot gate;
+#       pointer arithmetic over the persistence buffer before load() reads it.
+#
+# This keeps the fuzz targets locked to production code: there is no
+# hand-maintained copy. If a signature or body changes upstream, the next
+# fuzz build picks it up. If a function can no longer be found, we fail
+# loudly rather than fuzz nothing.
 
 set -euo pipefail
 
@@ -22,13 +25,14 @@ if [ ! -f "$SRC" ]; then
     exit 1
 fi
 
-# Capture from the `static ngx_int_t` return-type line whose following
-# definition line is ngx_http_error_abuse_validate_snapshot(, through the
-# matching closing brace in column 1 (nginx style: definitions close with
-# a bare `}`).
+# Capture each function from its `static ngx_int_t` return-type line
+# (whose following definition line names a target parser) through the
+# matching closing brace in column 1 (nginx style: a bare `}`). Both share
+# the return-type line, so match on the definition line that follows.
+# Emitted in source order (parse_statuses precedes validate_snapshot).
 awk '
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
-    pending && /^ngx_http_error_abuse_validate_snapshot\(/ {
+    pending && /^ngx_http_error_abuse_(parse_statuses|validate_snapshot)\(/ {
         capture = 1; pending = 0; print buf; print; next
     }
     pending { pending = 0; buf = "" }
@@ -38,13 +42,14 @@ awk '
     }
 ' "$SRC" > "$OUT"
 
-if ! grep -q 'ngx_http_error_abuse_validate_snapshot' "$OUT" \
+if ! grep -q 'ngx_http_error_abuse_parse_statuses' "$OUT" \
+   || ! grep -q 'ngx_http_error_abuse_validate_snapshot' "$OUT" \
    || [ "$(tail -n1 "$OUT")" != "}" ]; then
-    echo "✗ failed to extract validate_snapshot() from $SRC" >&2
+    echo "✗ failed to extract the parsers from $SRC" >&2
     echo "  (source layout changed? update extract_parser.sh)" >&2
     rm -f "$OUT"
     exit 1
 fi
 
 LINES=$(wc -l < "$OUT")
-echo "✓ extracted ngx_http_error_abuse_validate_snapshot() — $LINES lines -> $OUT"
+echo "✓ extracted parse_statuses() + validate_snapshot() — $LINES lines -> $OUT"

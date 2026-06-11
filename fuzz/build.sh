@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 #
-# Build the snapshot-validator libFuzzer target.
-# Usage: fuzz/build.sh [output-binary]
+# Build the error-abuse libFuzzer targets.
+# Usage: fuzz/build.sh [output-dir-or-binary]
+#
+#   - no arg          : build both targets into fuzz/
+#   - a directory     : build both targets into that dir
+#   - a file path      : build ONLY the snapshot target to that path
+#                        (back-compat for the CI step that passes an
+#                        explicit fuzz_snapshot output name)
 #
 # Requires clang with libFuzzer (clang >= 6). CFLAGS/CC overridable for
 # OSS-Fuzz / ClusterFuzzLite, which pass their own sanitizer flags.
@@ -9,7 +15,6 @@
 set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-$FUZZ_DIR/fuzz_snapshot}"
 CC="${CC:-clang}"
 
 # OSS-Fuzz sets $LIB_FUZZING_ENGINE and its own $CFLAGS; honour them.
@@ -18,10 +23,19 @@ CFLAGS="${CFLAGS:--g -O1 -fsanitize=address,undefined -fno-sanitize-recover=unde
 
 bash "$FUZZ_DIR/extract_parser.sh"
 
-# shellcheck disable=SC2086
-"$CC" $CFLAGS $ENGINE \
-    -I"$FUZZ_DIR" \
-    "$FUZZ_DIR/fuzz_snapshot.c" \
-    -o "$OUT"
+build_one() {
+    local src="$1" out="$2"
+    # shellcheck disable=SC2086
+    "$CC" $CFLAGS $ENGINE -I"$FUZZ_DIR" "$FUZZ_DIR/$src" -o "$out"
+    echo "✓ built fuzz target: $out"
+}
 
-echo "✓ built fuzz target: $OUT"
+ARG="${1:-}"
+if [ -n "$ARG" ] && [ ! -d "$ARG" ]; then
+    # Explicit single-file output path -> snapshot target only (CI compat).
+    build_one fuzz_snapshot.c "$ARG"
+else
+    DIR="${ARG:-$FUZZ_DIR}"
+    build_one fuzz_snapshot.c "$DIR/fuzz_snapshot"
+    build_one fuzz_statuses.c "$DIR/fuzz_statuses"
+fi
