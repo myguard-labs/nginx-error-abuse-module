@@ -283,7 +283,11 @@ class Nginx:
             str(self.root / "conf" / "nginx.conf"),
         ]
         if test:
+            # Syntax check runs with the bare binary: nginx -t never frees the
+            # cycle pool, so the Valgrind/ASan runner would flag intrinsic
+            # nginx leaks and mask the real config-test result.
             command.append("-t")
+            return command
         elif self.single_process:
             command.extend(["-g", "daemon off; master_process off;"])
         else:
@@ -516,7 +520,10 @@ http {{
 """,
         encoding="ascii",
     )
-    command = shlex.split(runner) + [
+    # Run the syntax check with the bare binary, never the leak-checker runner:
+    # nginx's -t path intentionally never frees the cycle pool, so Valgrind
+    # always reports indirect leaks and --error-exitcode masks the real result.
+    command = [
         str(binary), "-p", str(bad), "-c", str(bad / "conf" / "nginx.conf"),
         "-t",
     ]
@@ -546,7 +553,10 @@ http {{
 """,
         encoding="ascii",
     )
-    command = shlex.split(runner) + [
+    # Bare binary, never the leak-checker runner (see expect_invalid_config):
+    # nginx -t leaves the cycle pool unfreed, so Valgrind's leak exit code
+    # would fail an otherwise valid config.
+    command = [
         str(binary), "-p", str(good), "-c", str(good / "conf" / "nginx.conf"),
         "-t",
     ]

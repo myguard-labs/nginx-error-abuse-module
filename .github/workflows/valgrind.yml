@@ -51,6 +51,10 @@ jobs:
           runner="valgrind --tool=memcheck --track-origins=yes --leak-check=full"
           runner="$runner --show-leak-kinds=definite,indirect"
           runner="$runner --errors-for-leak-kinds=definite,indirect --error-exitcode=99"
+          # Suppress nginx-core arenas that nginx intentionally never frees at
+          # exit (env + event_process_init), pinned to their core frames so a
+          # real module leak still fails the job.
+          runner="$runner --suppressions=$GITHUB_WORKSPACE/tools/valgrind.supp"
           runner="$runner --log-file=$GITHUB_WORKSPACE/valgrind-%p.log"
           python3 tools/test_runtime.py \
             --single-process \

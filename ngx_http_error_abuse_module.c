@@ -3012,6 +3012,14 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
     for (i = 0; i < mcf->zones.nelts; i++) {
         if (zones[i]->persist.len != 0) {
             (void) ngx_http_error_abuse_save(zones[i], cycle->log);
+            /* Release the reused serialize buffer (the thread pool has already
+             * been drained by its own earlier exit handler, so no in-flight
+             * write still references it). */
+            if (zones[i]->persist_buf != NULL) {
+                ngx_free(zones[i]->persist_buf);
+                zones[i]->persist_buf = NULL;
+                zones[i]->persist_buf_cap = 0;
+            }
         }
     }
 }
