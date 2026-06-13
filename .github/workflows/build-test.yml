@@ -292,7 +292,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev \
-            cpanminus libtest-nginx-perl
+            cpanminus libio-socket-ssl-perl
+          # libtest-nginx-perl is not packaged on ubuntu-24.04 runners; install
+          # Test::Nginx from CPAN instead (cpanminus is available via apt).
+          sudo cpanm --notest --quiet Test::Nginx
 
       # CI-6: run the Test::Nginx smoke suite against the built dynamic module.
       - name: Build dynamic module
