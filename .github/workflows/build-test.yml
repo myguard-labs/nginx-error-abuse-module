@@ -116,6 +116,11 @@ jobs:
           ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
 
       - name: Strict module compile
+        # Skip for Angie: its own headers (ngx_module.h) are not clean under
+        # the extra -Wstrict-prototypes we add here, which is an Angie header
+        # issue, not this module's. The Angie build above already compiled the
+        # module under Angie's own -Werror.
+        if: matrix.flavor != 'angie'
         run: |
           build=".build/${{ matrix.flavor }}-${{ matrix.version }}"
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
@@ -177,8 +182,13 @@ jobs:
           (
             cd "nginx-${ver}"
             # 32-bit headers so NGX_PTR_SIZE/time_t match the syntax check.
+            # This is a compile-syntax check only (never linked or run), so
+            # disable the modules that would otherwise demand 32-bit zlib/PCRE
+            # at configure time (gzip needs zlib; both are unneeded here).
             ./configure --with-compat --with-threads \
               --without-http_rewrite_module \
+              --without-http_gzip_module \
+              --without-pcre \
               --with-cc-opt="-m32" --with-ld-opt="-m32" \
               --add-dynamic-module="$GITHUB_WORKSPACE" || cat objs/autoconf.err
           )
