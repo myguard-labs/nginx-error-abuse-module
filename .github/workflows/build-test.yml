@@ -168,10 +168,12 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y gcc-multilib curl libpcre2-dev zlib1g-dev \
-            libhiredis-dev libssl-dev:i386 libhiredis-dev:i386 || \
-          sudo apt-get install -y gcc-multilib curl libpcre2-dev zlib1g-dev \
-            libhiredis-dev
+          # gcc-multilib provides -m32 + 32-bit libc/crt. The module #includes
+          # <openssl/*> whose opensslconf.h is arch-split, so the 32-bit
+          # libssl-dev:i386 is required for the -m32 syntax check; hiredis
+          # headers are arch-independent, so the 64-bit package suffices.
+          sudo apt-get install -y \
+            gcc-multilib curl libhiredis-dev libssl-dev:i386
 
       - name: Configure nginx as 32-bit and syntax-check the module
         run: |
