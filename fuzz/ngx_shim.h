@@ -43,6 +43,9 @@ typedef struct {
 /* Snapshot constants + LE getters used by validate_snapshot (RFC-3) —
  * keep in sync with the .c. */
 #define NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN  20
+/* SEC-3: identities are a fixed 32-byte SHA-256 digest; validate_snapshot
+ * rejects any other key length. Mirror the .c constant for the sliced body. */
+#define NGX_HTTP_ERROR_ABUSE_DIGEST_LEN    32
 
 static inline uint16_t
 ngx_http_error_abuse_get_u16(const u_char *p)

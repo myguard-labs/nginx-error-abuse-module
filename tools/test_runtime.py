@@ -125,7 +125,14 @@ events {{
 http {{
     access_log off;
 
+    # Exercise the three exposed variables end-to-end at the log phase, where
+    # the request ctx state is fully settled.
+    log_format eavars '$uri $error_abuse_status $error_abuse_count '
+                      '$error_abuse_blocked_until';
+
 {redis}{redis_zone}
+    error_abuse_zone zone=vars:1m key=$binary_remote_addr
+                     statuses=404 interval=30s threshold=2 block=30s;
     error_abuse_zone zone=basic:1m key=$binary_remote_addr
                      statuses=403,404 interval=5s threshold=3 block=2s
                      persist={root}/basic.state persist_interval=100ms;
@@ -217,6 +224,17 @@ http {{
         }}
         location = /secret-ok {{
             error_abuse zone=secret status=429;
+            empty_gif;
+        }}
+
+        location = /var-error {{
+            error_abuse zone=vars status=429;
+            access_log {root}/logs/vars.log eavars;
+            root {root}/empty;
+        }}
+        location = /var-ok {{
+            error_abuse zone=vars status=429;
+            access_log {root}/logs/vars.log eavars;
             empty_gif;
         }}
 {redis_locations}
@@ -829,6 +847,32 @@ def main() -> int:
             nginx.start()
             expect(args.port, "/secret-ok", 200)   # not restored
             nginx.stop()
+
+            # Exposed variables: drive PASSED -> COUNTED -> BLOCKED and assert
+            # $error_abuse_status / _count / _blocked_until via the access log.
+            nginx.start()
+            expect(args.port, "/var-ok", 200)       # 200 untracked -> PASSED
+            expect(args.port, "/var-error", 404)    # 1st 404      -> COUNTED 1
+            expect(args.port, "/var-error", 404)    # threshold    -> BLOCKED 2
+            expect(args.port, "/var-error", 429)    # now banned   -> BLOCKED 2
+            time.sleep(0.3)
+            nginx.stop()
+
+            vars_log = nginx.root / "logs" / "vars.log"
+            lines = [ln.split() for ln in
+                     vars_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            if len(lines) != 4:
+                raise AssertionError(f"vars.log expected 4 lines, got {lines}")
+            states = [ln[1] for ln in lines]
+            if states != ["PASSED", "COUNTED", "BLOCKED", "BLOCKED"]:
+                raise AssertionError(f"unexpected $error_abuse_status: {states}")
+            if lines[0][2] != "0" or lines[0][3] != "0":
+                raise AssertionError(f"PASSED count/until not zero: {lines[0]}")
+            if lines[1][2] != "1" or lines[1][3] != "0":
+                raise AssertionError(f"COUNTED expected count=1 until=0: {lines[1]}")
+            for ln in lines[2:]:
+                if ln[2] != "2" or int(ln[3]) <= 0:
+                    raise AssertionError(f"BLOCKED expected count=2 until>0: {ln}")
 
             nginx.assert_clean_logs()
         finally:

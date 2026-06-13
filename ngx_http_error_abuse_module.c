@@ -46,7 +46,8 @@
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION 30
 
 typedef struct {
-    ngx_str_t   host;
+    ngx_str_t   host;       /* numeric address (resolved at config time) */
+    ngx_str_t   sni;        /* original host text, for TLS SNI + cert verify */
     ngx_str_t   prefix;
     ngx_str_t   user;
     ngx_str_t   password;
@@ -92,6 +93,8 @@ struct ngx_http_error_abuse_zone_s {
     ngx_str_t                         persist_secret;  /* SEC-5: HMAC key */
     ngx_msec_t                        persist_interval;
     ngx_event_t                       persist_event;
+    u_char                           *persist_buf;     /* reused serialize buf */
+    size_t                            persist_buf_cap;
     ngx_flag_t                        redis;
 #if (NGX_THREADS)
     ngx_thread_task_t                *persist_task;   /* PERF-1 */
@@ -952,6 +955,13 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
 
     ctx->response_seen = 1;
 
+    /* COR-2: an error_page internal redirect can land the response in a
+     * location whose dry_run= differs from where the ctx was first prepared
+     * (preaccess). Re-derive it from the location actually producing this
+     * response so enforcement and observation follow the final location
+     * deterministically, matching conf->log_level used below. */
+    ctx->dry_run = conf->dry_run;
+
     /* SEC-2/RFC-1/RFC-2: this is our own synthetic rejection; tag it private,
      * no-store and (for 429/503) Retry-After so it is never shared-cached. */
     if (ctx->own_rejection) {
@@ -1348,6 +1358,11 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             parsed_size = ngx_parse_size(&(ngx_str_t) {
                 (size_t) (value[i].data + value[i].len - p - 1), p + 1
             });
+            if (parsed_size == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "error_abuse zone has invalid size");
+                return NGX_CONF_ERROR;
+            }
             if (parsed_size < (ssize_t) (8 * ngx_pagesize)) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "error_abuse zone is too small");
@@ -1926,14 +1941,55 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    mcf->redis.host.data = ngx_pnalloc(cf->pool, host.len + 1);
+    /* Resolve the host to a numeric address at config time. redisAsyncConnect
+     * otherwise calls getaddrinfo() synchronously inside the worker event
+     * loop on every (re)connect; a slow or hung resolver would then stall all
+     * request processing in that worker for the duration of a Redis outage
+     * (reconnects fire on a 1s..30s backoff). Handing hiredis a numeric
+     * address keeps the connect path non-blocking. */
+    {
+        ngx_url_t  u;
+        u_char     text[NGX_SOCKADDR_STRLEN];
+        size_t     tlen;
+
+        /* Keep the original host text for TLS SNI + certificate hostname
+         * verification, since the connect address is now numeric. */
+        mcf->redis.sni.data = ngx_pnalloc(cf->pool, host.len + 1);
+        if (mcf->redis.sni.data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memcpy(mcf->redis.sni.data, host.data, host.len);
+        mcf->redis.sni.data[host.len] = '\0';
+        mcf->redis.sni.len = host.len;
+
+        ngx_memzero(&u, sizeof(ngx_url_t));
+        u.url = host;
+        u.default_port = mcf->redis.port;
+
+        if (ngx_parse_url(cf->pool, &u) != NGX_OK || u.naddrs == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "error_abuse_redis cannot resolve host \"%V\"%s%s",
+                               &host, u.err ? ": " : "",
+                               u.err ? u.err : "");
+            return NGX_CONF_ERROR;
+        }
+
+        tlen = ngx_sock_ntop(u.addrs[0].sockaddr, u.addrs[0].socklen,
+                             text, NGX_SOCKADDR_STRLEN, 0);
+
+        mcf->redis.host.data = ngx_pnalloc(cf->pool, tlen + 1);
+        if (mcf->redis.host.data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memcpy(mcf->redis.host.data, text, tlen);
+        mcf->redis.host.data[tlen] = '\0';
+        mcf->redis.host.len = tlen;
+    }
+
     mcf->redis.prefix.data = ngx_pnalloc(cf->pool, prefix.len);
-    if (mcf->redis.host.data == NULL || mcf->redis.prefix.data == NULL) {
+    if (mcf->redis.prefix.data == NULL) {
         return NGX_CONF_ERROR;
     }
-    ngx_memcpy(mcf->redis.host.data, host.data, host.len);
-    mcf->redis.host.data[host.len] = '\0';
-    mcf->redis.host.len = host.len;
     ngx_memcpy(mcf->redis.prefix.data, prefix.data, prefix.len);
     mcf->redis.prefix.len = prefix.len;
 
@@ -2755,7 +2811,7 @@ ngx_http_error_abuse_redis_connect(void)
             redisInitOpenSSL();
             worker->ssl = redisCreateSSLContext(
                 NULL, "/etc/ssl/certs", NULL, NULL,
-                (char *) worker->conf->host.data, &ssl_err);
+                (char *) worker->conf->sni.data, &ssl_err);
             if (worker->ssl == NULL) {
                 ngx_log_error(NGX_LOG_ERR, worker->log, 0,
                     "error_abuse: Redis TLS context init failed: %s",
@@ -2975,7 +3031,9 @@ ngx_http_error_abuse_persist_complete(ngx_event_t *ev)
 {
     ngx_http_error_abuse_save_ctx_t  *ctx = ev->data;
 
-    ngx_free(ctx->buffer);
+    /* ctx->buffer points at the zone-owned reusable serialize buffer; the next
+     * serialize reuses it. Just clear the handle and release the in-flight
+     * guard so the next tick can serialize again. */
     ctx->buffer = NULL;
     ctx->zone->persist_busy = 0;
 }
@@ -3006,11 +3064,11 @@ ngx_http_error_abuse_persist_handler(ngx_event_t *ev)
                         != NGX_OK)
                     {
                         /* Could not queue: fall back to a synchronous write
-                         * this tick rather than dropping the snapshot. */
+                         * this tick rather than dropping the snapshot. The
+                         * buffer is zone-owned and reused — do not free. */
                         zone->persist_busy = 0;
                         (void) ngx_http_error_abuse_write_file(ctx->buffer,
                             ctx->len, &zone->persist, ev->log);
-                        ngx_free(ctx->buffer);
                         ctx->buffer = NULL;
                     }
                 }
@@ -3123,11 +3181,27 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
     ngx_http_error_abuse_node_t  *ean;
 
     capacity = zone->shm_zone->shm.size;
-    /* SEC-5: reserve room for the trailing HMAC when a secret is configured. */
-    buffer = ngx_alloc(capacity + NGX_HTTP_ERROR_ABUSE_MAC_LEN, log);
-    if (buffer == NULL) {
-        return NULL;
+    /* SEC-5: reserve room for the trailing HMAC when a secret is configured.
+     * PERF: serialize runs single-threaded (event loop, never concurrent with
+     * an in-flight write — persist_busy gates that), so keep one grow-only
+     * buffer per zone instead of mmap/munmap-ing the whole shm size every
+     * persist tick. Owned by the zone; never freed by the caller. */
+    {
+        size_t  need = capacity + NGX_HTTP_ERROR_ABUSE_MAC_LEN;
+
+        if (zone->persist_buf == NULL || zone->persist_buf_cap < need) {
+            u_char  *nb = ngx_alloc(need, log);
+            if (nb == NULL) {
+                return NULL;
+            }
+            if (zone->persist_buf != NULL) {
+                ngx_free(zone->persist_buf);
+            }
+            zone->persist_buf = nb;
+            zone->persist_buf_cap = need;
+        }
     }
+    buffer = zone->persist_buf;
 
     p = buffer + NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN;
     last = buffer + capacity;
@@ -3192,8 +3266,7 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "error_abuse: HMAC computation failed for \"%V\"",
                           &zone->persist);
-            ngx_free(buffer);
-            return NULL;
+            return NULL;   /* buffer is zone-owned; reused next tick */
         }
         p += NGX_HTTP_ERROR_ABUSE_MAC_LEN;
     }
@@ -3296,7 +3369,7 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     }
 
     rc = ngx_http_error_abuse_write_file(buffer, len, &zone->persist, log);
-    ngx_free(buffer);
+    /* buffer is zone-owned and reused on the next serialize — do not free. */
     return rc;
 }
 
@@ -3449,7 +3522,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         rec_seen = (int64_t) ngx_http_error_abuse_get_u64(p + 12);
         p += NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN;
 
-        if (rec_key_len == 0
+        if (rec_key_len != NGX_HTTP_ERROR_ABUSE_DIGEST_LEN
             || rec_event_count > zone->threshold
             || (size_t) (last - p)
                < (size_t) rec_key_len + (size_t) rec_event_count * 8)
@@ -3478,8 +3551,16 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
             }
         }
 
-        ean->blocked_until = (rec_blocked > (int64_t) now)
-                             ? (time_t) rec_blocked : 0;
+        /* Clamp a restored ban to at most now+block so a forged or stale
+         * snapshot cannot install a ban decades in the future (and the
+         * (time_t) cast cannot truncate on 32-bit) — mirrors STAB-1. */
+        if (rec_blocked > (int64_t) now) {
+            int64_t max_deadline = (int64_t) now + (int64_t) zone->block;
+            ean->blocked_until = (time_t) (rec_blocked < max_deadline
+                                           ? rec_blocked : max_deadline);
+        } else {
+            ean->blocked_until = 0;
+        }
         ean->last_seen = (rec_seen > 0 && rec_seen <= (int64_t) now)
                          ? (time_t) rec_seen : now;
         ean->event_head = 0;
@@ -3533,7 +3614,12 @@ ngx_http_error_abuse_validate_snapshot(ngx_http_error_abuse_zone_t *zone,
         rec_event_count = ngx_http_error_abuse_get_u16(p + 2);
         p += NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN;
 
-        if (rec_key_len == 0 || rec_event_count > zone->threshold) {
+        /* Identities are always a fixed 32-byte SHA-256 digest (SEC-3); a
+         * record with any other key length is forged or corrupt — reject the
+         * whole snapshot rather than admit an unmatchable dead-weight node. */
+        if (rec_key_len != NGX_HTTP_ERROR_ABUSE_DIGEST_LEN
+            || rec_event_count > zone->threshold)
+        {
             return NGX_ERROR;
         }
 
