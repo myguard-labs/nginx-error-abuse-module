@@ -15,9 +15,12 @@ __DATA__
         error_abuse zone=test status=429;
         return 404;
     }
+    # NB: the block is enforced in the preaccess phase. `return` is handled in
+    # the rewrite phase and finalizes before preaccess runs, so the enforced
+    # request must use a normal content handler (here empty_gif) to reach it.
     location = /ok {
         error_abuse zone=test status=429;
-        return 200 "ok";
+        empty_gif;
     }
 --- pipelined_requests eval
 ["GET /missing", "GET /missing", "GET /missing", "GET /ok"]
@@ -43,11 +46,11 @@ __DATA__
     error_abuse_zone zone=test3:1m key=$binary_remote_addr
                      statuses=404 interval=10s threshold=1 block=30s;
 --- config
-    location / {
+    location = /dry {
         error_abuse zone=test3 dry_run=on;
         return 404;
     }
 --- pipelined_requests eval
-["GET /first", "GET /second"]
+["GET /dry", "GET /dry"]
 --- error_code eval
 [404, 404]

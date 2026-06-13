@@ -56,7 +56,6 @@ cd "$ROOT/$DIR"
     --with-debug \
     --with-threads \
     --with-http_realip_module \
-    --without-http_rewrite_module \
     $WITH_CC \
     --with-cc-opt="$CC_OPT" \
     --with-ld-opt="$LD_OPT" \
