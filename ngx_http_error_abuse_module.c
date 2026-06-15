@@ -536,18 +536,23 @@ ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
     uint32_t hash, ngx_str_t *key, time_t now)
 {
     size_t                          size;
+    size_t                          key_len;
     ngx_http_error_abuse_node_t    *ean;
 
     /* SEC: the key is always a fixed-size SHA-256 digest, produced internally
      * (request handler) or validated against NGX_HTTP_ERROR_ABUSE_DIGEST_LEN on
      * the persistence-load path. Reject anything larger so the allocation size
      * can never be driven by a forged/corrupt key length (CWE-789), and so the
-     * (u_short) key_len cast below cannot truncate. */
+     * (u_short) key_len cast below cannot truncate. The result is copied into a
+     * local whose value is provably in [0, NGX_HTTP_ERROR_ABUSE_DIGEST_LEN] and
+     * which is the only length used for sizing, allocation and the key copy —
+     * giving the allocation size a fixed, non-tainted upper bound. */
     if (key->len > NGX_HTTP_ERROR_ABUSE_DIGEST_LEN) {
         return NULL;
     }
+    key_len = key->len;
 
-    size = ngx_http_error_abuse_node_size(key->len, zone->threshold);
+    size = ngx_http_error_abuse_node_size(key_len, zone->threshold);
     ean = ngx_slab_alloc_locked(zone->shpool, size);
 
     if (ean == NULL) {
@@ -572,9 +577,9 @@ ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
 
     ngx_memzero(ean, size);
     ean->node.key = hash;
-    ean->key_len = (u_short) key->len;
+    ean->key_len = (u_short) key_len;
     ean->last_seen = now;
-    ngx_memcpy(ean->data, key->data, key->len);
+    ngx_memcpy(ean->data, key->data, key_len);
 
     ngx_rbtree_insert(&zone->sh->rbtree, &ean->node);
     ngx_queue_insert_head(&zone->sh->queue, &ean->queue);
