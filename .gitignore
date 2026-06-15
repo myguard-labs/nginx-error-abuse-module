@@ -9,3 +9,10 @@ fuzz/fuzz_snapshot
 fuzz/fuzz_statuses
 fuzz/crash-*
 fuzz/*-min/
+# Test::Nginx runtime tree (regenerated per run)
+t/servroot/
+# fuzzer-discovered corpus entries are regenerated locally; the curated seed
+# inputs (descriptively named, e.g. fuzz/corpus/one_record.bin) stay tracked,
+# while these wildcards keep newly discovered hash-named inputs out of git.
+fuzz/corpus/*
+fuzz/corpus_statuses/*

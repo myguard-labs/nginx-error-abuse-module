@@ -123,6 +123,15 @@ deadline.
 
 Points the module at one Redis server (see below).
 
+`host=` is resolved to a numeric address **once, at config load**, so the worker
+event loop never blocks on `getaddrinfo()` when (re)connecting. Two consequences:
+a name with several A records is pinned to its **first** address for the life of
+the config (no client-side DNS failover — reload to re-resolve), and if the name
+cannot be resolved at load time the module logs a warning and falls back to
+resolving it in the worker (which can briefly block the event loop on reconnect
+during an outage) rather than failing the reload. **Prefer a numeric IP** for a
+Redis behind volatile DNS.
+
 ### Variables
 
 - `$error_abuse_status` — `BYPASSED`, `PASSED`, `COUNTED`, `BLOCKED`, or `DRY_RUN`.

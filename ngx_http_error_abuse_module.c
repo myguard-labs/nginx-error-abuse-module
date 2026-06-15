@@ -263,6 +263,13 @@ static const char ngx_http_error_abuse_redis_record_script[] =
     "redis.call('DEL',KEYS[1]) return {1,n,deadline} end "
     "return {0,n}";
 
+/* SHA1 hex of the record script. The script never changes, so this is computed
+ * once at init_process; record() then uses EVALSHA instead of shipping the full
+ * ~470-byte script on every tracked error response. The script is primed into
+ * the Redis script cache via SCRIPT LOAD on each (re)connect, and a NOSCRIPT
+ * reply (cache flushed) re-primes it. */
+static u_char ngx_http_error_abuse_script_sha[40];
+
 static ngx_conf_enum_t ngx_http_error_abuse_log_levels[] = {
     { ngx_string("info"), NGX_LOG_INFO },
     { ngx_string("notice"), NGX_LOG_NOTICE },
@@ -1980,24 +1987,37 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         u.url = host;
         u.default_port = mcf->redis.port;
 
+        /* Resolve to a numeric address at config time so redisAsyncConnect does
+         * not call getaddrinfo() synchronously inside the worker event loop on
+         * every (re)connect. Only u.addrs[0] is used, so a multi-A / DNS-
+         * failover name is pinned to its first address for the life of the
+         * config. If resolution fails (e.g. a transient DNS outage at reload),
+         * do NOT fail the whole configuration — that would couple every reload
+         * to Redis DNS and contradict the module's fail-open-on-Redis design.
+         * Fall back to handing hiredis the hostname (worker-time resolution,
+         * which can block the event loop on reconnect during an outage but
+         * keeps reloads working) and warn the operator to use a numeric IP. */
         if (ngx_parse_url(cf->pool, &u) != NGX_OK || u.naddrs == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "error_abuse_redis cannot resolve host \"%V\"%s%s",
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "error_abuse_redis cannot resolve host \"%V\" at "
+                               "config time%s%s; falling back to worker-time "
+                               "resolution (may block the event loop on "
+                               "reconnect); use a numeric IP to avoid this",
                                &host, u.err ? ": " : "",
                                u.err ? u.err : "");
-            return NGX_CONF_ERROR;
-        }
+            mcf->redis.host = mcf->redis.sni;
+        } else {
+            tlen = ngx_sock_ntop(u.addrs[0].sockaddr, u.addrs[0].socklen,
+                                 text, NGX_SOCKADDR_STRLEN, 0);
 
-        tlen = ngx_sock_ntop(u.addrs[0].sockaddr, u.addrs[0].socklen,
-                             text, NGX_SOCKADDR_STRLEN, 0);
-
-        mcf->redis.host.data = ngx_pnalloc(cf->pool, tlen + 1);
-        if (mcf->redis.host.data == NULL) {
-            return NGX_CONF_ERROR;
+            mcf->redis.host.data = ngx_pnalloc(cf->pool, tlen + 1);
+            if (mcf->redis.host.data == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            ngx_memcpy(mcf->redis.host.data, text, tlen);
+            mcf->redis.host.data[tlen] = '\0';
+            mcf->redis.host.len = tlen;
         }
-        ngx_memcpy(mcf->redis.host.data, text, tlen);
-        mcf->redis.host.data[tlen] = '\0';
-        mcf->redis.host.len = tlen;
     }
 
     mcf->redis.prefix.data = ngx_pnalloc(cf->pool, prefix.len);
@@ -2333,10 +2353,17 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
 
     } else if (reply->type == REDIS_REPLY_STRING) {
         /* COR-4: the block value is the absolute Unix deadline. */
+        time_t    now = ngx_time();
         ngx_int_t deadline = ngx_atoi((u_char *) reply->str, reply->len);
         ctx->redis_blocked = 1;
         ctx->blocked_until = (deadline > 0) ? (time_t) deadline
-                                            : ngx_time() + ctx->zone->block;
+                                            : now + ctx->zone->block;
+        /* Clamp a Redis-provided deadline to now+block (mirrors the snapshot
+         * SNAP-CLAMP on load) so a rogue or corrupt block value cannot drive a
+         * multi-decade Retry-After or local deadline. */
+        if (ctx->blocked_until > now + ctx->zone->block) {
+            ctx->blocked_until = now + ctx->zone->block;
+        }
         ctx->count = ctx->zone->threshold;
         ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -2396,6 +2423,24 @@ ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
         return;
     }
 
+    if (reply->type == REDIS_REPLY_ERROR && reply->str
+        && ngx_strncmp(reply->str, "NOSCRIPT", 8) == 0)
+    {
+        /* The script cache was flushed (e.g. SCRIPT FLUSH on the server). This
+         * one request's event is lost, but it is not a connection failure, so
+         * do not trip the breaker; re-prime the cache so subsequent EVALSHA
+         * calls succeed. */
+        (void) redisAsyncCommand(ac,
+            ngx_http_error_abuse_redis_handshake_callback, NULL,
+            "SCRIPT LOAD %b",
+            (const char *) ngx_http_error_abuse_redis_record_script,
+            (size_t) (sizeof(ngx_http_error_abuse_redis_record_script) - 1));
+        ngx_log_error(NGX_LOG_WARN, ngx_http_error_abuse_redis_worker.log, 0,
+                      "error_abuse: Redis script cache miss (NOSCRIPT); "
+                      "reloading record script");
+        return;
+    }
+
     ngx_http_error_abuse_redis_record_failure(ngx_time());
     ngx_log_error(NGX_LOG_WARN, ngx_http_error_abuse_redis_worker.log, 0,
                   "error_abuse: Redis EVAL returned unexpected reply (type %d)"
@@ -2440,10 +2485,10 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     (size_t) (ngx_snprintf((u_char *) (buf), sizeof(buf), "%L",               \
                            (int64_t) (value)) - (u_char *) (buf))
 
-    argv[0] = "EVAL";
-    argvlen[0] = 4;
-    argv[1] = ngx_http_error_abuse_redis_record_script;
-    argvlen[1] = sizeof(ngx_http_error_abuse_redis_record_script) - 1;
+    argv[0] = "EVALSHA";
+    argvlen[0] = 7;
+    argv[1] = (const char *) ngx_http_error_abuse_script_sha;
+    argvlen[1] = sizeof(ngx_http_error_abuse_script_sha);   /* 40 hex chars */
     argv[2] = "2";
     argvlen[2] = 1;
     argv[3] = (const char *) events.data;
@@ -2769,6 +2814,15 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
                 ngx_http_error_abuse_redis_handshake_callback, NULL,
                 "SELECT %d", (int) worker->conf->db);
         }
+        if (rc == REDIS_OK) {
+            /* Prime the script cache so request-path EVALSHA calls hit. hiredis
+             * preserves order, so this completes before any queued EVALSHA. */
+            rc = redisAsyncCommand(worker->context,
+                ngx_http_error_abuse_redis_handshake_callback, NULL,
+                "SCRIPT LOAD %b",
+                (const char *) ngx_http_error_abuse_redis_record_script,
+                (size_t) (sizeof(ngx_http_error_abuse_redis_record_script) - 1));
+        }
         if (rc != REDIS_OK) {
             worker->ready = 0;
             ngx_log_error(NGX_LOG_ERR, worker->log, 0,
@@ -2926,6 +2980,18 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
     }
 
     if (mcf->redis.configured) {
+        static const u_char  hex[] = "0123456789abcdef";
+        u_char               digest[20];
+        ngx_uint_t           k;
+
+        /* Precompute the EVALSHA digest of the (constant) record script. */
+        SHA1((const unsigned char *) ngx_http_error_abuse_redis_record_script,
+             sizeof(ngx_http_error_abuse_redis_record_script) - 1, digest);
+        for (k = 0; k < 20; k++) {
+            ngx_http_error_abuse_script_sha[k * 2] = hex[digest[k] >> 4];
+            ngx_http_error_abuse_script_sha[k * 2 + 1] = hex[digest[k] & 0x0f];
+        }
+
         ngx_memzero(&ngx_http_error_abuse_redis_worker,
                     sizeof(ngx_http_error_abuse_redis_worker));
         ngx_http_error_abuse_redis_worker.conf = &mcf->redis;
