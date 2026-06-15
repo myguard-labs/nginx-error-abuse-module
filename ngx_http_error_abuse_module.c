@@ -538,6 +538,15 @@ ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
     size_t                          size;
     ngx_http_error_abuse_node_t    *ean;
 
+    /* SEC: the key is always a fixed-size SHA-256 digest, produced internally
+     * (request handler) or validated against NGX_HTTP_ERROR_ABUSE_DIGEST_LEN on
+     * the persistence-load path. Reject anything larger so the allocation size
+     * can never be driven by a forged/corrupt key length (CWE-789), and so the
+     * (u_short) key_len cast below cannot truncate. */
+    if (key->len > NGX_HTTP_ERROR_ABUSE_DIGEST_LEN) {
+        return NULL;
+    }
+
     size = ngx_http_error_abuse_node_size(key->len, zone->threshold);
     ean = ngx_slab_alloc_locked(zone->shpool, size);
 
