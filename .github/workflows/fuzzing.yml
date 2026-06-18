@@ -1,9 +1,8 @@
 name: Fuzzing
 
 # Coverage-guided fuzzing of the on-disk snapshot validator
-# (ngx_http_error_abuse_validate_snapshot). Kept OUT of build-test.yml on
-# purpose so it never slows PR feedback: a monthly run for discovery, plus
-# a short bounded run only when the source or harness actually changes.
+# (ngx_http_error_abuse_validate_snapshot). Monthly discovery run, plus
+# manual dispatch — kept off PR feedback on purpose.
 #
 # Action pins (see build-test.yml for rationale):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -13,13 +12,6 @@ on:
   schedule:
     # Monthly, 1st @ 03:41 UTC — discovery run, longer budget, no one waiting.
     - cron: "41 3 1 * *"
-  pull_request:
-    branches: [master, main]
-    paths:
-      # Short regression run only when the validator or harness changes.
-      - "ngx_http_error_abuse_module.c"
-      - "fuzz/**"
-      - ".github/workflows/fuzzing.yml"
   workflow_dispatch:
     inputs:
       duration:

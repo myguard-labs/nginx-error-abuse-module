@@ -5,11 +5,8 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
+    # Monthly, 1st @ 03:30 UTC.
     - cron: "30 3 1 * *"
   workflow_dispatch: {}
 

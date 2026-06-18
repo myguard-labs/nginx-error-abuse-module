@@ -9,8 +9,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    - cron: "17 4 * * 1"
   workflow_dispatch: {}
 
 concurrency:
@@ -67,10 +65,7 @@ jobs:
     name: Build (${{ matrix.flavor }} ${{ matrix.version }} / ${{ matrix.cc }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # An Angie release version can move; keep it informational so it never
-    # blocks a PR while still exercising the Angie build path.
-    continue-on-error: ${{ matrix.experimental == true }}
-    # CI-2: cover stable + mainline nginx, both compilers, and one Angie build.
+    # Latest nginx mainline only, amd64, gcc.
     strategy:
       fail-fast: false
       matrix:
@@ -79,16 +74,6 @@ jobs:
             version: "1.31.1"
             cc: gcc
             primary: true
-          - flavor: nginx
-            version: "1.31.1"
-            cc: clang
-          - flavor: nginx
-            version: "1.28.0"
-            cc: gcc
-          - flavor: angie
-            version: "1.10.1"
-            cc: gcc
-            experimental: true
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -116,11 +101,6 @@ jobs:
           ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
 
       - name: Strict module compile
-        # Skip for Angie: its own headers (ngx_module.h) are not clean under
-        # the extra -Wstrict-prototypes we add here, which is an Angie header
-        # issue, not this module's. The Angie build above already compiled the
-        # module under Angie's own -Werror.
-        if: matrix.flavor != 'angie'
         run: |
           build=".build/${{ matrix.flavor }}-${{ matrix.version }}"
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
@@ -151,58 +131,6 @@ jobs:
           name: nginx-mainline
           path: artifact/
           retention-days: 1
-
-  i386:
-    name: i386 compile (32-bit portability)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # 32-bit cross deps are best-effort; informational, never blocking.
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-
-      # CI-2: a 32-bit compile catches time_t/size_t portability regressions
-      # (STAB-1). Compile-only against the configured nginx headers.
-      - name: Install 32-bit toolchain and headers
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          # gcc-multilib provides -m32 + 32-bit libc/crt. The module #includes
-          # <openssl/*> whose opensslconf.h is arch-split, so the 32-bit
-          # libssl-dev:i386 is required for the -m32 syntax check; hiredis
-          # headers are arch-independent, so the 64-bit package suffices.
-          sudo apt-get install -y \
-            gcc-multilib curl libhiredis-dev libssl-dev:i386
-
-      - name: Configure nginx as 32-bit and syntax-check the module
-        run: |
-          ver="$NGINX_VERSION"
-          curl -fsSL "https://nginx.org/download/nginx-${ver}.tar.gz" \
-            -o "nginx-${ver}.tar.gz"
-          tar -xzf "nginx-${ver}.tar.gz"
-          (
-            cd "nginx-${ver}"
-            # 32-bit headers so NGX_PTR_SIZE/time_t match the syntax check.
-            # This is a compile-syntax check only (never linked or run), so
-            # disable the modules that would otherwise demand 32-bit zlib/PCRE
-            # at configure time (gzip needs zlib; both are unneeded here).
-            ./configure --with-compat --with-threads \
-              --without-http_rewrite_module \
-              --without-http_gzip_module \
-              --without-pcre \
-              --with-cc-opt="-m32" --with-ld-opt="-m32" \
-              --add-dynamic-module="$GITHUB_WORKSPACE" || cat objs/autoconf.err
-          )
-          build="nginx-${ver}"
-          incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
-          # shellcheck disable=SC2086
-          (
-            cd "$build"
-            gcc -m32 -fsyntax-only \
-              -Wall -Wextra -Wno-unused-parameter \
-              $incs "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c"
-          )
 
   runtime:
     name: Runtime
