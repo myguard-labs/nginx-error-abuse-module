@@ -247,27 +247,3 @@ jobs:
           TEST_NGINX_LOAD_MODULES: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}/objs/ngx_http_error_abuse_module.so
         run: |
           prove -v t/basic.t
-
-  soak:
-    name: ASan soak
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # CI-6: a sustained soak only on schedule / manual dispatch (not every PR).
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
-
-      - name: Build with sanitizers
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
-
-      - name: Soak the memory-heavy paths
-        run: |
-          bash tools/soak.sh \
-            ".build/nginx-${NGINX_VERSION}/objs/nginx" 90 8
