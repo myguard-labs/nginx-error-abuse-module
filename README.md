@@ -1,7 +1,6 @@
 # nginx-error-abuse-module
 
 [![Build and Test](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/build-test.yml)
-[![Valgrind](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml)
 [![Security Scanners](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/security-scanners.yml)
 [![Fuzzing](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/fuzzing.yml)
