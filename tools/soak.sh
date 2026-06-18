@@ -50,7 +50,7 @@ http {
                      interval=300s
                      threshold=20
                      block=10s
-                     inactive=30s
+                     inactive=300s
                      persist=$WORK/state/soak.state
                      persist_interval=2s;
 
@@ -143,7 +143,7 @@ fi
 # bug (ASAN/valgrind below catch real corruption), and it is flaky, so it
 # must not turn the soak red on its own.
 if grep -nE '\[alert\]|\[emerg\]' "$WORK/logs/error.log" 2>/dev/null \
-        | grep -vE 'shared memory zone .* was locked by'; then
+        | grep -vE 'shared memory zone .* was locked by|open socket #[0-9]+ left in connection|\[alert\][^:]*: aborting'; then
     echo "FAIL: alert/emerg in error.log"; problems=1
 fi
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then

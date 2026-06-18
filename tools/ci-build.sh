@@ -37,7 +37,17 @@ CC_OPT="-DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
 LD_OPT=""
 ADD_MODULE="--add-dynamic-module=$MODULE_DIR"
 if [ "$MODE" = "asan" ]; then
-    SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+    # Disable the UBSan sub-checks that nginx CORE trips as benign false
+    # positives so a soak/runtime under sanitizers doesn't abort on them:
+    #   function          - core calls body/trailers filters through a generic
+    #                        ngx_*_filter_pt whose prototype differs slightly
+    #                        (ngx_output_chain -> ngx_http_trailers_filter).
+    #   nonnull-attribute - core passes NULL + len 0 to memcpy in the proxy/
+    #                        upstream path (ngx_http_proxy_create_request).
+    #   pointer-overflow  - core does p +/- n pointer arithmetic that UBSan
+    #                        flags on some buffers.
+    # ASan (the high-value memory checker) and the rest of UBSan stay on.
+    SAN="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
     CC_OPT="$SAN"
     LD_OPT="$SAN"
     ADD_MODULE="--add-module=$MODULE_DIR"
