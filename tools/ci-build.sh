@@ -47,7 +47,14 @@ if [ "$MODE" = "asan" ]; then
     #   pointer-overflow  - core does p +/- n pointer arithmetic that UBSan
     #                        flags on some buffers.
     # ASan (the high-value memory checker) and the rest of UBSan stay on.
-    SAN="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+    # These -fno-sanitize sub-check names are clang-specific; gcc's configure
+    # rejects nonnull-attribute/pointer-overflow. Only add them under clang
+    # (the local soak/stress path); gcc keeps plain -fsanitize (CI was green and
+    # gcc does not trip these core FPs the same way).
+    SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+    if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
+        SAN="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+    fi
     CC_OPT="$SAN"
     LD_OPT="$SAN"
     ADD_MODULE="--add-module=$MODULE_DIR"
