@@ -1,4 +1,14 @@
-name: Valgrind
+name: Helgrind
+
+# Thread-error (data-race / lock-order) detection under Valgrind Helgrind.
+# nginx workers are separate processes, but the module touches shared-memory
+# zones + (with --with-threads) the aio thread pool — helgrind covers that.
+# WIDE+LONG monthly run on the self-hosted builder02 lxc runner; replaces the
+# local nginx-module-stress cron's coverage. Mirrors valgrind.yml, tool swapped.
+#
+# Action pins (see build-test.yml for rationale):
+# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/upload-artifact@v5 -> 330a01c490aca151604b8cf639adc76d48f6c5d4
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -6,22 +16,21 @@ env:
 
 on:
   schedule:
-    # Monthly, 1st @ 03:30 UTC.
-    - cron: "30 3 1 * *"
+    # Monthly, 1st @ 04:30 UTC — offset from fuzz (03:41) and valgrind (03:30).
+    - cron: "30 4 1 * *"
   workflow_dispatch: {}
 
 concurrency:
-  group: valgrind-${{ github.ref }}
+  group: helgrind-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  memcheck:
-    name: Memcheck
+  helgrind:
+    name: Helgrind
     runs-on: [self-hosted, builder02, lxc]
-    # Long monthly memcheck soak on self-hosted — no GitHub 6h cap.
     timeout-minutes: 240
     steps:
       - name: Checkout
@@ -43,13 +52,11 @@ jobs:
       - name: Build debug server and module
         run: bash tools/ci-build.sh nginx "$NGINX_VERSION" debug
 
-      - name: Run runtime suite under Memcheck
+      - name: Run runtime suite under Helgrind
         run: |
-          runner="valgrind --tool=memcheck --track-origins=yes --leak-check=full"
-          runner="$runner --show-leak-kinds=definite,indirect"
-          runner="$runner --errors-for-leak-kinds=definite,indirect --error-exitcode=99"
+          runner="valgrind --tool=helgrind --error-exitcode=99"
           runner="$runner --suppressions=$GITHUB_WORKSPACE/tools/valgrind.supp"
-          runner="$runner --log-file=$GITHUB_WORKSPACE/valgrind-%p.log"
+          runner="$runner --log-file=$GITHUB_WORKSPACE/helgrind-%p.log"
           python3 tools/test_runtime.py \
             --single-process \
             --runner "$runner" \
@@ -57,21 +64,21 @@ jobs:
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" \
             --module "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/ngx_http_error_abuse_module.so"
 
-      - name: Verify Memcheck reports
+      - name: Verify Helgrind reports
         if: always()
         run: |
-          cat valgrind-*.log || true
-          if grep -Eq 'ERROR SUMMARY: [1-9][0-9]* errors' valgrind-*.log; then
+          cat helgrind-*.log || true
+          if grep -Eq 'ERROR SUMMARY: [1-9][0-9]* errors' helgrind-*.log; then
             exit 1
           fi
-          grep -Eq 'ERROR SUMMARY: 0 errors' valgrind-*.log
+          grep -Eq 'ERROR SUMMARY: 0 errors' helgrind-*.log
 
-      - name: Upload Memcheck reports
+      - name: Upload Helgrind reports
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          name: valgrind-reports
-          path: valgrind-*.log
+          name: helgrind-reports
+          path: helgrind-*.log
           retention-days: 14
 
       - name: Notify Discord on failure
