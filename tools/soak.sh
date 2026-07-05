@@ -79,11 +79,21 @@ export ASAN_OPTIONS
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:-}:print_stacktrace=1:halt_on_error=1"
 
 RUN=("$NGINX" -p "$WORK" -c "$WORK/conf/nginx.conf")
+# Suppression file lives at tools/valgrind.supp (nginx core pool/ssl leaks that
+# are never freed at exit). Passed to BOTH memcheck and helgrind so a real
+# module leak/race (which always carries an error_abuse_* frame) is never hidden.
+SUPP="$(cd "$(dirname "$0")" && pwd)/valgrind.supp"
 if [ "${USE_VALGRIND:-0}" = "1" ]; then
     VG=(valgrind --error-exitcode=99 --leak-check=full
         --errors-for-leak-kinds=definite
         --log-file="$WORK/logs/valgrind.%p")
-    SUPP="$(cd "$(dirname "$0")/.." && pwd)/valgrind.suppress"
+    [ -f "$SUPP" ] && VG+=(--suppressions="$SUPP")
+    RUN=("${VG[@]}" "${RUN[@]}")
+elif [ "${USE_HELGRIND:-0}" = "1" ]; then
+    # Data-race / lock-order checking (shm zone + --with-threads aio pool).
+    # --error-exitcode=99 makes a detected race FAIL the job (not grep-only).
+    VG=(valgrind --tool=helgrind --error-exitcode=99
+        --log-file="$WORK/logs/helgrind.%p")
     [ -f "$SUPP" ] && VG+=(--suppressions="$SUPP")
     RUN=("${VG[@]}" "${RUN[@]}")
 fi
@@ -96,7 +106,7 @@ for _ in $(seq 1 100); do
     sleep 0.1
 done
 
-echo "soak: ${DURATION}s, concurrency ${CONC}$( [ "${USE_VALGRIND:-0}" = 1 ] && echo ' (valgrind)')"
+echo "soak: ${DURATION}s, concurrency ${CONC}$( [ "${USE_VALGRIND:-0}" = 1 ] && echo ' (valgrind)'; [ "${USE_HELGRIND:-0}" = 1 ] && echo ' (helgrind)')"
 END=$(( $(date +%s) + DURATION ))
 saw_429="$WORK/logs/saw_429"
 
@@ -129,11 +139,12 @@ problems=0
 if ls "$WORK"/logs/asan* >/dev/null 2>&1; then
     echo "FAIL: ASAN/UBSAN report:"; cat "$WORK"/logs/asan*; problems=1
 fi
-if ls "$WORK"/logs/valgrind.* >/dev/null 2>&1; then
+if ls "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* >/dev/null 2>&1; then
     if grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' \
-            "$WORK"/logs/valgrind.* 2>/dev/null; then
-        echo "FAIL: valgrind errors:"
-        grep -E 'ERROR SUMMARY|definitely lost' "$WORK"/logs/valgrind.*
+            "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* 2>/dev/null; then
+        echo "FAIL: valgrind/helgrind errors:"
+        grep -E 'ERROR SUMMARY|definitely lost' \
+            "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* 2>/dev/null
         problems=1
     fi
 fi
