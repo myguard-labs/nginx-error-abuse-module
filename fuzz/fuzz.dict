@@ -1,0 +1,39 @@
+# libFuzzer dictionary for the error-abuse status-list parser
+# (ngx_http_error_abuse_parse_statuses). Grammar is a comma-separated list of
+# HTTP status codes and inclusive ranges, e.g. "403,404,500-599".
+#
+# NOTE: whitespace MUST be a hex escape (\x09 = TAB) — libFuzzer's
+# ParseDictionaryFile rejects a literal \t / \n.
+
+# Separators / range operator
+comma=","
+dash="-"
+space=" "
+tab="\x09"
+
+# Common client-error codes (403/404/429 are the module's bread and butter)
+s400="400"
+s401="401"
+s403="403"
+s404="404"
+s408="408"
+s429="429"
+
+# Common server-error codes + the canonical 5xx range spelling
+s500="500"
+s502="502"
+s503="503"
+s504="504"
+range_5xx="500-599"
+range_4xx="400-499"
+
+# Boundary values the parser guards (min 100, max 599/999)
+s099="099"
+s100="100"
+s599="599"
+s600="600"
+s999="999"
+
+# Whole-list shapes seen in real config
+list_common="403,404,500-599"
+list_ranges="400-499,500-599"
