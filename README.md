@@ -1,7 +1,9 @@
 # nginx-error-abuse-module
 
 [![Build and Test](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml)
-[![CI Fast](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-fast.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-fast.yml)
+[![Security scanners](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml)
+[![Fuzzing](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml)
+[![Valgrind](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
 
 ## What is this?
