@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import os
 import pathlib
@@ -17,6 +18,34 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+
+# A test that raises before stop() would orphan every child we spawned:
+# an nginx master (or redis) keeps listening on its test port, which
+# collides with later runs of any repo sharing the runner. Track every
+# Popen and reap survivors at interpreter exit.
+_SPAWNED: list[subprocess.Popen] = []
+
+
+def _track(proc: subprocess.Popen) -> subprocess.Popen:
+    _SPAWNED.append(proc)
+    return proc
+
+
+def _reap_spawned() -> None:
+    for proc in _SPAWNED:
+        if proc.poll() is None:
+            proc.terminate()
+    deadline = time.monotonic() + 5
+    for proc in _SPAWNED:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+atexit.register(_reap_spawned)
 
 
 SANITIZER_MARKERS = (
@@ -308,12 +337,12 @@ class Nginx:
     def start(self) -> None:
         self.write_config()
         output = self.output_path.open("a", encoding="utf-8")
-        self.process = subprocess.Popen(
+        self.process = _track(subprocess.Popen(
             self.command(),
             text=True,
             stdout=output,
             stderr=subprocess.STDOUT,
-        )
+        ))
         output.close()
         try:
             wait_port(self.port)
@@ -390,9 +419,9 @@ class RedisServer:
         ]
         if self.requirepass:
             cmd += ["--requirepass", self.requirepass]
-        self.process = subprocess.Popen(
+        self.process = _track(subprocess.Popen(
             cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
+        ))
         wait_port(self.port)
         # Flush all data to ensure clean state for each test
         flush = ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port)]
