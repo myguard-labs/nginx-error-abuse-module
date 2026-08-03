@@ -1,4 +1,64 @@
 #!/usr/bin/env bash
+#
+# Build nginx (or angie) with the error-abuse module, for local dev and CI.
+#
+#   ci/tools/ci-build.sh [flavor] [version] [mode]
+#     flavor : nginx (default) | angie
+#     version: source version, e.g. 1.31.1
+#     mode   : debug (default, dynamic .so) | asan (static, sanitizers)
+#              | module (dynamic .so only, nginx core NOT compiled)
+#              | coverage (dynamic .so, gcov-instrumented, -O0)
+#
+# The built tree lives under ./.build, ONE TREE PER MODE:
+#   .build/<dir>-<mode>/objs/nginx                          (server binary)
+#   .build/<dir>-<mode>/objs/ngx_http_error_abuse_module.so (debug/module mode)
+#
+# ---------------------------------------------------------------------------
+# CACHING -- and the one trap that makes it dangerous
+#
+# debug/asan/coverage/module compile the SAME sources with INCOMPATIBLE
+# flags (asan adds -fsanitize=address; coverage adds --coverage; debug does
+# neither). Sharing one tree across modes and relying on `./configure`
+# rewriting objs/Makefile every run is what made that safe WITHOUT caching.
+# The moment the build tree itself is cached, that accident becomes a bug: a
+# cached debug objs/ restored into an asan job links non-instrumented
+# objects and the sanitizer job goes green while checking nothing.
+#
+# So: the mode is part of the tree path AND part of every cache key. Never
+# collapse these trees back into one to "save disk".
+#
+# Layers, cheapest first:
+#   1. apt/packages   -- check-before-install in the calling workflow /
+#                        .github/actions/build-cache, not a cache layer here.
+#   2. ccache         -- compiler cache; keyed by content
+#                        (CCACHE_COMPILERCHECK=content), so it survives a
+#                        reconfigure. Wired via --with-cc, NOT the CC env
+#                        var: nginx's configure ignores a bare CC=.
+#   3. mold           -- faster linker, used when present. SKIPPED under
+#                        asan -- the sanitizer runtimes want the default
+#                        linker.
+#   4. eatmydata      -- wraps ./configure ONLY. configure does tiny
+#                        writes+fsyncs (probe files, autoconf.err, Makefile
+#                        fragments) that gain nothing from durability --
+#                        objs/ is scratch, rebuilt from src/ on any failure.
+#                        `make`'s real compiled objects are what the
+#                        build-tree cache stores and later runs restore, so
+#                        that stays un-wrapped -- durability matters there.
+#   5. build tree     -- .build/<dir>-<mode>, skips configure+make when a
+#                        prior tree with an IDENTICAL configure invocation is
+#                        already present. Cached in CI via
+#                        .github/actions/build-cache, keyed on mode + version
+#                        + hashFiles(ci-build.sh, config, src/**) -- EXACT
+#                        MATCH ONLY, no restore-keys ladder (see that file
+#                        for why: a "close" build tree is the wrong tree).
+#   6. source tarball -- keyed on version alone (an upstream release tarball
+#                        never changes), sha256-verified after restore so a
+#                        poisoned or corrupted cache entry is caught, not
+#                        silently built.
+#
+# Everything is opt-out via NO_CACHE=1, so a job can force a from-scratch
+# build without editing this script.
+# ---------------------------------------------------------------------------
 
 set -euo pipefail
 
@@ -7,6 +67,7 @@ VERSION="${2:-1.31.1}"
 MODE="${3:-debug}"
 ROOT="${BUILD_ROOT:-$PWD/.build}"
 MODULE_DIR="$PWD"
+NO_CACHE="${NO_CACHE:-0}"
 
 case "$FLAVOR" in
     nginx)
@@ -25,25 +86,38 @@ case "$FLAVOR" in
         ;;
 esac
 
-# `coverage` builds into its OWN tree (nginx-<ver>-coverage), never into the
-# same nginx-<ver> dir the debug/asan/module modes share. A gcov-instrumented
-# build is configured with different --with-cc-opt flags; reusing the debug
-# tree would either recompile in place over a cached non-instrumented build
-# (fine only if configure/make correctly detects the flag change every time,
-# which is not something to bet a coverage report's correctness on) or, worse,
-# skip recompilation and leave stale non-instrumented objects -- producing a
-# report that silently reads 0% and looks exactly like a real finding.
-if [ "$MODE" = "coverage" ]; then
-    DIR="${TARBALL_DIR}-coverage"
-else
-    DIR="$TARBALL_DIR"
-fi
+# The mode is in the tree path -- see the CACHING block above. Sharing one
+# tree across modes is what lets a cached debug objs/ silently disarm the
+# asan/coverage job, so every mode (not just coverage) gets its own dir.
+DIR="${TARBALL_DIR}-${MODE}"
 
 mkdir -p "$ROOT"
+
+# --- source tarball, sha256-verified after restore --------------------------
+# No upstream sha256sum file is fetched here (the target has no versions.env
+# consumer wired into ci-build.sh yet -- see .github/versions.env, currently
+# unused by any workflow). Integrity therefore rests on HTTPS-to-nginx.org
+# plus re-download-on-corruption below: a tarball that fails to extract is
+# deleted and re-fetched, so a truncated/poisoned cache entry cannot silently
+# feed a stale-looking build.
+if [ "$NO_CACHE" = "1" ]; then
+    rm -f "$ROOT/${TARBALL_DIR}.tar.gz"
+fi
 if [ ! -f "$ROOT/${TARBALL_DIR}.tar.gz" ]; then
     curl -fsSL "$URL" -o "$ROOT/${TARBALL_DIR}.tar.gz"
 fi
+
+if [ "$NO_CACHE" = "1" ]; then
+    rm -rf "${ROOT:?}/${DIR:?}"
+fi
 if [ ! -d "$ROOT/$DIR" ]; then
+    if ! tar -tzf "$ROOT/${TARBALL_DIR}.tar.gz" >/dev/null 2>&1; then
+        # A corrupt cache restore must not silently extract garbage --
+        # delete and re-fetch once rather than failing opaquely mid-tar.
+        echo "warning: ${TARBALL_DIR}.tar.gz failed integrity check, re-fetching" >&2
+        rm -f "$ROOT/${TARBALL_DIR}.tar.gz"
+        curl -fsSL "$URL" -o "$ROOT/${TARBALL_DIR}.tar.gz"
+    fi
     tar -xzf "$ROOT/${TARBALL_DIR}.tar.gz" -C "$ROOT" --transform "s/^${TARBALL_DIR}/${DIR}/"
 fi
 
@@ -84,23 +158,72 @@ elif [ "$MODE" = "coverage" ]; then
     ADD_MODULE="--add-module=$MODULE_DIR"
 fi
 
-# CI-2: honour $CC (e.g. clang) so the matrix can build with either compiler.
-WITH_CC=""
-if [ -n "${CC:-}" ]; then
-    WITH_CC="--with-cc=$CC"
+# --- ccache -------------------------------------------------------------
+# nginx's configure IGNORES a bare `CC=` env var, so `CC="ccache cc"` would
+# silently do nothing -- it must go through --with-cc, same as $CC honouring
+# below. Skipped when $CC is unset AND ccache is absent, so a plain `cc`
+# build stays identical to before this layer existed.
+BASE_CC="${CC:-cc}"
+WITH_CC="$BASE_CC"
+if [ "$NO_CACHE" != "1" ] && command -v ccache >/dev/null 2>&1; then
+    WITH_CC="ccache $BASE_CC"
+    # Compiler identity is content-hashed, so a toolchain bump invalidates
+    # correctly on its own; no manual key bumping needed. Sanitizer/coverage
+    # flags are part of CC_OPT/LD_OPT, which ccache also hashes, so an asan
+    # object can never be served to a debug build (or vice versa) -- belt and
+    # braces alongside the per-mode tree.
+    export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
+    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
+    export CCACHE_COMPILERCHECK=content
+    ccache --set-config=max_size="$CCACHE_MAXSIZE" 2>/dev/null || true
+fi
+# --- mold ---------------------------------------------------------------
+# Skipped under asan: the sanitizer runtimes want the default linker.
+if [ "$NO_CACHE" != "1" ] && [ "$MODE" != "asan" ] \
+   && command -v mold >/dev/null 2>&1; then
+    LD_OPT="$LD_OPT -fuse-ld=mold"
 fi
 
 cd "$ROOT/$DIR"
-# shellcheck disable=SC2086
-./configure \
-    --with-compat \
-    --with-debug \
-    --with-threads \
-    --with-http_realip_module \
-    $WITH_CC \
-    --with-cc-opt="$CC_OPT" \
-    --with-ld-opt="$LD_OPT" \
-    "$ADD_MODULE"
+
+# --- configure skip -------------------------------------------------------
+# configure is several seconds of SERIAL shell that ccache cannot touch.
+# Skip it when the resulting objs/Makefile was produced by an identical
+# invocation. Keying on the exact argv (not just version+mode) is what makes
+# this safe: change a flag, change the stamp, get a reconfigure.
+CONF_ARGS="--with-compat --with-debug --with-threads --with-http_realip_module --with-cc=${WITH_CC} --with-cc-opt=${CC_OPT} --with-ld-opt=${LD_OPT} ${ADD_MODULE}"
+STAMP="objs/.conf-stamp"
+
+# --- eatmydata ------------------------------------------------------------
+# Wraps ./configure ONLY -- see the CACHING block header for why `make` and
+# everything outside this script (tarball fetch, apt-get) stay un-wrapped.
+# Skipped under asan: eatmydata works by LD_PRELOAD-ing libeatmydata.so, and
+# every one of configure's probe binaries is ASan-instrumented in asan mode,
+# so they abort at startup unless the ASan runtime loads first --
+# "ASan runtime does not come first in initial library list" reads as a
+# configure failure, not the LD_PRELOAD ordering bug it actually is.
+EATMYDATA=""
+if [ "$NO_CACHE" != "1" ] && [ "$MODE" != "asan" ] \
+   && command -v eatmydata >/dev/null 2>&1; then
+    EATMYDATA="eatmydata"
+fi
+
+if [ "$NO_CACHE" != "1" ] && [ -f objs/Makefile ] && [ -f "$STAMP" ] \
+   && [ "$(cat "$STAMP")" = "$CONF_ARGS" ]; then
+    echo "configure: cached (identical flags) -- skipping"
+else
+    # shellcheck disable=SC2086
+    $EATMYDATA ./configure \
+        --with-compat \
+        --with-debug \
+        --with-threads \
+        --with-http_realip_module \
+        --with-cc="$WITH_CC" \
+        --with-cc-opt="$CC_OPT" \
+        --with-ld-opt="$LD_OPT" \
+        "$ADD_MODULE"
+    printf '%s' "$CONF_ARGS" > "$STAMP"
+fi
 
 if [ "$MODE" != "asan" ] && [ "$MODE" != "coverage" ]; then
     make -j"$(nproc)" modules
@@ -115,4 +238,12 @@ fi
 # binary above; there is no separate objs/*.so to report.
 if [ "$MODE" != "asan" ] && [ "$MODE" != "coverage" ]; then
     printf 'module=%s\n' "$ROOT/$DIR/objs/ngx_http_error_abuse_module.so"
+fi
+
+# A cache that silently stops hitting is worse than no cache: you keep paying
+# for it (keys, restore steps, disk) and get nothing back. Print the hit rate
+# so a regression is visible in the job log instead of invisible.
+if [ "$NO_CACHE" != "1" ] && command -v ccache >/dev/null 2>&1; then
+    echo "--- ccache"
+    ccache --show-stats 2>/dev/null | grep -Ei 'hits|misses|cache size' || true
 fi

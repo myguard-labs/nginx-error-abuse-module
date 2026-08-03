@@ -72,6 +72,14 @@ jobs:
           fi
           echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
 
+      # cp7a: version is resolved dynamically above, so the cache key changes
+      # with it -- correct, since a new mainline release IS a new build tree.
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
+
       - name: Configure nginx tree
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
