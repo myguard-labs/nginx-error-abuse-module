@@ -10,10 +10,11 @@
 #                        explicit fuzz_snapshot output name)
 #
 # Both targets LINK the module's real decision TU
-# (../ngx_http_error_abuse_scan.c) plus nginx's real src/core/ngx_string.c, so
-# the parsers under test and the ngx_atoi()/ngx_strlchr() they walk bytes with
-# are production code. That requires a configured nginx tree at
-# .build/nginx-<VER>/ -- run tools/ci-build.sh first.
+# (../../src/ngx_http_error_abuse_scan.c) plus nginx's real
+# src/core/ngx_string.c, so the parsers under test and the
+# ngx_atoi()/ngx_strlchr() they walk bytes with are production code. That
+# requires a configured nginx tree at .build/nginx-<VER>/ -- run
+# ci/tools/ci-build.sh first.
 #
 # This replaced extract_parser.sh, which sed-sliced the two function bodies out
 # of the module .c and compiled them against ngx_shim.h's re-typed copies of the
@@ -28,7 +29,8 @@
 set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$FUZZ_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$FUZZ_DIR/../.." && pwd)"
+SRC_DIR="$REPO_ROOT/src"
 CC="${CC:-clang}"
 
 # OSS-Fuzz sets $LIB_FUZZING_ENGINE and its own $CFLAGS; honour them.
@@ -55,8 +57,8 @@ if [ -z "$NGX_SRC" ] || [ ! -f "$NGX_SRC/objs/ngx_auto_config.h" ]; then
   The fuzz targets link nginx's real src/core/ngx_string.c and need
   objs/ngx_auto_config.h, which only exists after nginx is configured.
 
-  Run first:  bash tools/ci-build.sh nginx 1.31.1
-  Or point at a tree explicitly:  NGX_SRC=/path/to/nginx-1.31.1 fuzz/build.sh
+  Run first:  bash ci/tools/ci-build.sh nginx 1.31.1
+  Or point at a tree explicitly:  NGX_SRC=/path/to/nginx-1.31.1 ci/fuzz/build.sh
 EOF
     exit 1
 fi
@@ -70,10 +72,10 @@ NGX_INCS="-I$NGX_SRC/src/core -I$NGX_SRC/src/event -I$NGX_SRC/src/event/modules 
 build_one() {
     local src="$1" out="$2"
     # shellcheck disable=SC2086
-    "$CC" $CFLAGS $ENGINE $NGX_INCS -I"$REPO_ROOT" -I"$FUZZ_DIR" \
+    "$CC" $CFLAGS $ENGINE $NGX_INCS -I"$SRC_DIR" -I"$FUZZ_DIR" \
         "$FUZZ_DIR/$src" \
         "$FUZZ_DIR/ngx_stubs.c" \
-        "$REPO_ROOT/ngx_http_error_abuse_scan.c" \
+        "$SRC_DIR/ngx_http_error_abuse_scan.c" \
         "$NGX_SRC/src/core/ngx_string.c" \
         -o "$out"
     echo "✓ built fuzz target: $out"
