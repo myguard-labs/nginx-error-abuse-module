@@ -1,5 +1,7 @@
 *.o
 *.so
+*.gcda
+*.gcno
 .build/
 __pycache__/
 build/
@@ -11,6 +13,8 @@ ci/fuzz/crash-*
 ci/fuzz/*-min/
 # Test::Nginx runtime tree (regenerated per run)
 ci/t/servroot/
+# ci/tests/unit/run.sh's build output (source and run.sh stay tracked)
+ci/tests/unit/test_scan
 # fuzzer-discovered corpus entries are regenerated locally; the curated seed
 # inputs (descriptively named, e.g. ci/fuzz/corpus/one_record.bin) stay tracked,
 # while these wildcards keep newly discovered hash-named inputs out of git.
