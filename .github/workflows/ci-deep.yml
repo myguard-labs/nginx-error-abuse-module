@@ -44,7 +44,7 @@ permissions:
 jobs:
   fuzz:
     name: Fuzz (all targets, long)
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 600
     steps:
       - name: Checkout module
@@ -139,7 +139,7 @@ jobs:
 
   memcheck:
     name: Valgrind Memcheck soak
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -190,7 +190,7 @@ jobs:
 
   helgrind:
     name: Valgrind Helgrind soak
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -241,7 +241,7 @@ jobs:
 
   scanners:
     name: Security scanners
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
