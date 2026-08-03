@@ -1,7 +1,7 @@
 # Fuzzing
 
-Coverage-guided fuzzing of the two untrusted-input parsers in
-[`../ngx_http_error_abuse_module.c`](../ngx_http_error_abuse_module.c):
+Coverage-guided fuzzing of the two untrusted-input parsers in the scan core,
+[`../ngx_http_error_abuse_scan.c`](../ngx_http_error_abuse_scan.c):
 
 - **`fuzz_snapshot`** → `ngx_http_error_abuse_validate_snapshot()` — the
   gate that walks the untrusted on-disk persistence snapshot before
@@ -11,12 +11,11 @@ Coverage-guided fuzzing of the two untrusted-input parsers in
   `ngx_strlchr`/`ngx_atoi` and, for each status in each range, sets a bit
   in `zone->statuses[status >> 3]` — an **OOB-write** surface if the
   `first<100 / final<first / final>MAX_STATUS` guard is ever weakened.
-  The harness puts the bitmap at the tail of an exact-sized heap object
-  so any single-byte over-write is an immediate ASAN failure.
+  The harness allocates the bitmap as an exact-sized heap object so any
+  single-byte over-write is an immediate ASAN failure.
 
-Both parsers are sliced verbatim into `generated_parser.inc`; the section
-below describes the snapshot target in detail and the no-copy-drift setup
-that applies to both.
+Both targets link the real scan TU; the section below describes the snapshot
+target in detail and the no-copy-drift setup that applies to both.
 
 ## Why this target
 
@@ -49,20 +48,47 @@ byte); the rest is the snapshot payload handed in as `[p, last)`.
 
 ## No copy drift
 
-There is **no hand-maintained copy** of the validator.
-[`extract_parser.sh`](extract_parser.sh) slices its verbatim body out of the
-shipped `.c` into `generated_parser.inc` at build time and fails loudly if it
-cannot find it. [`ngx_shim.h`](ngx_shim.h) supplies only the tiny nginx
-surface the function needs (`ngx_int_t`, the two on-disk struct layouts,
-`zone->threshold`, `ngx_memcpy`) with faithful upstream semantics.
+Both targets **link** [`../ngx_http_error_abuse_scan.c`](../ngx_http_error_abuse_scan.c)
+— the same translation unit the shipped module links — together with nginx's
+real `src/core/ngx_string.c`. So the parsers under test *and* the
+`ngx_atoi()`/`ngx_strlchr()` they walk bytes with are production code, and the
+snapshot harness's load()-stride replay decodes records through the same LE
+getters the loader uses. There is no generated, sliced or re-typed copy anywhere
+in the build.
+
+That is why an ASAN report from these targets names
+`ngx_http_error_abuse_scan.c:<line>` directly: the stack frame is the shipped
+function, not a harness duplicate of it.
+
+Earlier revisions sliced the two function bodies out of the module `.c` with
+`extract_parser.sh` and compiled them against an `ngx_shim.h` that reimplemented
+`ngx_atoi`, `ngx_strlchr` and the on-disk constants. Three copies, none of them
+checked by the build — and a persistence-format change did once break the
+harness's hand-maintained stride rather than the validator (see
+`memory/labs/nginx-error-abuse-module/lessons.md`). Do not reintroduce that
+pattern: if a parser cannot be linked directly, that is a signal to move it into
+the scan TU, not to slice it.
+
+[`ngx_stubs.c`](ngx_stubs.c) resolves the allocator/log symbols `ngx_string.c`
+drags in. Every stub **aborts** rather than returning a plausible value, so the
+scan core silently starting to allocate or log fails the fuzzer loudly. Growth
+in that file means decision logic drifted back toward nginx types — fix the
+seam, not the stub.
 
 ## Run locally
 
+The targets need a configured nginx tree for its headers and `ngx_string.c`:
+
 ```bash
-bash fuzz/build.sh          # needs clang with libFuzzer
+bash tools/ci-build.sh nginx 1.31.1   # once; provides .build/nginx-*/
+bash fuzz/build.sh                    # needs clang with libFuzzer
 cd fuzz
 ./fuzz_snapshot -max_total_time=60 corpus/
+./fuzz_statuses -max_total_time=60 -dict=fuzz.dict corpus_statuses/
 ```
+
+`build.sh` fails with an explicit message if no configured tree is present,
+rather than falling back to anything stubbed.
 
 A crash drops a `crash-*` reproducer. Replay it with:
 

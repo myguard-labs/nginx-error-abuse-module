@@ -52,7 +52,27 @@ jobs:
       - name: Install clang + libFuzzer
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang
+          sudo apt-get install -y \
+            clang build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
+
+      # The fuzz targets link the module's real scan TU and nginx's real
+      # src/core/ngx_string.c, so this job needs a CONFIGURED nginx tree for
+      # objs/ngx_auto_config.h. Same mainline resolution the deep soak jobs
+      # below use, so the long fuzz runs against the same nginx they do.
+      - name: Resolve latest mainline nginx
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          if [ -z "$ver" ]; then
+            echo "::error::cannot resolve nginx version"
+            exit 1
+          fi
+          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Configure nginx tree
+        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Select fuzz duration
         run: |

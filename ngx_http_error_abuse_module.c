@@ -16,19 +16,25 @@
 #include <ngx_thread_pool.h>
 #endif
 
+#include "ngx_http_error_abuse_scan.h"
+
 /* SEC-3: the identity stored in shared memory, Redis and snapshots is a fixed
  * 32-byte SHA-256 digest of the configured key, regardless of how large the raw
  * key variable is. This bounds per-identity memory and Redis traffic so an
  * attacker cannot amplify them with a large $request_uri/$http_* key. The raw
- * key is kept (capped) only for human-readable logging. */
-#define NGX_HTTP_ERROR_ABUSE_DIGEST_LEN   SHA256_DIGEST_LENGTH  /* 32 */
+ * key is kept (capped) only for human-readable logging.
+ *
+ * NGX_HTTP_ERROR_ABUSE_DIGEST_LEN itself lives in the scan header, spelled as a
+ * literal so that TU needs no OpenSSL headers. Check the two agree here, where
+ * both are visible: a mismatch would let the snapshot validator accept records
+ * the loader then reads with a different key stride. */
+#if (NGX_HTTP_ERROR_ABUSE_DIGEST_LEN != SHA256_DIGEST_LENGTH)
+#error "scan header DIGEST_LEN disagrees with OpenSSL SHA256_DIGEST_LENGTH"
+#endif
 #define NGX_HTTP_ERROR_ABUSE_RAW_LOG_MAX  256
 
 #define NGX_HTTP_ERROR_ABUSE_VERSION       2  /* RFC-3: portable LE format */
 #define NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN  24 /* magic8+ver4+thr4+rec4+crc4 */
-#define NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN  20 /* klen2+ecnt2+blk8+seen8 */
-#define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
-#define NGX_HTTP_ERROR_ABUSE_STATUS_BYTES  75
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
 /* STAB-1: cap configured durations (seconds) so now+block, now-interval and
  * value*1000 cannot overflow signed time_t/int64_t, including on 32-bit. */
@@ -218,9 +224,6 @@ static ngx_int_t ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
     ngx_str_t *persist, ngx_log_t *log);
 static ngx_int_t ngx_http_error_abuse_load(
     ngx_http_error_abuse_zone_t *zone, ngx_log_t *log);
-static ngx_int_t ngx_http_error_abuse_validate_snapshot(
-    ngx_http_error_abuse_zone_t *zone, u_char *p, u_char *last,
-    uint32_t records);
 static ngx_int_t ngx_http_error_abuse_variable_status(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_error_abuse_variable_count(
@@ -360,61 +363,9 @@ static ngx_http_variable_t ngx_http_error_abuse_variables[] = {
     ngx_http_null_variable
 };
 
-/* RFC-3: explicit little-endian field codecs so a snapshot is portable across
- * endianness and compiler ABI, not a raw native struct dump. */
-static ngx_inline u_char *
-ngx_http_error_abuse_put_u16(u_char *p, uint16_t v)
-{
-    p[0] = (u_char) v;
-    p[1] = (u_char) (v >> 8);
-    return p + 2;
-}
-
-static ngx_inline u_char *
-ngx_http_error_abuse_put_u32(u_char *p, uint32_t v)
-{
-    p[0] = (u_char) v;
-    p[1] = (u_char) (v >> 8);
-    p[2] = (u_char) (v >> 16);
-    p[3] = (u_char) (v >> 24);
-    return p + 4;
-}
-
-static ngx_inline u_char *
-ngx_http_error_abuse_put_u64(u_char *p, uint64_t v)
-{
-    ngx_uint_t  i;
-
-    for (i = 0; i < 8; i++) {
-        p[i] = (u_char) (v >> (8 * i));
-    }
-    return p + 8;
-}
-
-static ngx_inline uint16_t
-ngx_http_error_abuse_get_u16(const u_char *p)
-{
-    return (uint16_t) (p[0] | (p[1] << 8));
-}
-
-static ngx_inline uint32_t
-ngx_http_error_abuse_get_u32(const u_char *p)
-{
-    return (uint32_t) p[0] | ((uint32_t) p[1] << 8)
-           | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
-}
-
-static ngx_inline uint64_t
-ngx_http_error_abuse_get_u64(const u_char *p)
-{
-    uint64_t    v = 0;
-    ngx_uint_t  i;
-
-    for (i = 0; i < 8; i++) {
-        v |= (uint64_t) p[i] << (8 * i);
-    }
-    return v;
-}
+/* RFC-3 little-endian field codecs live in the scan TU
+ * (ngx_http_error_abuse_scan.c) so the validator, the loader here and the fuzz
+ * harness all decode the on-disk format through one implementation. */
 
 static ngx_inline time_t *
 ngx_http_error_abuse_events(ngx_http_error_abuse_node_t *ean)
@@ -1210,73 +1161,38 @@ ngx_http_error_abuse_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     return NGX_OK;
 }
 
+/*
+ * Render the scan core's status-list rejection as a config error. The parse
+ * itself lives in ngx_http_error_abuse_scan.c, which cannot log; this keeps the
+ * operator-facing text identical to what it emitted before the split.
+ */
 static ngx_int_t
-ngx_http_error_abuse_parse_statuses(ngx_conf_t *cf,
+ngx_http_error_abuse_parse_statuses_conf(ngx_conf_t *cf,
     ngx_http_error_abuse_zone_t *zone, ngx_str_t *value)
 {
-    u_char      *p, *last, *dash, *end;
-    ngx_int_t    first, final;
-    ngx_uint_t   status;
+    switch (ngx_http_error_abuse_parse_statuses(value->data, value->len,
+                                                zone->statuses))
+    {
+    case NGX_HTTP_ERROR_ABUSE_STATUSES_OK:
+        return NGX_OK;
 
-    p = value->data;
-    last = value->data + value->len;
+    case NGX_HTTP_ERROR_ABUSE_STATUSES_EMPTY_ELEMENT:
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid error_abuse status list \"%V\" "
+                           "(empty element)", value);
+        return NGX_ERROR;
 
-    while (p < last) {
-        end = ngx_strlchr(p, last, ',');
-        if (end == NULL) {
-            end = last;
-        }
+    case NGX_HTTP_ERROR_ABUSE_STATUSES_TRAILING_COMMA:
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid error_abuse status list \"%V\" "
+                           "(trailing comma)", value);
+        return NGX_ERROR;
 
-        /* COR-8: reject empty tokens such as a trailing comma ("404,") or a
-         * double comma, instead of silently skipping them. */
-        if (end == p) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid error_abuse status list \"%V\" "
-                               "(empty element)", value);
-            return NGX_ERROR;
-        }
-
-        dash = ngx_strlchr(p, end, '-');
-        if (dash == NULL) {
-            first = ngx_atoi(p, end - p);
-            final = first;
-        } else {
-            first = ngx_atoi(p, dash - p);
-            final = ngx_atoi(dash + 1, end - dash - 1);
-        }
-
-        if (first < 100 || final < first
-            || final > NGX_HTTP_ERROR_ABUSE_MAX_STATUS)
-        {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid error_abuse status list \"%V\"",
-                               value);
-            return NGX_ERROR;
-        }
-
-        for (status = (ngx_uint_t) first;
-             status <= (ngx_uint_t) final;
-             status++)
-        {
-            zone->statuses[status >> 3] |= 1U << (status & 7);
-        }
-
-        /* COR-8: do not form a pointer past one-past-last when the final
-         * element ends at the buffer end. */
-        if (end == last) {
-            break;
-        }
-        p = end + 1;
-        if (p == last) {
-            /* trailing comma, e.g. "404," */
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid error_abuse status list \"%V\" "
-                               "(trailing comma)", value);
-            return NGX_ERROR;
-        }
+    default:
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid error_abuse status list \"%V\"", value);
+        return NGX_ERROR;
     }
-
-    return NGX_OK;
 }
 
 static ngx_http_error_abuse_zone_t *
@@ -1574,7 +1490,9 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    if (ngx_http_error_abuse_parse_statuses(cf, zone, &statuses) != NGX_OK) {
+    if (ngx_http_error_abuse_parse_statuses_conf(cf, zone, &statuses)
+        != NGX_OK)
+    {
         return NGX_CONF_ERROR;
     }
 
@@ -3582,7 +3500,8 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         return NGX_OK;
     }
 
-    if (ngx_http_error_abuse_validate_snapshot(zone, p, last, f_records)
+    if (ngx_http_error_abuse_validate_snapshot(p, last, f_records,
+                                               zone->threshold)
         != NGX_OK)
     {
         ngx_log_error(NGX_LOG_WARN, log, 0,
@@ -3683,43 +3602,6 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     }
 
     return NGX_OK;
-}
-
-static ngx_int_t
-ngx_http_error_abuse_validate_snapshot(ngx_http_error_abuse_zone_t *zone,
-    u_char *p, u_char *last, uint32_t records)
-{
-    uint32_t   i;
-    uint16_t   rec_key_len, rec_event_count;
-    size_t     payload;
-
-    for (i = 0; i < records; i++) {
-        if ((size_t) (last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN) {
-            return NGX_ERROR;
-        }
-
-        rec_key_len = ngx_http_error_abuse_get_u16(p);
-        rec_event_count = ngx_http_error_abuse_get_u16(p + 2);
-        p += NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN;
-
-        /* Identities are always a fixed 32-byte SHA-256 digest (SEC-3); a
-         * record with any other key length is forged or corrupt — reject the
-         * whole snapshot rather than admit an unmatchable dead-weight node. */
-        if (rec_key_len != NGX_HTTP_ERROR_ABUSE_DIGEST_LEN
-            || rec_event_count > zone->threshold)
-        {
-            return NGX_ERROR;
-        }
-
-        payload = (size_t) rec_key_len + (size_t) rec_event_count * 8;
-        if ((size_t) (last - p) < payload) {
-            return NGX_ERROR;
-        }
-
-        p += payload;
-    }
-
-    return (p == last) ? NGX_OK : NGX_ERROR;
 }
 
 static ngx_http_error_abuse_req_ctx_t *
