@@ -1,10 +1,11 @@
 name: CI
 
-# Single entry point orchestrator (cp4a). Calls each PR-lane member workflow
-# via workflow_call. INTERMEDIATE state: members still carry their own
-# pull_request/push triggers too, so each member runs TWICE on this PR (once
-# standalone, once via this orchestrator) until the follow-up commit removes
-# the members' pull_request trigger.
+# Single entry point orchestrator (cp4a). This is the ONLY workflow carrying a
+# pull_request trigger; every PR-lane member is reachable at PR time solely as a
+# workflow_call from here. Adding a pull_request trigger to a member would make
+# it run twice and is not the convention — add the call here instead.
+#
+# ci-deep.yml is schedule-driven and deliberately NOT a member of this lane.
 
 on:
   pull_request:
