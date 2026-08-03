@@ -27,7 +27,6 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/asan.yml
-    secrets: inherit
 
   fuzzing:
     permissions:
