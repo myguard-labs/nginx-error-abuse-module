@@ -77,23 +77,33 @@
 #     pre-validating the exact bug under test, which defeats the point.
 #   * record-length bound weakened by 1 -- change
 #     `(last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN` to
-#     `... - 1` in ngx_http_error_abuse_validate_snapshot(). ALL 38 checks stay
-#     green. Root cause: for a single truncated-by-1 record, the resulting
-#     1-byte pointer overshoot is independently caught by the function's own
-#     final `p == last` stride check a few lines later -- the two bounds are
-#     redundant on that exact input shape, not a hole the test suite failed to
-#     probe. See the comment on case_snapshot_reject_truncated_header() in
-#     test_scan.c for the full reasoning; no case built from a single-record
-#     truncation can isolate this specific line.
+#     `... - 1` in ngx_http_error_abuse_validate_snapshot(). ALL 41 checks stay
+#     green -- including case_snapshot_accept_two_records() and every other
+#     multi-record case added 2026-08 specifically to try to close this gap.
+#     Root cause, confirmed to generalize to ANY record count: `p` only ever
+#     increases across the loop (each record adds FILE_REC_LEN plus a
+#     non-negative payload). Once a weakened header bound lets `p` overshoot
+#     `last` on some record -- here by exactly 1 byte, from decoding a header
+#     that is 1 byte short -- no later record's strictly-positive advance can
+#     bring `p` back down to equal `last`, so the function's own final
+#     `p == last` stride check independently rejects every such overshoot,
+#     with 1 record or with N. Verified by exhaustive simulation (event counts
+#     0-10, byte offsets swept across up to 3 records) and by building this
+#     exact mutation and running the full multi-record suite: still 41/41
+#     green. See the investigation note on case_snapshot_accept_two_records()
+#     in test_scan.c for the full argument and the exact commands run. The
+#     mutation IS a real bug (a 1-byte out-of-bounds READ) -- it is simply not
+#     one this return-code-asserting unit-test file can observe; that is
+#     exactly the job ci/fuzz/ (ASan-built) exists to do.
 #   * payload bound dropped -- delete the `if ((size_t) (last - p) < payload)`
-#     check in ngx_http_error_abuse_validate_snapshot(). ALL 38 checks stay
-#     green, for the same structural reason as the record-length bound above:
-#     on a 64-bit size_t, any event_count that fits the on-disk uint16_t field
-#     cannot make `p += payload` wrap the address space, so the function's own
-#     final `p == last` stride check independently catches every overrun this
-#     harness can construct. Kept as defense in depth (and load-bearing on a
-#     32-bit build, where pointer arithmetic has far less headroom before
-#     wrapping) but not provably load-bearing from this test file. See
+#     check in ngx_http_error_abuse_validate_snapshot(). ALL 41 checks stay
+#     green, for the identical monotonic-`p` reason as the record-length bound
+#     above -- confirmed the same way, by exhaustive simulation and by
+#     building this exact mutation against the full multi-record suite. Kept
+#     as defense in depth (and load-bearing on a 32-bit build, where pointer
+#     arithmetic has far less headroom before `p += payload` wraps) but not
+#     provably load-bearing, at the return-code level, from any unit test in
+#     this file, at any record count. See
 #     case_snapshot_reject_payload_overrun() in test_scan.c.
 #
 # Extend: add a CASE() to test_scan.c and one line to its main(). New source

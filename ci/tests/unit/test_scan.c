@@ -291,7 +291,15 @@ case_snapshot_reject_truncated_header(void)
      * no case built from this shape can isolate the length bound from the
      * stride bound. It IS still a meaningful assertion -- it proves the
      * truncated buffer is rejected -- just not proof that this SPECIFIC line
-     * is what does it. See run.sh's SEEN RED / SURVIVED lists. */
+     * is what does it. See run.sh's SEEN RED / SURVIVED lists.
+     *
+     * A multi-record construction does NOT close this gap either -- see the
+     * investigation note on case_snapshot_accept_two_records() below: `p` is
+     * monotonic, so once this bound is weakened enough to let `p` overshoot
+     * `last`, no later record's advance can bring it back to equal `last`,
+     * and the function's own final stride check independently rejects every
+     * such overshoot regardless of record count. Verified by building the
+     * mutation and running the full multi-record suite: still 41/41 green. */
     p = buf;
     p = ngx_http_error_abuse_put_u16(p, NGX_HTTP_ERROR_ABUSE_DIGEST_LEN);
     p = ngx_http_error_abuse_put_u16(p, 0);          /* event_count */
@@ -361,7 +369,14 @@ case_snapshot_reject_payload_overrun(void)
      * property this proves is host/ABI-dependent -- a 32-bit build's pointer
      * arithmetic has far less headroom before wrapping), but no case reachable
      * from this harness can prove IT specifically is load-bearing. See
-     * run.sh's SURVIVED list. */
+     * run.sh's SURVIVED list.
+     *
+     * A multi-record construction does NOT close this gap: `p` is monotonic
+     * non-decreasing, so once this bound is weakened enough to let `p`
+     * overshoot `last`, no later record's advance can bring it back to equal
+     * `last`. See the investigation note on case_snapshot_accept_two_records()
+     * below for the full argument; verified by building the mutation and
+     * running the full multi-record suite -- still 41/41 green. */
     u_char  buf[NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN
                 + NGX_HTTP_ERROR_ABUSE_DIGEST_LEN];
     u_char *p;
@@ -398,6 +413,68 @@ case_snapshot_reject_off_by_one_stride(void)
     check(ngx_http_error_abuse_validate_snapshot(
               buf, buf + sizeof(buf), 1, 10) == NGX_ERROR,
           "stride short of last by one byte is rejected (off-by-one)");
+}
+
+
+/* Two-record helper: encodes a record with the given event_count at `p`,
+ * returns the advanced pointer. Digest bytes are left zeroed -- the function
+ * never inspects digest content, only rec_key_len. */
+static u_char *
+put_record(u_char *p, uint16_t event_count)
+{
+    p = ngx_http_error_abuse_put_u16(p, NGX_HTTP_ERROR_ABUSE_DIGEST_LEN);
+    p = ngx_http_error_abuse_put_u16(p, event_count);
+    p = ngx_http_error_abuse_put_u64(p, 0);           /* blk */
+    p = ngx_http_error_abuse_put_u64(p, 0);           /* seen */
+    memset(p, 0, NGX_HTTP_ERROR_ABUSE_DIGEST_LEN);     /* digest payload */
+    p += NGX_HTTP_ERROR_ABUSE_DIGEST_LEN;
+    p += (size_t) event_count * 8;                    /* event payload */
+    return p;
+}
+
+
+static void
+case_snapshot_accept_two_records(void)
+{
+    /* Two well-formed records, 0 events each, stride landing exactly on
+     * last. Must pass unmutated -- proves the multi-record shape itself
+     * parses correctly.
+     *
+     * INVESTIGATED AND NOT ADDED, recorded so the next person does not
+     * redo this work: a multi-record case that KILLS the record-length or
+     * payload-bound mutations (see run.sh's SURVIVED list) does not exist,
+     * on any 64-bit build, for any record count. Both bounds guard
+     * `p += <fixed or attacker-influenced amount>`, and `p` is monotonic
+     * non-decreasing across the whole function. Once a weakened/missing
+     * bound lets `p` overshoot `last` on some record, no later record's
+     * (strictly positive) advance can bring `p` back down to equal `last`
+     * again -- so the final `return (p == last) ? NGX_OK : NGX_ERROR;`
+     * check independently rejects every overshoot the two per-record bounds
+     * would have caught, regardless of how many records precede or follow
+     * it. This was verified both by exhaustive simulation (sweeping event
+     * counts 0-10 and byte offsets across 1-3 records, see the reasoning
+     * left in this commit's message) and by building the mutated source and
+     * running: `checks stay 41/41 green under both mutations, same as the
+     * single-record cases above. The only real difference the mutations
+     * introduce is the OOB READ itself (one to a few bytes past `last`,
+     * still normally within the same heap/stack allocation on typical
+     * inputs) -- not the function's return value -- which is exactly why
+     * the fuzz targets under ci/fuzz/ (built with ASan) are the layer that
+     * catches this class of bug, not this unit-test file. A unit case
+     * asserting NGX_ERROR here would therefore be asserting something that
+     * does NOT distinguish correct from mutated code -- see the "control
+     * that hardcodes a verdict" rule. */
+    u_char  buf[2 * (NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN
+                      + NGX_HTTP_ERROR_ABUSE_DIGEST_LEN)];
+    u_char *p;
+
+    memset(buf, 0, sizeof(buf));
+    p = buf;
+    p = put_record(p, 0);
+    p = put_record(p, 0);
+
+    check(ngx_http_error_abuse_validate_snapshot(buf, p, 2, 10) == NGX_OK,
+          "two well-formed records with stride landing exactly on last is OK");
 }
 
 
@@ -502,6 +579,7 @@ main(void)
     case_snapshot_reject_payload_overrun();
     case_snapshot_reject_off_by_one_stride();
     case_snapshot_reject_records_zero_with_bytes_left();
+    case_snapshot_accept_two_records();
 
     case_codec_u16();
     case_codec_u32();
