@@ -47,6 +47,7 @@ jobs:
           config: |
             paths:
               - ngx_http_error_abuse_module.c
+              - ngx_http_error_abuse_scan.c
             paths-ignore:
               - .build/**
 

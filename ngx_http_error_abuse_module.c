@@ -27,9 +27,16 @@
  * NGX_HTTP_ERROR_ABUSE_DIGEST_LEN itself lives in the scan header, spelled as a
  * literal so that TU needs no OpenSSL headers. Check the two agree here, where
  * both are visible: a mismatch would let the snapshot validator accept records
- * the loader then reads with a different key stride. */
+ * the loader then reads with a different key stride.
+ *
+ * Guarded on SHA256_DIGEST_LENGTH being defined at all. Static analysers parse
+ * this file without the OpenSSL include path, and an undefined macro
+ * preprocesses to 0 -- so an unguarded comparison fails the analyser on every
+ * run while telling you nothing about the real build. */
+#ifdef SHA256_DIGEST_LENGTH
 #if (NGX_HTTP_ERROR_ABUSE_DIGEST_LEN != SHA256_DIGEST_LENGTH)
 #error "scan header DIGEST_LEN disagrees with OpenSSL SHA256_DIGEST_LENGTH"
+#endif
 #endif
 #define NGX_HTTP_ERROR_ABUSE_RAW_LOG_MAX  256
 
