@@ -1,11 +1,25 @@
 # nginx-error-abuse-module
 
-[![Build and Test](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml)
-[![Security scanners](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml)
+[![CI](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci.yml)
+[![Build&Test](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml)
+[![Security Scanners](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml)
 [![Fuzzing](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml)
 [![Valgrind](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml)
-[![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml)
+<!-- A/UBSan badge: pending asan.yml (checkpoint 6) -->
+[![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
+
+## CI
+
+| Workflow | What it gates |
+|---|---|
+| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the five members below |
+| `build-test.yml` | build, `.so` dlopen, bad-config rejection, `-Werror`, Test::Nginx runtime suite, ASan+UBSan |
+| `security-scanners.yml` | flawfinder, clang-tidy, Semgrep |
+| `fuzzing.yml` | libFuzzer regression replay against the parse targets |
+| `valgrind.yml` | memcheck soak |
+| `codeql.yml` | CodeQL over the module TU |
+| `ci-deep.yml` | monthly schedule; long fuzz + memcheck + helgrind sweep, not a PR-lane member |
 
 ## What is this?
 
