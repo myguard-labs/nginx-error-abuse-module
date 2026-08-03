@@ -1,0 +1,48 @@
+name: CI
+
+# Single entry point orchestrator (cp4a). Calls each PR-lane member workflow
+# via workflow_call. INTERMEDIATE state: members still carry their own
+# pull_request/push triggers too, so each member runs TWICE on this PR (once
+# standalone, once via this orchestrator) until the follow-up commit removes
+# the members' pull_request trigger.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: orchestrator-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-test.yml
+    secrets: inherit
+
+  fuzzing:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/fuzzing.yml
+    secrets: inherit
+
+  valgrind:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/valgrind.yml
+    secrets: inherit
+
+  security-scanners:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-scanners.yml
+    secrets: inherit
+
+  codeql:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
+    secrets: inherit
