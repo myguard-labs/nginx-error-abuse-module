@@ -84,25 +84,29 @@ jobs:
           sudo apt-get install -y \
             build-essential clang curl libhiredis-dev libpcre2-dev zlib1g-dev
 
-      # CI-7: cache the downloaded source tarball, keyed by flavor+version.
-      - name: Cache source tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # cp7a: ccache/mold/eatmydata presence + the source tarball, ccache and
+      # build-tree caches for THIS mode (debug). See ci/tools/ci-build.sh's
+      # CACHING block and the action itself for why the build-tree layer is
+      # exact-match only.
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
         with:
-          path: .build/${{ matrix.flavor }}-${{ matrix.version }}.tar.gz
-          key: src-${{ matrix.flavor }}-${{ matrix.version }}
+          mode: debug
+          flavor: ${{ matrix.flavor }}
+          nginx-version: ${{ matrix.version }}
 
       - name: Build server and dynamic module
         env:
           CC: ${{ matrix.cc }}
         run: |
           bash ci/tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
-          build=".build/${{ matrix.flavor }}-${{ matrix.version }}/objs"
+          build=".build/${{ matrix.flavor }}-${{ matrix.version }}-debug/objs"
           test -f "$build/ngx_http_error_abuse_module.so"
           ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
 
       - name: Strict module compile
         run: |
-          build=".build/${{ matrix.flavor }}-${{ matrix.version }}"
+          build=".build/${{ matrix.flavor }}-${{ matrix.version }}-debug"
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           # cflags and incs are compiler flag lists and must word-split.
@@ -126,8 +130,8 @@ jobs:
         if: matrix.primary
         run: |
           mkdir artifact
-          cp ".build/nginx-${NGINX_VERSION}/objs/nginx" artifact/
-          cp ".build/nginx-${NGINX_VERSION}/objs/ngx_http_error_abuse_module.so" artifact/
+          cp ".build/nginx-${NGINX_VERSION}-debug/objs/nginx" artifact/
+          cp ".build/nginx-${NGINX_VERSION}-debug/objs/ngx_http_error_abuse_module.so" artifact/
 
       - name: Upload nginx artifact
         if: matrix.primary
@@ -193,14 +197,23 @@ jobs:
           # Test::Nginx from CPAN instead (cpanminus is available via apt).
           sudo cpanm --notest --quiet Test::Nginx
 
+      # cp7a: same caching as the build job, keyed on the same mode (debug) --
+      # a PR run typically reuses the build job's warm tree on a persistent
+      # self-hosted runner.
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: debug
+          nginx-version: ${{ env.NGINX_VERSION }}
+
       # CI-6: run the Test::Nginx smoke suite against the built dynamic module.
       - name: Build dynamic module
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION"
 
       - name: Run ci/t/basic.t
         env:
-          TEST_NGINX_BINARY: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}/objs/nginx
-          TEST_NGINX_LOAD_MODULES: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}/objs/ngx_http_error_abuse_module.so
+          TEST_NGINX_BINARY: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}-debug/objs/nginx
+          TEST_NGINX_LOAD_MODULES: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}-debug/objs/ngx_http_error_abuse_module.so
           # Test::Nginx::Util defaults servroot to "t/servroot" relative to
           # cwd; since the suite moved to ci/t/, the default would try to
           # mkdir a nonexistent t/ at repo root. Point it at the real location.

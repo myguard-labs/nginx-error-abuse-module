@@ -18,6 +18,15 @@
 #   NGX_BUILD_SUFFIX     appended to the nginx-<ver> dir name, e.g. "-coverage"
 #                         so this can be pointed at ci-build.sh's distinct
 #                         coverage tree without touching the debug one.
+#                         Default "-debug": cp7a gave every ci-build.sh mode
+#                         its OWN tree (.build/nginx-<ver>-<mode>, never a
+#                         bare .build/nginx-<ver>) so a cached debug tree can
+#                         never be silently restored into an asan/coverage
+#                         job. Plain `ci/tools/ci-build.sh nginx <ver>`
+#                         (mode defaults to debug) is what this script's own
+#                         usage line above tells you to run first, so the
+#                         default here has to match that tree, not the old
+#                         suffix-less one.
 #
 # Exit: 0 all checks passed, 1 a check failed or the build failed.
 #
@@ -122,7 +131,7 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 VERSION="${NGINX_VERSION:-1.31.1}"
-NGX_SRC="$ROOT/.build/nginx-${VERSION}${NGX_BUILD_SUFFIX:-}"
+NGX_SRC="$ROOT/.build/nginx-${VERSION}${NGX_BUILD_SUFFIX:--debug}"
 
 if [ ! -f "$NGX_SRC/objs/ngx_auto_config.h" ]; then
     cat >&2 <<EOF

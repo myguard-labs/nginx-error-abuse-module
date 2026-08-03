@@ -22,6 +22,37 @@
 | `asan.yml` | ASan+UBSan request-storm soak (static `--add-module` build), single-process + multi-worker/reload lanes |
 | `ci-deep.yml` | monthly schedule; long fuzz + memcheck + helgrind sweep, not a PR-lane member |
 
+### CI caching
+
+`ci/tools/ci-build.sh` is the single chokepoint every build-test/asan/codeql/
+fuzzing/ci-deep(fuzz) job goes through — no workflow duplicates cache logic.
+Layers, cheapest first: apt/package presence check, ccache
+(`CCACHE_COMPILERCHECK=content`), mold (skipped under `asan`), eatmydata
+(wraps `./configure` only), the per-mode build tree
+(`.build/<flavor>-<version>-<mode>/`, exact-match cache key —
+`hashFiles(ci/tools/ci-build.sh, config, src/**)`, deliberately no
+restore-keys ladder), the source tarball (keyed on version alone).
+`.github/actions/build-cache/action.yml` documents each layer's key and why.
+
+Measured locally on this build host (`/proc/loadavg` 1.3–1.6 at the time,
+network to nginx.org unthrottled — CI's numbers will differ, this is the
+mechanism, not a promised CI time):
+
+| Run | Wall clock |
+|---|---|
+| Fully cold (no tarball, no build tree, no ccache) | 6.7s |
+| Warm re-run, nothing changed (build tree hit, configure skipped, `make` no-op) | 0.02s |
+| One source file touched, warm tree (configure skipped, one TU recompiles via ccache) | 0.1s |
+
+The honest win here is the warm no-op case, not a claimed multi-minute save —
+this module's from-scratch build is already only a few seconds on a fast
+network, so the layers mostly buy back CI minutes on *repeat* PR pushes and
+the fuzzing/codeql "module" mode (configure-only, no core `make`), where
+skipping configure is the whole cost. Invalidation was verified directly: a
+one-byte source edit changes the `hashFiles()` build-tree key (proven with a
+standalone hash check) and, within an already-warm tree, `make` recompiles
+exactly the changed translation unit rather than serving a stale object.
+
 ## What is this?
 
 Imagine someone keeps poking your website with requests that don't exist —

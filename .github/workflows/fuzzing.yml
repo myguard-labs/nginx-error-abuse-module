@@ -43,6 +43,13 @@ jobs:
           sudo apt-get install -y \
             clang build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
 
+      # cp7a: mostly the tarball + configure-skip stamp for mode=module.
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
+
       # The fuzz targets link the module's real scan TU and nginx's real
       # src/core/ngx_string.c, so they need a CONFIGURED nginx tree for
       # objs/ngx_auto_config.h. Configure-only (mode=module) is enough --

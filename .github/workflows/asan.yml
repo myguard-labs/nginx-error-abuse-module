@@ -45,6 +45,16 @@ jobs:
             build-essential curl libhiredis-dev libpcre2-dev redis-server \
             zlib1g-dev
 
+      # cp7a: mold and eatmydata are both SKIPPED under this mode by
+      # ci-build.sh itself (sanitizer runtime ordering / linker
+      # requirements) -- the action still restores ccache, the source
+      # tarball and the (asan-only, exact-match) build tree.
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: asan
+          nginx-version: ${{ env.NGINX_VERSION }}
+
       - name: Build with sanitizers
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
 
@@ -66,7 +76,7 @@ jobs:
           python3 ci/tools/test_runtime.py \
             --single-process \
             --redis-server /usr/bin/redis-server \
-            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}-asan/objs/nginx"
 
   asan-reload:
     name: ASan multi-worker + reload
@@ -82,6 +92,16 @@ jobs:
           sudo apt-get install -y \
             build-essential curl libhiredis-dev libpcre2-dev redis-server \
             zlib1g-dev
+
+      # cp7a: mold and eatmydata are both SKIPPED under this mode by
+      # ci-build.sh itself (sanitizer runtime ordering / linker
+      # requirements) -- the action still restores ccache, the source
+      # tarball and the (asan-only, exact-match) build tree.
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache
+        with:
+          mode: asan
+          nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Build with sanitizers
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
@@ -107,4 +127,4 @@ jobs:
         run: |
           python3 ci/tools/test_runtime.py \
             --redis-server /usr/bin/redis-server \
-            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}-asan/objs/nginx"
