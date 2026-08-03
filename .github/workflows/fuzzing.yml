@@ -53,6 +53,31 @@ jobs:
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
+      # Replay every recorded past-crash shape before the fresh time-boxed
+      # run. libFuzzer treats a file argument (not a corpus dir) as a
+      # one-shot replay, so a returning crash aborts here in seconds instead
+      # of waiting on the 120s fresh budget below.
+      - name: Replay regression corpus
+        run: |
+          set -euo pipefail
+          cd ci/fuzz
+          shopt -s nullglob
+          files=(regressions/*.bin)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no regression fixtures under ci/fuzz/regressions/"
+            exit 0
+          fi
+          fail=0
+          for f in "${files[@]}"; do
+            echo "=== replay $f ==="
+            if ! ./fuzz_snapshot "$f"; then
+              echo "❌ regression returned: $f"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "✓ ${#files[@]} regression(s) replayed clean"
+
       - name: Run each target 120s
         run: |
           set -euo pipefail

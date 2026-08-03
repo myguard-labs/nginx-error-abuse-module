@@ -23,6 +23,11 @@ jobs:
     uses: ./.github/workflows/build-test.yml
     secrets: inherit
 
+  asan:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/asan.yml
+
   fuzzing:
     permissions:
       contents: read

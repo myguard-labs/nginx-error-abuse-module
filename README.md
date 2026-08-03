@@ -6,19 +6,20 @@
 [![Fuzzing](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml)
 [![Valgrind](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml)
-<!-- A/UBSan badge: pending asan.yml (checkpoint 6) -->
+[![A/UBSan](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
 
 ## CI
 
 | Workflow | What it gates |
 |---|---|
-| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the five members below |
-| `build-test.yml` | build, `.so` dlopen, bad-config rejection, `-Werror`, Test::Nginx runtime suite, ASan+UBSan |
+| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the six members below |
+| `build-test.yml` | build, `.so` dlopen, bad-config rejection, `-Werror`, Test::Nginx runtime suite |
 | `security-scanners.yml` | flawfinder, clang-tidy, Semgrep |
-| `fuzzing.yml` | libFuzzer regression replay against the parse targets |
+| `fuzzing.yml` | recorded-regression replay, then a fresh time-boxed libFuzzer run against the parse targets |
 | `valgrind.yml` | memcheck soak |
 | `codeql.yml` | CodeQL over the module TU |
+| `asan.yml` | ASan+UBSan request-storm soak (static `--add-module` build), single-process + multi-worker/reload lanes |
 | `ci-deep.yml` | monthly schedule; long fuzz + memcheck + helgrind sweep, not a PR-lane member |
 
 ## What is this?
