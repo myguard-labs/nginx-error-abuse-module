@@ -30,24 +30,24 @@ read-only repository permissions.
 
 ```bash
 # Build nginx mainline and the dynamic module.
-bash tools/ci-build.sh nginx 1.31.1
+bash ci/tools/ci-build.sh nginx 1.31.1
 
 # Native multi-worker runtime suite.
-python3 tools/test_runtime.py \
+python3 ci/tools/test_runtime.py \
   --nginx-binary .build/nginx-1.31.1/objs/nginx \
   --module .build/nginx-1.31.1/objs/ngx_http_error_abuse_module.so \
   --redis-server /usr/bin/redis-server
 
 # ASan and UBSan.
-bash tools/ci-build.sh nginx 1.31.1 asan
+bash ci/tools/ci-build.sh nginx 1.31.1 asan
 ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-python3 tools/test_runtime.py --single-process \
+python3 ci/tools/test_runtime.py --single-process \
   --redis-server /usr/bin/redis-server \
   --nginx-binary .build/nginx-1.31.1/objs/nginx
 
 # Valgrind.
-python3 tools/test_runtime.py --single-process \
+python3 ci/tools/test_runtime.py --single-process \
   --runner "valgrind --tool=memcheck --track-origins=yes --error-exitcode=99" \
   --redis-server /usr/bin/redis-server \
   --nginx-binary .build/nginx-1.31.1/objs/nginx \

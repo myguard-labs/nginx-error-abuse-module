@@ -34,17 +34,17 @@ jobs:
 
       - name: Validate scripts and source
         run: |
-          bash -n tools/ci-build.sh
-          shellcheck tools/ci-build.sh
-          python3 -m py_compile tools/test_runtime.py
+          bash -n ci/tools/ci-build.sh
+          shellcheck ci/tools/ci-build.sh
+          python3 -m py_compile ci/tools/test_runtime.py
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
             --suppress=missingIncludeSystem \
             --suppress=normalCheckLevelMaxBranches \
             --suppress=unusedFunction \
-            ngx_http_error_abuse_module.c \
-            ngx_http_error_abuse_scan.c
+            src/ngx_http_error_abuse_module.c \
+            src/ngx_http_error_abuse_scan.c
           git diff --check
 
       - name: Lint workflows
@@ -96,7 +96,7 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
         run: |
-          bash tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
+          bash ci/tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
           build=".build/${{ matrix.flavor }}-${{ matrix.version }}/objs"
           test -f "$build/ngx_http_error_abuse_module.so"
           ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
@@ -118,7 +118,7 @@ jobs:
                 -Wall -Wextra -Wshadow -Wstrict-prototypes \
                 -Wstrict-aliasing -Wunreachable-code -Werror \
                 -Wno-unused-parameter \
-                $incs "$GITHUB_WORKSPACE/${tu}.c" \
+                $incs "$GITHUB_WORKSPACE/src/${tu}.c" \
                 -o "/tmp/${tu}.o"
             done
           )
@@ -171,7 +171,7 @@ jobs:
       - name: Run multi-worker runtime suite
         run: |
           chmod +x nginx-bin/nginx
-          python3 tools/test_runtime.py \
+          python3 ci/tools/test_runtime.py \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module.so" \
             --redis-server /usr/bin/redis-server
@@ -192,7 +192,7 @@ jobs:
             zlib1g-dev
 
       - name: Build with sanitizers
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
 
       - name: Sweep stale test listeners
         run: |
@@ -209,7 +209,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
-          python3 tools/test_runtime.py \
+          python3 ci/tools/test_runtime.py \
             --single-process \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
@@ -230,7 +230,7 @@ jobs:
             zlib1g-dev
 
       - name: Build with sanitizers
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
 
       # CI-3: exercise the master + multi-worker lifecycle (reload overlap,
       # worker shutdown, helper-process init) under ASan/UBSan — the paths the
@@ -251,7 +251,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
-          python3 tools/test_runtime.py \
+          python3 ci/tools/test_runtime.py \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
 
@@ -275,11 +275,15 @@ jobs:
 
       # CI-6: run the Test::Nginx smoke suite against the built dynamic module.
       - name: Build dynamic module
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION"
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION"
 
-      - name: Run t/basic.t
+      - name: Run ci/t/basic.t
         env:
           TEST_NGINX_BINARY: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}/objs/nginx
           TEST_NGINX_LOAD_MODULES: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}/objs/ngx_http_error_abuse_module.so
+          # Test::Nginx::Util defaults servroot to "t/servroot" relative to
+          # cwd; since the suite moved to ci/t/, the default would try to
+          # mkdir a nonexistent t/ at repo root. Point it at the real location.
+          TEST_NGINX_SERVROOT: ${{ github.workspace }}/ci/t/servroot
         run: |
-          prove -v t/basic.t
+          prove -v ci/t/basic.t

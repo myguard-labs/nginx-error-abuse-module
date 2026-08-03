@@ -4,15 +4,15 @@
 __pycache__/
 build/
 objs/
-fuzz/generated_parser.inc
-fuzz/fuzz_snapshot
-fuzz/fuzz_statuses
-fuzz/crash-*
-fuzz/*-min/
+ci/fuzz/generated_parser.inc
+ci/fuzz/fuzz_snapshot
+ci/fuzz/fuzz_statuses
+ci/fuzz/crash-*
+ci/fuzz/*-min/
 # Test::Nginx runtime tree (regenerated per run)
-t/servroot/
+ci/t/servroot/
 # fuzzer-discovered corpus entries are regenerated locally; the curated seed
-# inputs (descriptively named, e.g. fuzz/corpus/one_record.bin) stay tracked,
+# inputs (descriptively named, e.g. ci/fuzz/corpus/one_record.bin) stay tracked,
 # while these wildcards keep newly discovered hash-named inputs out of git.
-fuzz/corpus/*
-fuzz/corpus_statuses/*
+ci/fuzz/corpus/*
+ci/fuzz/corpus_statuses/*
