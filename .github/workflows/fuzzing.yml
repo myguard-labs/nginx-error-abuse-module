@@ -47,17 +47,17 @@ jobs:
       # The fuzz targets link the module's real scan TU and nginx's real
       # src/core/ngx_string.c, so they need a CONFIGURED nginx tree for
       # objs/ngx_auto_config.h. Configure-only (mode=module) is enough --
-      # fuzz/build.sh compiles the sources it needs itself.
+      # ci/fuzz/build.sh compiles the sources it needs itself.
       - name: Configure nginx tree
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Build fuzz targets
-        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"
+        run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
       - name: Run each target 120s
         run: |
           set -euo pipefail
-          cd fuzz
+          cd ci/fuzz
           # target:corpus[:dict] — snapshot is binary (no dict); statuses is a
           # token grammar (HTTP status codes / range punctuation) so it gets one.
           targets="fuzz_snapshot:corpus: fuzz_statuses:corpus_statuses:fuzz.dict"
@@ -79,5 +79,5 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-fast-crashes
-          path: ${{ github.workspace }}/fuzz/crash-*
+          path: ${{ github.workspace }}/ci/fuzz/crash-*
           retention-days: 14

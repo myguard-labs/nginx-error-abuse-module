@@ -9,9 +9,10 @@ name: CI Deep
 # — the scanners still run and GATE on findings, they just don't upload.
 #
 # Jobs: fuzz (14400s/target) · memcheck soak · helgrind soak · scanners.
-#   * memcheck AND helgrind run under tools/soak.sh, which passes
-#     --suppressions=tools/valgrind.supp for BOTH tools and --error-exitcode=99
-#     (see tools/soak.sh) — the drift-fix baseline for every module.
+#   * memcheck AND helgrind run under ci/tools/soak.sh, which passes
+#     --suppressions=ci/tools/valgrind.supp for BOTH tools and
+#     --error-exitcode=99 (see ci/tools/soak.sh) — the drift-fix baseline for
+#     every module.
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -72,7 +73,7 @@ jobs:
           echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
 
       - name: Configure nginx tree
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Select fuzz duration
         run: |
@@ -83,12 +84,12 @@ jobs:
           fi
 
       - name: Build fuzz targets
-        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"
+        run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
       - name: Fuzz each target
         run: |
           set -euo pipefail
-          cd fuzz
+          cd ci/fuzz
           # target:corpus[:dict] — snapshot is binary (no dict); statuses is a
           # token grammar so it gets the status-code/range dictionary.
           targets="fuzz_snapshot:corpus: fuzz_statuses:corpus_statuses:fuzz.dict"
@@ -113,7 +114,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-deep-crashes
-          path: ${{ github.workspace }}/fuzz/crash-*
+          path: ${{ github.workspace }}/ci/fuzz/crash-*
           retention-days: 30
 
       - name: Upload minimized corpus
@@ -121,7 +122,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/fuzz/*-min
+          path: ${{ github.workspace }}/ci/fuzz/*-min
           retention-days: 30
 
       - name: Notify Discord on failure
@@ -173,7 +174,7 @@ jobs:
         env:
           USE_VALGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" 600 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
@@ -224,7 +225,7 @@ jobs:
         env:
           USE_HELGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" 600 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
@@ -271,10 +272,10 @@ jobs:
       - name: flawfinder
         run: |
           flawfinder --minlevel=1 \
-            "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c 2>&1 | tee flawfinder.log
+            "$GITHUB_WORKSPACE"/src/ngx_http_error_abuse_*.c 2>&1 | tee flawfinder.log
           # Gate on any high-severity (level >= 4) finding.
           if flawfinder --minlevel=4 --quiet \
-               "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c \
+               "$GITHUB_WORKSPACE"/src/ngx_http_error_abuse_*.c \
                2>/dev/null | grep -Eq 'Hits = [1-9]'; then
             echo "✗ flawfinder: high-severity (>=4) findings present" >&2
             exit 1
@@ -287,7 +288,7 @@ jobs:
           INCLUDES="-I$N/src/core -I$N/src/event -I$N/src/event/modules -I$N/src/event/quic \
             -I$N/src/os/unix -I$N/objs -I$N/src/http -I$N/src/http/modules -I$N/src/http/v2 -I/usr/include"
           # shellcheck disable=SC2086,SC2046
-          clang-tidy "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c \
+          clang-tidy "$GITHUB_WORKSPACE"/src/ngx_http_error_abuse_*.c \
             --checks='-*,cert-*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
             --warnings-as-errors='*' \
             -- $INCLUDES $(pkg-config --cflags hiredis 2>/dev/null) \
@@ -295,7 +296,7 @@ jobs:
       - name: semgrep
         run: |
           semgrep scan --config p/c --config p/security-audit \
-            "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c 2>&1 | tee semgrep.log || true
+            "$GITHUB_WORKSPACE"/src/ngx_http_error_abuse_*.c 2>&1 | tee semgrep.log || true
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

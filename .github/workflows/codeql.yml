@@ -46,8 +46,8 @@ jobs:
           queries: security-extended
           config: |
             paths:
-              - ngx_http_error_abuse_module.c
-              - ngx_http_error_abuse_scan.c
+              - src/ngx_http_error_abuse_module.c
+              - src/ngx_http_error_abuse_scan.c
             paths-ignore:
               - .build/**
 
@@ -59,7 +59,7 @@ jobs:
           key: src-nginx-${{ env.NGINX_VERSION }}
 
       - name: Build traced source
-        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" module
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Analyze
         uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
