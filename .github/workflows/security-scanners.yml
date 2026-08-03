@@ -59,10 +59,10 @@ jobs:
       - name: flawfinder
         run: |
           flawfinder --minlevel=1 \
-            "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" 2>&1 | tee flawfinder.log
+            "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c 2>&1 | tee flawfinder.log
           # Gate on any high-severity (level >= 4) finding.
           if flawfinder --minlevel=4 --quiet \
-               "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" \
+               "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c \
                2>/dev/null | grep -Eq 'Hits = [1-9]'; then
             echo "✗ flawfinder: high-severity (>=4) findings present" >&2
             exit 1
@@ -75,7 +75,7 @@ jobs:
           INCLUDES="-I$N/src/core -I$N/src/event -I$N/src/event/modules -I$N/src/event/quic \
             -I$N/src/os/unix -I$N/objs -I$N/src/http -I$N/src/http/modules -I$N/src/http/v2 -I/usr/include"
           # shellcheck disable=SC2086,SC2046
-          clang-tidy "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" \
+          clang-tidy "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c \
             --checks='-*,cert-*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
             --warnings-as-errors='*' \
             -- $INCLUDES $(pkg-config --cflags hiredis 2>/dev/null) \
@@ -83,7 +83,7 @@ jobs:
       - name: semgrep
         run: |
           semgrep scan --config p/c --config p/security-audit \
-            "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" 2>&1 | tee semgrep.log || true
+            "$GITHUB_WORKSPACE"/ngx_http_error_abuse_*.c 2>&1 | tee semgrep.log || true
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

@@ -10,7 +10,10 @@ name: Fuzzing
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: ""
+  # Pinned to match build-test.yml. The fuzz targets link nginx's real
+  # src/core/ngx_string.c, so this job now needs a real version to configure a
+  # tree with -- it was an unused empty placeholder before that.
+  NGINX_VERSION: "1.31.1"
 
 on:
   push:
@@ -38,7 +41,15 @@ jobs:
       - name: Install clang + libFuzzer
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang
+          sudo apt-get install -y \
+            clang build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
+
+      # The fuzz targets link the module's real scan TU and nginx's real
+      # src/core/ngx_string.c, so they need a CONFIGURED nginx tree for
+      # objs/ngx_auto_config.h. Configure-only (mode=module) is enough --
+      # fuzz/build.sh compiles the sources it needs itself.
+      - name: Configure nginx tree
+        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Build fuzz targets
         run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"

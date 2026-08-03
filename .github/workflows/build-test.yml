@@ -43,7 +43,8 @@ jobs:
             --suppress=missingIncludeSystem \
             --suppress=normalCheckLevelMaxBranches \
             --suppress=unusedFunction \
-            ngx_http_error_abuse_module.c
+            ngx_http_error_abuse_module.c \
+            ngx_http_error_abuse_scan.c
           git diff --check
 
       - name: Lint workflows
@@ -106,15 +107,20 @@ jobs:
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           # cflags and incs are compiler flag lists and must word-split.
+          # Both TUs get the strict pass. The scan TU holds the two parsers that
+          # walk untrusted bytes, so exempting it from -Werror would leave the
+          # highest-risk file in the module as the only one not strictly built.
           # shellcheck disable=SC2086
           (
             cd "$build"
-            "${{ matrix.cc }}" -c -fPIC $cflags \
-              -Wall -Wextra -Wshadow -Wstrict-prototypes \
-              -Wstrict-aliasing -Wunreachable-code -Werror \
-              -Wno-unused-parameter \
-              $incs "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" \
-              -o /tmp/module.o
+            for tu in ngx_http_error_abuse_module ngx_http_error_abuse_scan; do
+              "${{ matrix.cc }}" -c -fPIC $cflags \
+                -Wall -Wextra -Wshadow -Wstrict-prototypes \
+                -Wstrict-aliasing -Wunreachable-code -Werror \
+                -Wno-unused-parameter \
+                $incs "$GITHUB_WORKSPACE/${tu}.c" \
+                -o "/tmp/${tu}.o"
+            done
           )
 
       - name: Stage artifact
