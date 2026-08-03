@@ -14,9 +14,8 @@ env:
 on:
   push:
     branches: [master, main, dev]
-  pull_request:
-    branches: [master, main]
   workflow_dispatch: {}
+  workflow_call: {}
 
 concurrency:
   group: valgrind-${{ github.workflow }}-${{ github.ref }}

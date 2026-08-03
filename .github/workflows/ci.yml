@@ -1,0 +1,49 @@
+name: CI
+
+# Single entry point orchestrator (cp4a). This is the ONLY workflow carrying a
+# pull_request trigger; every PR-lane member is reachable at PR time solely as a
+# workflow_call from here. Adding a pull_request trigger to a member would make
+# it run twice and is not the convention — add the call here instead.
+#
+# ci-deep.yml is schedule-driven and deliberately NOT a member of this lane.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: orchestrator-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-test.yml
+    secrets: inherit
+
+  fuzzing:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/fuzzing.yml
+    secrets: inherit
+
+  valgrind:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/valgrind.yml
+    secrets: inherit
+
+  security-scanners:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security-scanners.yml
+    secrets: inherit
+
+  codeql:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
+    secrets: inherit
