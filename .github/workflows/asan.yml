@@ -1,3 +1,4 @@
+# sync-sha: 4b87029b8751f26ddbbcc0445b53ef7701c8a1bf7862f19c9cc1b4d5a02cbf70
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml

@@ -1,3 +1,4 @@
+# sync-sha: 869df63bf53124973627235494287dad848bc091eb7a1620680f0ebe8767c1cf
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -51,6 +52,14 @@ jobs:
         # Before trusting the next step's verdict, prove the gate can still say
         # no: a selector that matches nothing must exit 2, not report clean.
         run: ci/linter/selftest.sh
+
+      - name: Verify CI sync stamps are current
+        # Each stamped .github/ file carries a `# sync-sha:` of its own content,
+        # so a `--list` diff against nginx-skeleton-module names exactly which
+        # copies have drifted. The stamps are only worth reading if they cannot
+        # go stale, hence this gate: edit a workflow without running
+        # ci/tools/sync-stamp.sh and the PR goes red here.
+        run: ci/tools/sync-stamp.sh --check
 
       - name: Run linters
         env:

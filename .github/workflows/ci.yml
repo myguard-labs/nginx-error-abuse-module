@@ -1,3 +1,4 @@
+# sync-sha: b0723457ecc25bb7a75af2e82050c13fe9f3865aa50ed2c8e28510aed8f44acb
 name: CI
 
 # Single entry point orchestrator (cp4a). This is the ONLY workflow carrying a

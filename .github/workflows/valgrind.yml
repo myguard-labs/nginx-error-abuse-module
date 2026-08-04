@@ -1,3 +1,4 @@
+# sync-sha: 8e2e5625c664a3fc8eb816b1d8eb9888dafc9546e2b5144cc0f2d50f6bcc03ad
 name: Valgrind
 
 # Valgrind memcheck lite soak on every PR/push — 60s soak so PR feedback stays
