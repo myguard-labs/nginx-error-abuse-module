@@ -1449,12 +1449,13 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             keylen = hexlen / 2;
             /* F-5: enforce minimum HMAC key size before allocation */
             if (keylen < NGX_HTTP_ERROR_ABUSE_MIN_PERSIST_SECRET_BYTES) {
-#define MIN_SECRET_BYTES NGX_HTTP_ERROR_ABUSE_MIN_PERSIST_SECRET_BYTES
+                ngx_int_t   min_bytes;
+
+                min_bytes = NGX_HTTP_ERROR_ABUSE_MIN_PERSIST_SECRET_BYTES;
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "persist_secret: min %d bytes (%d hex "
-                                   "chars); got %uz bytes", MIN_SECRET_BYTES,
-                                   MIN_SECRET_BYTES * 2, keylen);
-#undef MIN_SECRET_BYTES
+                                   "chars); got %uz bytes", min_bytes,
+                                   min_bytes * 2, keylen);
                 return NGX_CONF_ERROR;
             }
             zone->persist_secret.data = ngx_pnalloc(cf->pool, keylen);

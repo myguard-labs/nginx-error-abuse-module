@@ -96,7 +96,7 @@ f00dcafebabe5a5a
         empty_gif;
     }
 --- must_die
---- error_like: persist_secret must be at least 16 bytes
+--- error_log: persist_secret: min 16 bytes (32 hex chars); got 1 bytes
 
 === TEST 7: persist_secret rejects 15-byte key
 --- http_config
@@ -108,7 +108,7 @@ f00dcafebabe5a5a
         empty_gif;
     }
 --- must_die
---- error_like: persist_secret must be at least 16 bytes
+--- error_log: persist_secret: min 16 bytes (32 hex chars); got 15 bytes
 
 === TEST 8: persist_secret accepts 16-byte key
 --- http_config
