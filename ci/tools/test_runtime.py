@@ -859,6 +859,229 @@ def test_on_full_policy(
         redis.stop()
 
 
+def _error_page_config(
+    root: pathlib.Path, port: int, module: pathlib.Path | None
+) -> str:
+    # F-2: an error_page internal redirect (URI target AND named-location
+    # target -- nginx clears r->ctx on two distinct code paths) must not
+    # erase the ORIGIN's error_abuse ctx. Each origin location is bound to
+    # zone "origin" (threshold=1, so a single error both counts AND, on a
+    # follow-up request, proves the identity was tracked). Destinations cover
+    # the three audited cases: (a) error_abuse off, (b) bound to a DIFFERENT
+    # zone "other", (c) a custom rejection status whose headers must still be
+    # the module's own (private/no-store/Retry-After).
+    load = f"load_module {module};\n" if module else ""
+    return f"""{load}worker_processes 1;
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log notice;
+
+events {{
+    worker_connections 512;
+}}
+
+http {{
+    access_log off;
+
+    error_abuse_zone zone=origin:1m key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=600s;
+    error_abuse_zone zone=other:1m key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=600s;
+
+    server {{
+        listen 127.0.0.1:{port};
+
+        # (a) URI error_page target with error_abuse off.
+        location = /off-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 /off-dest;
+            root {root}/empty;
+        }}
+        location = /off-dest {{
+            internal;
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # (a) named-location target with error_abuse off.
+        location = /off-named-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 @off_named;
+            root {root}/empty;
+        }}
+        location @off_named {{
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # (b) URI error_page target bound to a DIFFERENT zone.
+        location = /other-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 /other-dest;
+            root {root}/empty;
+        }}
+        location = /other-dest {{
+            internal;
+            error_abuse zone=other status=429;
+            empty_gif;
+        }}
+
+        # (b) named-location target bound to a DIFFERENT zone.
+        location = /other-named-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 @other_named;
+            root {root}/empty;
+        }}
+        location @other_named {{
+            error_abuse zone=other status=429;
+            empty_gif;
+        }}
+
+        # (c) URI error_page target: custom 503 rejection page.
+        location = /custom-origin {{
+            error_abuse zone=origin status=503;
+            error_page 404 /custom-dest;
+            root {root}/empty;
+        }}
+        location = /custom-dest {{
+            internal;
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # (c) named-location target: custom 503 rejection page.
+        location = /custom-named-origin {{
+            error_abuse zone=origin status=503;
+            error_page 404 @custom_named;
+            root {root}/empty;
+        }}
+        location @custom_named {{
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # Plain probes to read back the "origin" / "other" zone identity
+        # counters without going through error_page.
+        location = /origin-ok {{
+            error_abuse zone=origin status=429;
+            empty_gif;
+        }}
+        location = /other-ok {{
+            error_abuse zone=other status=429;
+            empty_gif;
+        }}
+    }}
+}}
+"""
+
+
+def test_error_page_redirect(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> None:
+    work = root / "error-page"
+    (work / "conf").mkdir(parents=True)
+    (work / "logs").mkdir()
+    (work / "empty").mkdir()
+    (work / "conf" / "nginx.conf").write_text(
+        _error_page_config(work, port, module), encoding="ascii"
+    )
+    output = (work / "nginx-output.log").open("a", encoding="utf-8")
+    proc = _track(
+        subprocess.Popen(
+            shlex.split(runner)
+            + [
+                str(binary),
+                "-p",
+                str(work),
+                "-c",
+                str(work / "conf" / "nginx.conf"),
+                "-g",
+                "daemon off; master_process off;",
+            ],
+            text=True,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    output.close()
+    try:
+        wait_port(port)
+
+        # (a) error_page URI target with "error_abuse off": the origin 404
+        # must still be COUNTED against zone "origin", not silently dropped.
+        # threshold=1 means the FIRST error alone cannot distinguish counted
+        # from uncounted (a tracked identity also answers via its own 404 on
+        # request 1) -- the follow-up /origin-ok request on the SAME key is
+        # the proof: 200 would mean untracked, 429 means the identity was
+        # recorded and is now banned.
+        expect(port, "/off-origin?client=off-a", 404)
+        expect(port, "/origin-ok?client=off-a", 429)
+
+        # (a) named-location target with "error_abuse off".
+        expect(port, "/off-named-origin?client=off-b", 404)
+        expect(port, "/origin-ok?client=off-b", 429)
+
+        # (b) URI error_page target bound to a DIFFERENT zone: the origin
+        # zone's identity must still be the one that gets counted, and the
+        # destination zone ("other") must NOT record it instead.
+        expect(port, "/other-origin?client=other-a", 404)
+        expect(port, "/origin-ok?client=other-a", 429)
+        expect(port, "/other-ok?client=other-a", 200)
+
+        # (b) named-location target bound to a DIFFERENT zone.
+        expect(port, "/other-named-origin?client=other-b", 404)
+        expect(port, "/origin-ok?client=other-b", 429)
+        expect(port, "/other-ok?client=other-b", 200)
+
+        # (c) custom rejection page (URI target): the SECOND request against
+        # the now-banned identity must come back through the origin's own
+        # status=503 with the synthetic rejection headers -- proving the
+        # restored ctx kept own_rejection/state, not just the counter.
+        expect(port, "/custom-origin?client=custom-a", 404)
+        status, headers = fetch(port, "/custom-origin?client=custom-a")
+        if status != 503:
+            raise AssertionError(f"/custom-origin expected 503, got {status}")
+        cache_control = headers.get("cache-control", "")
+        if "no-store" not in cache_control or "private" not in cache_control:
+            raise AssertionError(
+                f"custom rejection page Cache-Control missing "
+                f"private/no-store: {cache_control!r}"
+            )
+        if "retry-after" not in headers:
+            raise AssertionError("custom rejection page missing Retry-After")
+
+        # (c) custom rejection page (named-location target).
+        expect(port, "/custom-named-origin?client=custom-b", 404)
+        status, headers = fetch(port, "/custom-named-origin?client=custom-b")
+        if status != 503:
+            raise AssertionError(f"/custom-named-origin expected 503, got {status}")
+        cache_control = headers.get("cache-control", "")
+        if "no-store" not in cache_control or "private" not in cache_control:
+            raise AssertionError(
+                f"custom rejection page (named) Cache-Control missing "
+                f"private/no-store: {cache_control!r}"
+            )
+        if "retry-after" not in headers:
+            raise AssertionError("custom rejection page (named) missing Retry-After")
+    finally:
+        rc = proc.poll()
+        if rc is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        elif rc not in (0, -signal.SIGTERM):
+            text = (work / "nginx-output.log").read_text(
+                encoding="utf-8", errors="replace"
+            )
+            raise AssertionError(f"nginx exited with {rc}:\n{text}")
+
+
 def expect_invalid_config(
     binary: pathlib.Path,
     module: pathlib.Path | None,
@@ -1191,6 +1414,7 @@ def main() -> int:
             args.port,
             pathlib.Path(args.redis_server).absolute() if args.redis_server else None,
         )
+        test_error_page_redirect(binary, module, root, args.runner, args.port + 20)
         if args.redis_server:
             test_redis_multi_host(
                 binary,

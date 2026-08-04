@@ -171,7 +171,40 @@ typedef struct {
     unsigned                      redis_pending:1;
     unsigned                      redis_checked:1;
     unsigned                      redis_blocked:1;
+    /* F-2: set once, when prepare_ctx() restores this ctx from the
+     * r->cleanup anchor after an error_page internal redirect zeroed
+     * r->ctx. Never cleared -- every subsequent hop for this request must
+     * keep treating it as origin-owned. Every zone dereference on a path
+     * that can run after restore MUST use ctx->zone, never conf->zone: the
+     * destination location's conf is not the authority once this bit is
+     * set. conf still supplies location policy (reject_status, log_level)
+     * and dry_run, but only dry_run when this bit is clear -- see the
+     * origin-wins comment in the header filter. */
+    unsigned                      from_anchor:1;
 } ngx_http_error_abuse_req_ctx_t;
+
+/* F-2: an error_page internal redirect (both ngx_http_internal_redirect() and
+ * the named-location path) zeroes r->ctx wholesale but never touches
+ * r->cleanup, and the request pool survives the hop. A durable cleanup
+ * record, registered the first time the ctx is prepared, is the only anchor
+ * that outlives the redirect: the header filter walks r->main->cleanup for
+ * this magic tag and restores the ORIGIN ctx instead of preparing a fresh one
+ * from the destination location's conf. The handler itself is a no-op --
+ * the record exists only to carry the back-pointer, the pool owns the ctx. */
+#define NGX_HTTP_ERROR_ABUSE_ANCHOR_MAGIC  0x45414e43u  /* "EANC" */
+
+typedef struct {
+    ngx_uint_t                       magic;
+    ngx_http_error_abuse_req_ctx_t  *ctx;
+} ngx_http_error_abuse_ctx_anchor_t;
+
+static void ngx_http_error_abuse_ctx_anchor_noop(void *data);
+static ngx_http_error_abuse_req_ctx_t *ngx_http_error_abuse_find_anchor_ctx(
+    ngx_http_request_t *r);
+static ngx_int_t ngx_http_error_abuse_register_anchor(ngx_http_request_t *r,
+    ngx_http_error_abuse_req_ctx_t *ctx);
+static ngx_flag_t ngx_http_error_abuse_effective_dry_run(
+    ngx_http_error_abuse_req_ctx_t *ctx, ngx_http_error_abuse_loc_conf_t *conf);
 
 /* Binds the hiredis async context's socket into nginx's own epoll, so I/O is
  * fully event-driven instead of polled on a recurring timer. */
@@ -863,7 +896,7 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
         /* COR-4: ctx->blocked_until was populated from the Redis deadline in
          * the check callback; count reflects a threshold match. */
         ctx->count = ctx->zone->threshold;
-        if (conf->dry_run) {
+        if (ngx_http_error_abuse_effective_dry_run(ctx, conf)) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
             ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
                                               "would block (Redis)");
@@ -877,7 +910,7 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     }
 
     now = ngx_time();
-    rc = ngx_http_error_abuse_is_blocked(conf->zone, &ctx->key, now,
+    rc = ngx_http_error_abuse_is_blocked(ctx->zone, &ctx->key, now,
                                          &ctx->count,
                                          &ctx->blocked_until);
     if (rc == NGX_OK) {
@@ -885,7 +918,7 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
                        "error_abuse: client \"%V\" in zone \"%V\" "
                        "currently blocked",
                        &ctx->raw_key, &ctx->zone->name);
-        if (conf->dry_run) {
+        if (ngx_http_error_abuse_effective_dry_run(ctx, conf)) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
             ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
                                               "would block (local)");
@@ -920,16 +953,19 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
-    /* skip when module disabled or no zone bound */
     conf = ngx_http_get_module_loc_conf(r, ngx_http_error_abuse_module);
-    if (!conf->enabled || conf->zone == NULL) {
-        return ngx_http_error_abuse_next_header_filter(r);
-    }
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
-    if (ctx == NULL) {
-        ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
-    }
+    /* F-2: ngx_http_internal_redirect() and the named-location redirect path
+     * both zero r->ctx wholesale, so a ctx prepared at the origin location is
+     * gone by the time the response is produced at the destination (e.g. an
+     * error_page target). prepare_ctx() itself restores the ORIGIN ctx from
+     * the durable r->cleanup anchor when r->ctx is empty, regardless of the
+     * destination's enabled/zone gate -- an "error_abuse off" or
+     * differently-zoned destination must not skip enforcement the origin
+     * already earned. Call it unconditionally here (it is a no-op returning
+     * the existing ctx when one is already set) so the anchor gets a chance
+     * to fire even when THIS location is disabled or unzoned. */
+    ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
 
     if (ctx == NULL || ctx->zone == NULL || ctx->response_seen) {
         return ngx_http_error_abuse_next_header_filter(r);
@@ -941,8 +977,16 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
      * location whose dry_run= differs from where the ctx was first prepared
      * (preaccess). Re-derive it from the location actually producing this
      * response so enforcement and observation follow the final location
-     * deterministically, matching conf->log_level used below. */
-    ctx->dry_run = conf->dry_run;
+     * deterministically, matching conf->log_level used below.
+     *
+     * F-2: that re-derivation only applies when the ctx was (re)built from
+     * THIS location's conf. A ctx restored from the anchor after an
+     * error_page redirect keeps the ORIGIN's dry_run -- the destination's
+     * dry_run=/off/zone= must not retroactively change how the origin's
+     * error is enforced or observed. */
+    if (!ctx->from_anchor) {
+        ctx->dry_run = conf->dry_run;
+    }
 
     /* SEC-2/RFC-1/RFC-2: this is our own synthetic rejection; tag it private,
      * no-store and (for 429/503) Retry-After so it is never shared-cached. */
@@ -1032,6 +1076,73 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
     return ngx_http_error_abuse_next_header_filter(r);
 }
 
+/* F-2: no-op handler -- the record exists only to carry ctx->cleanup's
+ * back-pointer through r->cleanup, which the pool already owns and frees. */
+static void
+ngx_http_error_abuse_ctx_anchor_noop(void *data)
+{
+    (void) data;
+}
+
+static ngx_int_t
+ngx_http_error_abuse_register_anchor(ngx_http_request_t *r,
+    ngx_http_error_abuse_req_ctx_t *ctx)
+{
+    ngx_http_cleanup_t                *cln;
+    ngx_http_error_abuse_ctx_anchor_t *anchor;
+
+    cln = ngx_http_cleanup_add(r, sizeof(ngx_http_error_abuse_ctx_anchor_t));
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+
+    anchor = cln->data;
+    anchor->magic = NGX_HTTP_ERROR_ABUSE_ANCHOR_MAGIC;
+    anchor->ctx = ctx;
+
+    cln->handler = ngx_http_error_abuse_ctx_anchor_noop;
+
+    return NGX_OK;
+}
+
+/* F-2: r->ctx is zeroed by both internal-redirect paths, but r->cleanup is
+ * always r->main->cleanup and survives every hop along with the pool. Walk
+ * it for our tagged anchor and hand back the ORIGIN ctx it points at. */
+static ngx_http_error_abuse_req_ctx_t *
+ngx_http_error_abuse_find_anchor_ctx(ngx_http_request_t *r)
+{
+    ngx_http_cleanup_t                *cln;
+    ngx_http_error_abuse_ctx_anchor_t *anchor;
+
+    for (cln = r->main->cleanup; cln != NULL; cln = cln->next) {
+        if (cln->handler != ngx_http_error_abuse_ctx_anchor_noop) {
+            continue;
+        }
+
+        anchor = cln->data;
+        if (anchor->magic != NGX_HTTP_ERROR_ABUSE_ANCHOR_MAGIC) {
+            continue;
+        }
+
+        return anchor->ctx;
+    }
+
+    return NULL;
+}
+
+/* F-2: origin-wins. A ctx restored from the anchor keeps the ORIGIN
+ * location's dry_run for the rest of the request; a ctx prepared fresh (the
+ * common, non-redirected case) tracks the current location's conf, matching
+ * pre-F-2 behaviour. Every dry_run read on a path reachable after restore
+ * (preaccess AND the header filter) must go through this, not conf->dry_run
+ * directly. */
+static ngx_flag_t
+ngx_http_error_abuse_effective_dry_run(ngx_http_error_abuse_req_ctx_t *ctx,
+    ngx_http_error_abuse_loc_conf_t *conf)
+{
+    return ctx->from_anchor ? ctx->dry_run : conf->dry_run;
+}
+
 static ngx_http_error_abuse_req_ctx_t *
 ngx_http_error_abuse_prepare_ctx(ngx_http_request_t *r,
     ngx_http_error_abuse_loc_conf_t *conf)
@@ -1042,6 +1153,27 @@ ngx_http_error_abuse_prepare_ctx(ngx_http_request_t *r,
     ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
     if (ctx != NULL) {
         return ctx;
+    }
+
+    /* F-2: r->ctx is zeroed by both internal-redirect paths (URI error_page
+     * target and named-location target), but never r->cleanup, and the
+     * request pool survives every hop. Before allocating a fresh ctx from
+     * THIS (possibly disabled, possibly differently-zoned) location's conf,
+     * check whether an origin ctx was already anchored earlier in this
+     * request -- restoring it is the whole fix: a destination location must
+     * not silently discard enforcement the origin already earned. */
+    ctx = ngx_http_error_abuse_find_anchor_ctx(r);
+    if (ctx != NULL) {
+        ctx->from_anchor = 1;
+        ngx_http_set_ctx(r, ctx, ngx_http_error_abuse_module);
+        return ctx;
+    }
+
+    /* No origin ctx exists: this is either the first location to see this
+     * request, or the module is disabled/unzoned everywhere it has run so
+     * far. Only now does conf->zone become load-bearing. */
+    if (conf == NULL || !conf->enabled || conf->zone == NULL) {
+        return NULL;
     }
 
     if (ngx_http_complex_value(r, &conf->zone->key, &key) != NGX_OK) {
@@ -1056,6 +1188,14 @@ ngx_http_error_abuse_prepare_ctx(ngx_http_request_t *r,
     ctx->state = NGX_HTTP_ERROR_ABUSE_BYPASSED;
     ctx->dry_run = conf->dry_run;
     ngx_http_set_ctx(r, ctx, ngx_http_error_abuse_module);
+
+    /* F-2: anchor this ctx in a durable r->cleanup record now, while it is
+     * still reachable, so a later error_page internal redirect (which
+     * zeroes r->ctx but never r->cleanup) can be recognized and restored by
+     * the header filter instead of silently losing it. */
+    if (ngx_http_error_abuse_register_anchor(r, ctx) != NGX_OK) {
+        return NULL;
+    }
 
     if (key.len == 0) {
         return ctx;
