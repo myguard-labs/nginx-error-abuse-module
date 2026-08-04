@@ -6,6 +6,40 @@ name: CI
 # it run twice and is not the convention — add the call here instead.
 #
 # ci-deep.yml is schedule-driven and deliberately NOT a member of this lane.
+#
+# Runner lanes (cp8). Measured per-called-workflow wall clock from run
+# 30864509849 (2026-08-04, branch ci/cp7b-linter, self-hosted builder02):
+#   fuzzing            265s (self-hosted) -- longest single job, the budget
+#   valgrind            90s (self-hosted)
+#   build-test          85s (self-hosted; internally Build 47s, Test::Nginx 51s,
+#                             Validation 17s, Runtime 35s)
+#   security-scanners   65s (self-hosted)
+#   asan                62s (self-hosted; internally 59s + 62s)
+#   codeql              93s (HOSTED ubuntu-latest)
+#   lint                56s (HOSTED ubuntu-latest)
+#
+# builder02 has 6 real self-hosted ephemeral slots (docker-01, docker-02,
+# runner-01..04 -- `systemctl list-units | grep ci-ephemeral`). Before this
+# change, every self-hosted job started at t=0 with no `needs:` between them:
+# build-test fans out to 3 concurrent jobs, asan to 2, plus valgrind,
+# security-scanners and fuzzing each 1 -- 8 self-hosted jobs racing 6 slots.
+# The measured run (30864509849) happened to show zero queueing delay (all
+# jobs startedAt 00:06:30, run created 00:06:27), so this is oversubscription
+# headroom removed, NOT a measured wall-clock speedup -- no speedup was
+# measured or claimed here.
+#
+# Three lanes -- three that fit beats four that fit:
+#   Lane A: fuzzing alone (265s), nothing chained behind it. Headroom 0s.
+#   Lane B: valgrind (90s) -> security-scanners (65s) = 155s. Headroom 110s.
+#   Lane C: build-test (85s) -> asan (62s) = 147s. Headroom 118s.
+#   codeql and lint are HOSTED (ubuntu-latest): no `needs:`, not laned,
+#   start immediately alongside everything else.
+#
+# After this change, peak self-hosted concurrency at t=0 is 5 (fuzzing 1 +
+# valgrind 1 + build-test's 3 fanned-out jobs), under the 6-slot ceiling.
+#
+# Re-derive the per-job timings with:
+#   gh run view <id> --json jobs -q '.jobs[] | [.name, .conclusion, (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s", .startedAt, .completedAt] | @tsv'
 
 on:
   pull_request:
@@ -36,6 +70,8 @@ jobs:
     secrets: inherit # zizmor: ignore[secrets-inherit] -- no secrets configured on this repo yet, see note above jobs:
 
   asan:
+    needs: build-test
+    if: ${{ !cancelled() }}
     permissions:
       contents: read
     uses: ./.github/workflows/asan.yml
@@ -53,6 +89,8 @@ jobs:
     secrets: inherit # zizmor: ignore[secrets-inherit] -- no secrets configured on this repo yet, see note above jobs:
 
   security-scanners:
+    needs: valgrind
+    if: ${{ !cancelled() }}
     permissions:
       contents: read
     uses: ./.github/workflows/security-scanners.yml

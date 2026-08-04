@@ -52,17 +52,24 @@ jobs:
             paths-ignore:
               - .build/**
 
-      # cp7a: mode=module here is configure-only (no core `make`), so most of
-      # the win is the source tarball and configure-skip stamp -- but ccache
-      # still helps the module's own two TUs, and reusing the action keeps
-      # this workflow from hand-duplicating the tarball cache key logic.
-      - name: Restore build caches
-        uses: ./.github/actions/build-cache
-        with:
-          mode: module
-          nginx-version: ${{ env.NGINX_VERSION }}
-
+      # cp8: NO cache restore here, and NO_CACHE=1 on the build below. CodeQL
+      # traces the compiler invocations that happen during "Build traced
+      # source" -- if ccache (or a restored build tree) serves the module's
+      # two TUs instead of a real compiler running under the tracer, the
+      # resulting database has no C/C++ code in it and `codeql analyze` fails
+      # with "CodeQL could not process any code written in C/C++" (seen on
+      # run 30865052783, exit 32 at `database finalize`, with a WARM ccache).
+      # A cold cache happened to hide this at cp7b, which is why it shipped.
+      # The source tarball / configure-skip stamp would be safe to keep (they
+      # don't touch the compiler), but ci-build.sh's NO_CACHE=1 clears all of
+      # ccache, the build tree AND the tarball together -- there's no cheap
+      # way to keep just the tarball without hand-duplicating cache-key logic
+      # here, so the whole restore is dropped instead. Losing the tarball
+      # download is a few seconds; a silently-empty CodeQL database is not
+      # something to trade it for.
       - name: Build traced source
+        env:
+          NO_CACHE: "1"
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Analyze
