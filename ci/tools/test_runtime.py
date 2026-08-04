@@ -998,6 +998,21 @@ http {{
             error_abuse zone=dryorigin status=429;
             empty_gif;
         }}
+
+        # A-1: plain "error_abuse off" location, hit DIRECTLY -- no
+        # error_page redirect, no anchor from any earlier location in this
+        # request. prepare_ctx() finds no anchor and conf->enabled=0, so it
+        # returns NULL: preaccess must treat that as the ordinary "disabled
+        # here" case (NGX_DECLINED, normal response) and NOT the internal
+        # error it used to return when prepare_ctx() was unreachable through
+        # a different path. Guards the CAUTION in A-1: NULL now means two
+        # different things (no anchor + disabled here vs a real allocation
+        # failure) and this is the common one, exercised on every request to
+        # a module-off location.
+        location = /off-plain {{
+            error_abuse off;
+            empty_gif;
+        }}
     }}
 }}
 """
@@ -1052,6 +1067,33 @@ def test_error_page_redirect(
         # (a) named-location target with "error_abuse off".
         expect(port, "/off-named-origin?client=off-b", 404)
         expect(port, "/origin-ok?client=off-b", 429)
+
+        # Smoke coverage, NOT the A-1 regression guard: off-a is already
+        # banned in zone "origin" (from the assertions above, a SEPARATE
+        # prior request). /off-origin shares that zone, so its own
+        # preaccess -- unaffected by A-1, it was never behind the removed
+        # guard -- rejects first (429, own_rejection) without ever reaching
+        # the backend or the error_page redirect to /off-dest. Kept as an
+        # end-to-end sanity check that the ban is honoured on repeat
+        # requests; the debug-log assertion further down is what actually
+        # exercises /off-dest's own restored preaccess.
+        expect(port, "/off-origin?client=off-a", 429)
+
+        # Negative control: a FRESH identity, never seen anywhere, taking
+        # the same /off-origin -> /off-dest path must pass normally: origin
+        # preaccess records it (404, uncounted-yet since threshold=1 makes
+        # this itself the counted event) and the "error_abuse off"
+        # destination must not turn it into a 500 or a spurious reject.
+        expect(port, "/off-origin?client=off-fresh", 404)
+
+        # A-1 core regression guard: a location where the module is off,
+        # hit DIRECTLY with no earlier hop in this request to anchor from.
+        # prepare_ctx() returns NULL (no anchor, conf disabled) and
+        # preaccess must treat that as "disabled here", serving the normal
+        # response -- not NGX_HTTP_INTERNAL_SERVER_ERROR. This is the exact
+        # case the CAUTION warns about: get the NULL handling wrong and
+        # EVERY request to a module-off location 500s.
+        expect(port, "/off-plain?client=off-plain-a", 200)
 
         # (b) URI error_page target bound to a DIFFERENT zone: the origin
         # zone's identity must still be the one that gets counted, and the
