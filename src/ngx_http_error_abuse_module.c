@@ -43,6 +43,8 @@
 #define NGX_HTTP_ERROR_ABUSE_VERSION       2  /* RFC-3: portable LE format */
 #define NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN  24 /* magic8+ver4+thr4+rec4+crc4 */
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
+/* F-5: min HMAC-SHA256 key size (bytes) */
+#define NGX_HTTP_ERROR_ABUSE_MIN_PERSIST_SECRET_BYTES 16
 /* STAB-1: cap configured durations (seconds) so now+block, now-interval and
  * value*1000 cannot overflow signed time_t/int64_t, including on 32-bit. */
 #define NGX_HTTP_ERROR_ABUSE_MAX_SECONDS   315360000  /* 10 years */
@@ -1432,7 +1434,7 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         } else if (ngx_strncmp(value[i].data, "persist_secret=", 15) == 0) {
             u_char     *hexp;
-            size_t      hexlen, b;
+            size_t      hexlen, keylen, b;
 
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_SECRET) {
                 goto duplicate;
@@ -1444,11 +1446,22 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             if (hexlen == 0 || (hexlen & 1)) {
                 goto invalid;
             }
-            zone->persist_secret.data = ngx_pnalloc(cf->pool, hexlen / 2);
+            keylen = hexlen / 2;
+            /* F-5: enforce minimum HMAC key size before allocation */
+            if (keylen < NGX_HTTP_ERROR_ABUSE_MIN_PERSIST_SECRET_BYTES) {
+#define MIN_SECRET_BYTES NGX_HTTP_ERROR_ABUSE_MIN_PERSIST_SECRET_BYTES
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "persist_secret: min %d bytes (%d hex "
+                                   "chars); got %uz bytes", MIN_SECRET_BYTES,
+                                   MIN_SECRET_BYTES * 2, keylen);
+#undef MIN_SECRET_BYTES
+                return NGX_CONF_ERROR;
+            }
+            zone->persist_secret.data = ngx_pnalloc(cf->pool, keylen);
             if (zone->persist_secret.data == NULL) {
                 return NGX_CONF_ERROR;
             }
-            for (b = 0; b < hexlen / 2; b++) {
+            for (b = 0; b < keylen; b++) {
                 ngx_int_t hi = ngx_hextoi(hexp + b * 2, 1);
                 ngx_int_t lo = ngx_hextoi(hexp + b * 2 + 1, 1);
                 if (hi == NGX_ERROR || lo == NGX_ERROR) {
@@ -1456,7 +1469,7 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 }
                 zone->persist_secret.data[b] = (u_char) ((hi << 4) | lo);
             }
-            zone->persist_secret.len = hexlen / 2;
+            zone->persist_secret.len = keylen;
 
         } else if (ngx_strncmp(value[i].data, "redis=", 6) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_REDIS) {
