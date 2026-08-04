@@ -137,6 +137,32 @@ u_char *ngx_http_error_abuse_redis_key_write(u_char *buf,
     const u_char *digest, size_t digest_len);
 
 
+/*
+ * Per-record bounds arithmetic for the persist-file serializer, split out of
+ * serialize()'s queue loop so the byte count that gates the "does this record
+ * fit in the remaining buffer" check is the SAME expression the unit tests
+ * exercise, not a hand-copied twin of it.
+ *
+ * The record layout is FILE_REC_LEN (klen2+ecnt2+blk8+seen8) bytes of fixed
+ * fields, then key_len bytes of key data, then event_count u64 event
+ * timestamps. serialize() must write exactly this many bytes per record: any
+ * caller changing the write sequence has to change this function in the same
+ * diff, or the two go silently out of sync the way redis_key_len/write above
+ * warn about.
+ *
+ * Precondition: key_len and event_count must be small enough that the sum
+ * cannot wrap size_t. The module's only caller reads key_len from
+ * ngx_http_error_abuse_node_t.key_len (a uint16_t, bounded by
+ * NGX_HTTP_ERROR_ABUSE_DIGEST_LEN in practice) and event_count from
+ * ean->event_count (a uint16_t, bounded by the configured threshold), so this
+ * holds by construction there. Stated rather than checked for the same reason
+ * redis_key_len states it: a size_t return has no error value, and the
+ * allocation this guards cannot survive the wrap anyway.
+ */
+size_t ngx_http_error_abuse_serialize_rec_len(size_t key_len,
+    size_t event_count);
+
+
 u_char *ngx_http_error_abuse_put_u16(u_char *p, uint16_t v);
 u_char *ngx_http_error_abuse_put_u32(u_char *p, uint32_t v);
 u_char *ngx_http_error_abuse_put_u64(u_char *p, uint64_t v);

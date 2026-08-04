@@ -670,6 +670,80 @@ case_redis_key_len_matches_write(void)
 }
 
 
+/*
+ * serialize()'s queue loop bounds-checks each record against
+ * ngx_http_error_abuse_serialize_rec_len() before writing FILE_REC_LEN fixed
+ * bytes, then key_len key bytes, then event_count u64s. If that expression
+ * ever drifts from the write sequence (a `* 4` instead of `* 8`, a dropped
+ * `+ key_len`, a wrong FILE_REC_LEN), serialize() either truncates a valid
+ * record or overruns the persist buffer -- neither is caught by the compiler.
+ *
+ * The write below is independent literal arithmetic (FILE_REC_LEN raw bytes,
+ * then key_len raw bytes, then event_count*8 raw bytes written 8 at a time),
+ * not a call through serialize_rec_len() itself, so a mutated rec_len()
+ * genuinely disagrees with what gets written instead of trivially matching
+ * itself.
+ */
+static void
+case_serialize_rec_len_matches_write(void)
+{
+    static const struct {
+        size_t       key_len;
+        size_t       event_count;
+        const char  *what;
+    } cases[] = {
+        { 0,                                  0,   "both zero" },
+        { 0,                                  5,   "zero key, some events" },
+        { NGX_HTTP_ERROR_ABUSE_DIGEST_LEN,     0,   "real key, zero events" },
+        { NGX_HTTP_ERROR_ABUSE_DIGEST_LEN,     1,   "real key, one event" },
+        { NGX_HTTP_ERROR_ABUSE_DIGEST_LEN,   200,   "real key, many events" },
+        { 65535,                             65535, "max plausible uint16 both" },
+    };
+
+    u_char   buf[65535 + 65535 * 8 + NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN + 1];
+    u_char   key[65535];
+    size_t   i, j;
+
+    for (j = 0; j < sizeof(key); j++) {
+        key[j] = (u_char) (j * 3 + 1);
+    }
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t   key_len = cases[i].key_len;
+        size_t   event_count = cases[i].event_count;
+        size_t   claimed;
+        u_char  *p;
+        size_t   k;
+
+        claimed = ngx_http_error_abuse_serialize_rec_len(key_len,
+                                                          event_count);
+
+        memset(buf, 0, sizeof(buf));
+        buf[claimed] = 0xAA;
+
+        /* Independent write: raw literal byte counts, not a call through the
+         * function under test. */
+        p = buf;
+        for (k = 0; k < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN; k++) {
+            *p++ = 0x11;
+        }
+        for (k = 0; k < key_len; k++) {
+            *p++ = key[k];
+        }
+        for (k = 0; k < event_count; k++) {
+            size_t  b;
+            for (b = 0; b < 8; b++) {
+                *p++ = 0x22;
+            }
+        }
+
+        check((size_t) (p - buf) == claimed, cases[i].what);
+        check(buf[claimed] == 0xAA,
+              "canary past the claimed record length is untouched");
+    }
+}
+
+
 int
 main(void)
 {
@@ -687,6 +761,7 @@ main(void)
     case_snapshot_accept_two_records();
 
     case_redis_key_len_matches_write();
+    case_serialize_rec_len_matches_write();
 
     case_codec_u16();
     case_codec_u32();
