@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sync-sha: dec2234912aea677cbd8ccf84ac3229cac6315ba82c363054b30d5ada87c7dba
 # compute-versions.sh -- resolve the latest upstream versions + their sha256 and
 # rewrite .github/versions.env in place. Used by bump.yml (weekly). Prints a
 # short summary of what it resolved to stdout, which bump.yml quotes into the

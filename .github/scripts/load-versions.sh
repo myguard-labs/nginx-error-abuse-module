@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sync-sha: f27b4b0015c199974496dcfef3efaad998cabd15d83703a17ba7444c973a5a6c
 # load-versions.sh — export every pin from .github/versions.env into the
 # workflow environment. Run as the first step of every CI job:
 #

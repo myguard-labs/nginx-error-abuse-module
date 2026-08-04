@@ -1,3 +1,4 @@
+# sync-sha: b8deb92e1b165b085953273cdbf0b646998cf3dd502d97553892a8704a5c4257
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on the status-list

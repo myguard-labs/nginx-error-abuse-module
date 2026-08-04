@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sync-sha: 6e84b7c8cb73f9c86aa7362a7aa923b82eea4044d86a1987f20854d576975279
 # fetch-verify.sh URL EXPECTED_SHA256 OUTFILE
 #
 # Download URL to OUTFILE and verify its sha256 against EXPECTED_SHA256.
