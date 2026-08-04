@@ -62,17 +62,11 @@ jobs:
       # src/core/ngx_string.c, so this job needs a CONFIGURED nginx tree for
       # objs/ngx_auto_config.h. Same mainline resolution the deep soak jobs
       # below use, so the long fuzz runs against the same nginx they do.
-      - name: Resolve latest mainline nginx
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          if [ -z "$ver" ]; then
-            echo "::error::cannot resolve nginx version"
-            exit 1
-          fi
-          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+      # Was: scrape nginx.org for the highest version and build whatever came
+      # back -- unreproducible (same commit, different nginx on different days)
+      # and unverifiable (a run-time version has no digest to check against).
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       # cp7a: version is resolved dynamically above, so the cache key changes
       # with it -- correct, since a new mainline release IS a new build tree.
@@ -188,13 +182,11 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - name: Resolve latest mainline nginx
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
-          [ -n "$ver" ] || { echo "::error::cannot resolve nginx version"; exit 1; }
-          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+      # Was: scrape nginx.org for the highest version and build whatever came
+      # back -- unreproducible (same commit, different nginx on different days)
+      # and unverifiable (a run-time version has no digest to check against).
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -204,8 +196,12 @@ jobs:
       - name: Build debug nginx + error-abuse module
         run: |
           set -euo pipefail
-          test -f "nginx-${NGINX_VERSION}.tar.gz" || wget -q -O "nginx-${NGINX_VERSION}.tar.gz" \
-            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+          # Digest-verified; the bare wget this replaces compiled whatever
+          # bytes the network returned.
+          bash .github/scripts/fetch-verify.sh \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+            "$NGINX_VERSION_SHA256" \
+            "nginx-${NGINX_VERSION}.tar.gz"
           tar -xzf "nginx-${NGINX_VERSION}.tar.gz"; cd "nginx-${NGINX_VERSION}"
           ./configure \
             --with-compat --with-debug --with-threads --with-file-aio \
@@ -243,13 +239,11 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - name: Resolve latest mainline nginx
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
-          [ -n "$ver" ] || { echo "::error::cannot resolve nginx version"; exit 1; }
-          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+      # Was: scrape nginx.org for the highest version and build whatever came
+      # back -- unreproducible (same commit, different nginx on different days)
+      # and unverifiable (a run-time version has no digest to check against).
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -259,8 +253,12 @@ jobs:
       - name: Build debug nginx + error-abuse module
         run: |
           set -euo pipefail
-          test -f "nginx-${NGINX_VERSION}.tar.gz" || wget -q -O "nginx-${NGINX_VERSION}.tar.gz" \
-            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+          # Digest-verified; the bare wget this replaces compiled whatever
+          # bytes the network returned.
+          bash .github/scripts/fetch-verify.sh \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+            "$NGINX_VERSION_SHA256" \
+            "nginx-${NGINX_VERSION}.tar.gz"
           tar -xzf "nginx-${NGINX_VERSION}.tar.gz"; cd "nginx-${NGINX_VERSION}"
           ./configure \
             --with-compat --with-debug --with-threads --with-file-aio \
@@ -298,6 +296,8 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -315,10 +315,15 @@ jobs:
       - name: Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
-          wget -q "https://nginx.org/download/nginx-${ver}.tar.gz"
-          tar -xzf "nginx-${ver}.tar.gz"; cd "nginx-${ver}"
+          # Pinned and digest-verified, like every other nginx fetch in this
+          # file. This one also scraped for "latest" and wget'd it unverified,
+          # so the headers clang-tidy read could drift from the tree the rest
+          # of CI builds against.
+          bash .github/scripts/fetch-verify.sh \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+            "$NGINX_VERSION_SHA256" \
+            "nginx-${NGINX_VERSION}.tar.gz"
+          tar -xzf "nginx-${NGINX_VERSION}.tar.gz"; cd "nginx-${NGINX_VERSION}"
           CC=gcc ./configure --with-compat --add-dynamic-module="$GITHUB_WORKSPACE" >/dev/null
           echo "NGINX_SRC_TREE=$PWD" >> "$GITHUB_ENV"
       - name: flawfinder

@@ -10,10 +10,11 @@ name: Fuzzing
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Pinned to match build-test.yml. The fuzz targets link nginx's real
-  # src/core/ngx_string.c, so this job now needs a real version to configure a
-  # tree with -- it was an unused empty placeholder before that.
-  NGINX_VERSION: "1.31.1"
+  # NGINX_VERSION is deliberately NOT set here. It comes from
+  # .github/versions.env via the "Load version pins" step in each job below.
+  # A workflow-level env of the same name would WIN over the $GITHUB_ENV write
+  # that step makes, silently pinning the build to this literal while the file
+  # that claims to be the single source of truth was ignored.
 
 on:
   push:
@@ -38,6 +39,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install clang + libFuzzer
         run: |

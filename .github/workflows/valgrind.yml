@@ -35,14 +35,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Resolve latest mainline nginx
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          [ -n "$ver" ] || { echo "::error::cannot resolve nginx version"; exit 1; }
-          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+      # Was: scrape nginx.org's download page for the highest version and build
+      # whatever came back. That made the job unreproducible (the same commit
+      # built a different nginx on different days, so a new failure could not
+      # be attributed to the diff) and unverifiable -- a version discovered at
+      # run time has no digest to check the tarball against, which is exactly
+      # what versions.env exists to provide.
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install dependencies
         run: |
@@ -54,9 +54,14 @@ jobs:
       - name: Build debug nginx + error-abuse module
         run: |
           set -euo pipefail
-          test -f "nginx-${NGINX_VERSION}.tar.gz" || \
-            wget -q -O "nginx-${NGINX_VERSION}.tar.gz" \
-              "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+          # Verified against the digest pinned beside the version in
+          # versions.env. The bare `wget` this replaces built whatever bytes
+          # the network returned, so a compromised or simply changed archive
+          # was compiled and run rather than failing the job.
+          bash .github/scripts/fetch-verify.sh \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+            "$NGINX_VERSION_SHA256" \
+            "nginx-${NGINX_VERSION}.tar.gz"
           tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
           cd "nginx-${NGINX_VERSION}"
           ./configure \
