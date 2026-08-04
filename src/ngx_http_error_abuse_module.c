@@ -3471,8 +3471,8 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
         key_len = ean->key_len;
 
         if ((size_t) (last - p)
-            < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN + key_len
-              + (size_t) ean->event_count * 8)
+            < ngx_http_error_abuse_serialize_rec_len(key_len,
+                                                      ean->event_count))
         {
             break;
         }

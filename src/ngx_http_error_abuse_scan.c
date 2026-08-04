@@ -207,3 +207,10 @@ ngx_http_error_abuse_redis_key_write(u_char *buf,
 
     return p;
 }
+
+
+size_t
+ngx_http_error_abuse_serialize_rec_len(size_t key_len, size_t event_count)
+{
+    return NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN + key_len + event_count * 8;
+}
