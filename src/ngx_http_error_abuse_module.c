@@ -111,6 +111,7 @@ struct ngx_http_error_abuse_zone_s {
     u_char                           *persist_buf;     /* reused serialize buf */ /* NOLINT-nginx: aligned struct field block */
     size_t                            persist_buf_cap;
     ngx_flag_t                        redis;
+    ngx_flag_t                        on_full_reject;  /* F-3: on_full= */ /* NOLINT-nginx: aligned struct field block */
 #if (NGX_THREADS)
     ngx_thread_task_t                *persist_task;   /* PERF-1 */
     unsigned                          persist_busy:1;
@@ -997,11 +998,24 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         ngx_http_error_abuse_redis_record(r, ctx);
     }
     if (rc == NGX_ERROR) {
-        /* SEC-1: do not fail open. The configured shm pressure policy decides
-         * whether a new identity that could not be tracked is rejected. */
+        /* F-3: the zone had no room to allocate a node for this new identity
+         * (an active ban is never evicted to make room — see
+         * ngx_http_error_abuse_evict_one_unblocked). The zone's on_full=
+         * parameter decides what happens to this untracked response:
+         * "allow" (default) passes it through untracked, matching prior
+         * behavior; "reject" applies the location's configured rejection
+         * status so a full zone fails closed instead of silently losing
+         * enforcement. */
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "error_abuse zone \"%V\" has insufficient shared memory",
                       &ctx->zone->name);
+        if (ctx->zone->on_full_reject) {
+            ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
+            ngx_http_error_abuse_log_decision(r, conf, ctx, "blocked",
+                                              "rejected (zone full)");
+            return ngx_http_filter_finalize_request(r,
+                &ngx_http_error_abuse_module, conf->reject_status);
+        }
     } else if (rc == NGX_BUSY) {
         ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
         ngx_http_error_abuse_log_decision(r, conf, ctx, "blocked",
@@ -1301,7 +1315,8 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST = 1 << 7,
         NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_INTERVAL = 1 << 8,
         NGX_HTTP_ERROR_ABUSE_SEEN_REDIS = 1 << 9,
-        NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_SECRET = 1 << 10
+        NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_SECRET = 1 << 10,
+        NGX_HTTP_ERROR_ABUSE_SEEN_ON_FULL = 1 << 11
     };
 
     mcf = conf;
@@ -1486,6 +1501,24 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                        && ngx_strcasecmp(s.data, (u_char *) "off") == 0)
             {
                 zone->redis = 0;
+            } else {
+                goto invalid;
+            }
+
+        } else if (ngx_strncmp(value[i].data, "on_full=", 8) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_ON_FULL) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_ON_FULL;
+            ngx_str_t s = { value[i].len - 8, value[i].data + 8 };
+            if (s.len == 5
+                && ngx_strncmp(s.data, (u_char *) "allow", 5) == 0)
+            {
+                zone->on_full_reject = 0;
+            } else if (s.len == 6
+                       && ngx_strncmp(s.data, (u_char *) "reject", 6) == 0)
+            {
+                zone->on_full_reject = 1;
             } else {
                 goto invalid;
             }
@@ -2307,9 +2340,11 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
 {
     redisReply                        *reply;
     ngx_http_request_t               *r;
+    ngx_connection_t                  *c;
     ngx_http_error_abuse_req_ctx_t   *ctx;
 
     r = privdata;
+    c = r->connection;
     ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
     if (ctx == NULL) {
         /* release the reference taken at park time */
@@ -2369,11 +2404,23 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
                           ? reply->str : "");
     }
 
-    /* Resume the parked request, then release the reference taken at park
-     * time. finalize(NGX_DONE) frees the request if nothing else holds it. */
-    ngx_http_core_run_phases(r);
-    ngx_http_run_posted_requests(r->connection);
+    /* F-3: a phase/filter downstream of preaccess (on_full=reject's
+     * ngx_http_filter_finalize_request) can finish the request
+     * synchronously from inside run_phases() -- including via
+     * ngx_http_terminate_request(), which closes the request UNCONDITIONALLY
+     * (it does not consult r->main->count, so holding an extra reference
+     * does not protect against it). That means `r` and its connection may be
+     * fully freed by the time run_phases() returns, so nothing after that
+     * call may touch `r` -- only the already-captured `c`. This mirrors
+     * nginx's own ngx_http_request_handler(): resume the phase chain first
+     * (its write_event_handler(r) call), THEN run posted requests via the
+     * pre-captured connection, last. Release our park reference before
+     * resuming phases, same as ngx_http_finalize_request(r, NGX_DECLINED)
+     * does for its own NGX_AGAIN resume (run_phases is its last statement,
+     * nothing after it touches r either). */
     ngx_http_finalize_request(r, NGX_DONE);
+    ngx_http_core_run_phases(r);
+    ngx_http_run_posted_requests(c);
 }
 
 /* COR-5: validate the record EVAL reply. The script returns {blocked, count}
