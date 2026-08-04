@@ -166,6 +166,7 @@ deliberately relaxed policy that catches *sustained* abuse, not the odd 404.
 | `persist`          | *(none)*              | File path to snapshot state to disk.               |
 | `persist_interval` | `5s`                  | How often to write the snapshot.                   |
 | `persist_secret`   | *(none)*              | Hex-encoded HMAC-SHA256 key (min. 32 hex chars / 16 bytes, recommended 64 hex chars / 32 bytes); when set, the snapshot is authenticated and a tampered/forged file is rejected on load. Requires `persist`. Generate with `openssl rand -hex 32`. |
+| `on_full`          | `allow`               | What happens to a new (not-yet-tracked) identity's error response when the zone's shared memory is full: `allow` passes that one response through untracked (the historical behaviour; identities already tracked with an active ban are still rejected as normal); `reject` applies the location's configured rejection status instead, so a full zone fails closed. An **active ban is never evicted** to make room, under either setting — only unblocked, aged-out identities can be reclaimed. |
 
 ### `error_abuse zone=name [status=code] [dry_run=on|off] [log_level=level]` — context: `http`, `server`, `location`
 

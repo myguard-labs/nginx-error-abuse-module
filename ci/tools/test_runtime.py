@@ -601,6 +601,264 @@ def test_redis_auth(
         redis.stop()
 
 
+# ngx_http_error_abuse_zone() rejects anything under 8 * ngx_pagesize, so the
+# smallest legal zone is page-size dependent: 32k on a 4 KiB host, 128k on a
+# 16 KiB one (arm64 Linux, macOS on Apple silicon). Hardcoding 32k makes nginx
+# refuse the config outright on those hosts and the test never reaches the
+# allocation-failure path it exists to check.
+_ZONE_FULL_PAGES = 8
+_ZONE_FULL_BYTES = _ZONE_FULL_PAGES * os.sysconf("SC_PAGE_SIZE")
+_ZONE_FULL_SIZE = f"{_ZONE_FULL_BYTES // 1024}k"
+# 300 identities overflow a 32k zone with room to spare; scale with the zone so
+# a 16 KiB-page host still fills it rather than asserting against a zone that
+# never ran out.
+_ZONE_FILL_REQUESTS = 300 * max(1, _ZONE_FULL_BYTES // 32768)
+
+
+def _on_full_config(
+    root: pathlib.Path,
+    port: int,
+    module: pathlib.Path | None,
+    on_full: str,
+    redis_port: int | None,
+    redis_prefix: str,
+) -> str:
+    # F-3: minimum-size zone (8 pages), threshold=1 so a single 404 both
+    # creates AND permanently blocks each distinct identity -- every
+    # successful insert consumes a node forever, so a handful of pipelined
+    # distinct clients reliably exhausts the zone.
+    load = f"load_module {module};\n" if module else ""
+    redis = ""
+    redis_param = ""
+    if redis_port is not None:
+        redis = (
+            f"    error_abuse_redis host=127.0.0.1 port={redis_port} "
+            f"prefix={redis_prefix} timeout=250ms;\n"
+        )
+        redis_param = " redis=on"
+    return f"""{load}worker_processes 1;
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log notice;
+
+events {{
+    worker_connections 512;
+}}
+
+http {{
+    access_log off;
+
+{redis}    error_abuse_zone zone=full:{_ZONE_FULL_SIZE} key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=600s
+                     on_full={on_full}{redis_param};
+
+    server {{
+        listen 127.0.0.1:{port};
+
+        location = /err {{
+            error_abuse zone=full status=503;
+            root {root}/empty;
+        }}
+        location = /ok {{
+            error_abuse zone=full status=503;
+            empty_gif;
+        }}
+    }}
+}}
+"""
+
+
+def _on_full_start(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+    on_full: str,
+    redis_port: int | None = None,
+    redis_prefix: str = "error-abuse-ci-full:",
+) -> subprocess.Popen[str]:
+    (root / "conf").mkdir(parents=True, exist_ok=True)
+    (root / "logs").mkdir(parents=True, exist_ok=True)
+    (root / "empty").mkdir(parents=True, exist_ok=True)
+    (root / "conf" / "nginx.conf").write_text(
+        _on_full_config(root, port, module, on_full, redis_port, redis_prefix),
+        encoding="ascii",
+    )
+    output = (root / "nginx-output.log").open("a", encoding="utf-8")
+    proc = _track(
+        subprocess.Popen(
+            shlex.split(runner)
+            + [
+                str(binary),
+                "-p",
+                str(root),
+                "-c",
+                str(root / "conf" / "nginx.conf"),
+                "-g",
+                "daemon off; master_process off;",
+            ],
+            text=True,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    output.close()
+    try:
+        wait_port(port)
+    except Exception:
+        _on_full_stop(proc)
+        raise
+    return proc
+
+
+def _on_full_stop(proc: subprocess.Popen[str]) -> None:
+    # A crash AFTER the response has been written still satisfies every expect()
+    # above, so an already-dead nginx here is a test failure, not a no-op. This
+    # is exactly how the callback-lifetime regression manifests: the 503 goes
+    # out, then the worker dies unwinding the request.
+    rc = proc.poll()
+    if rc is not None:
+        raise AssertionError(
+            f"nginx exited with {rc} before shutdown -- it crashed while "
+            f"serving the on_full requests"
+        )
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _fill_zone(port: int, tag: str, n: int = _ZONE_FILL_REQUESTS) -> None:
+    # Each distinct client=<tag><N> both creates a node and immediately
+    # blocks it (threshold=1) -- the node is never evicted afterward (an
+    # active ban is never evicted to make room), so n distinct identities
+    # against a 32k zone reliably drives ngx_http_error_abuse_create_node's
+    # allocation to NGX_ERROR well before n=300.
+    #
+    # `tag` MUST be unique per instance sharing a Redis backend: with
+    # redis=on, a key already reported BLOCKED by Redis short-circuits at
+    # preaccess and never reaches the local zone's create_node() at all, so
+    # reusing the same client= names across allow/reject legs (which share
+    # one Redis server) would leave the reject leg's local zone unfilled and
+    # its assertion vacuous.
+    for i in range(n):
+        request(port, f"/err?client={tag}{i}")
+
+
+def test_on_full_policy(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+    redis_binary: pathlib.Path | None,
+) -> None:
+    # F-3: a full zone must not silently pass a new identity untracked
+    # (on_full=allow, the default, preserves that historical passthrough
+    # behaviour) or, when the operator opts into on_full=reject, it must
+    # apply the location's configured rejection status instead.
+    allow_root = root / "on-full-allow"
+    proc = _on_full_start(binary, module, allow_root, runner, nginx_port + 10, "allow")
+    try:
+        _fill_zone(nginx_port + 10, "allow")
+        # F-3 default: the zone is full, so the fresh identity's error
+        # response passes through untracked -- same as historical behaviour.
+        expect(nginx_port + 10, "/err?client=fresh-allow", 404)
+        # The 404 above is NOT by itself evidence of pass-through: at
+        # threshold=1 a successfully TRACKED identity also gets 404 on its
+        # first error (it is blocked only from the next request on). Ask for a
+        # non-error URI with the same key -- 200 means no node was created and
+        # the identity really is untracked; a tracked one would be banned and
+        # answer 503 here.
+        expect(nginx_port + 10, "/ok?client=fresh-allow", 200)
+    finally:
+        _on_full_stop(proc)
+
+    reject_root = root / "on-full-reject"
+    proc = _on_full_start(
+        binary, module, reject_root, runner, nginx_port + 11, "reject"
+    )
+    try:
+        _fill_zone(nginx_port + 11, "reject")
+        # F-3 opt-in: the zone is full, so the fresh identity's error
+        # response is rejected with the location's configured status instead
+        # of passing through untracked.
+        expect(nginx_port + 11, "/err?client=fresh-reject", 503)
+        # Serve one more request afterwards: the filter_finalize path unwinds
+        # after the 503 is already on the wire, so a crash there is invisible
+        # to the assertion above but kills the next request.
+        expect(nginx_port + 11, "/err?client=after-reject", 503)
+    finally:
+        _on_full_stop(proc)
+
+    if redis_binary is None:
+        return
+
+    # Same policy, with redis=on: a fresh identity is first parked in
+    # preaccess awaiting the async Redis reply (ngx_http_error_abuse_redis_
+    # check_callback resumes it), so on_full=reject's synchronous
+    # ngx_http_filter_finalize_request must still complete cleanly from
+    # inside that resumed phase chain -- this previously segfaulted nginx
+    # until the callback was fixed to release its parked reference BEFORE
+    # resuming phases instead of after (see the ordering comment on
+    # ngx_http_error_abuse_redis_check_callback).
+    redis_port = nginx_port + 40
+    prefix = f"error-abuse-ci-full-{os.getpid()}-{int(time.time() * 1000)}:"
+    redis = RedisServer(redis_binary, root / "on-full-redis-server", redis_port)
+    try:
+        redis.start()
+
+        allow_root = root / "on-full-allow-redis"
+        proc = _on_full_start(
+            binary,
+            module,
+            allow_root,
+            runner,
+            nginx_port + 12,
+            "allow",
+            redis_port,
+            prefix,
+        )
+        try:
+            _fill_zone(nginx_port + 12, "allowredis")
+            expect(nginx_port + 12, "/err?client=fresh-allow-redis", 404)
+            # NOT the untracked proof used on the non-Redis leg: with redis=on,
+            # ngx_http_error_abuse_redis_record() runs before the rc==NGX_ERROR
+            # branch, so a full LOCAL zone still records the identity in Redis
+            # and threshold=1 bans it there. The follow-up is therefore 503 even
+            # under on_full=allow. That is the module's actual behaviour, so
+            # assert it rather than the local-only expectation.
+            expect(nginx_port + 12, "/ok?client=fresh-allow-redis", 503)
+        finally:
+            _on_full_stop(proc)
+
+        reject_root = root / "on-full-reject-redis"
+        proc = _on_full_start(
+            binary,
+            module,
+            reject_root,
+            runner,
+            nginx_port + 13,
+            "reject",
+            redis_port,
+            prefix,
+        )
+        try:
+            _fill_zone(nginx_port + 13, "rejectredis")
+            expect(nginx_port + 13, "/err?client=fresh-reject-redis", 503)
+            # This is the leg that actually segfaulted before the callback
+            # ordering fix: the reject unwinds inside the phase chain resumed
+            # by the Redis callback. A second request proves the worker
+            # survived it.
+            expect(nginx_port + 13, "/err?client=after-reject-redis", 503)
+        finally:
+            _on_full_stop(proc)
+    finally:
+        redis.stop()
+
+
 def expect_invalid_config(
     binary: pathlib.Path,
     module: pathlib.Path | None,
@@ -715,6 +973,23 @@ def test_valid_configs(
         "minimal-redis",
         """    error_abuse_redis host=127.0.0.1;
     error_abuse_zone zone=minimal:1m redis=on;""",
+    )
+    # F-3: both on_full= values are accepted.
+    expect_valid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "on-full-allow",
+        "    error_abuse_zone zone=minimal:1m on_full=allow;",
+    )
+    expect_valid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "on-full-reject",
+        "    error_abuse_zone zone=minimal:1m on_full=reject;",
     )
 
 
@@ -855,6 +1130,29 @@ def test_invalid_configs(
                          redis=on;""",
         "invalid error_abuse_redis parameter",
     )
+    # F-3: an unrecognized on_full= value is rejected at config time.
+    expect_invalid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "bad-on-full",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         on_full=maybe;""",
+        "invalid error_abuse_zone parameter",
+    )
+    expect_invalid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "duplicate-on-full",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         on_full=allow on_full=reject;""",
+        "duplicate error_abuse_zone parameter",
+    )
     shared = root / "shared.state"
     expect_invalid_config(
         binary,
@@ -885,6 +1183,14 @@ def main() -> int:
         root = pathlib.Path(tmp)
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
+        test_on_full_policy(
+            binary,
+            module,
+            root,
+            args.runner,
+            args.port,
+            pathlib.Path(args.redis_server).absolute() if args.redis_server else None,
+        )
         if args.redis_server:
             test_redis_multi_host(
                 binary,
