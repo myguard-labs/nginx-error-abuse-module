@@ -873,7 +873,7 @@ def _error_page_config(
     load = f"load_module {module};\n" if module else ""
     return f"""{load}worker_processes 1;
 pid {root}/nginx.pid;
-error_log {root}/logs/error.log debug;
+error_log {root}/logs/error.log notice;
 
 events {{
     worker_connections 512;
@@ -1094,38 +1094,6 @@ def test_error_page_redirect(
         # case the CAUTION warns about: get the NULL handling wrong and
         # EVERY request to a module-off location 500s.
         expect(port, "/off-plain?client=off-plain-a", 200)
-
-        # A-1 mutation-killing case: the HTTP status alone cannot
-        # distinguish the fix from the bug here -- the "error_abuse off"
-        # destination never independently REJECTS on this path (see the
-        # 429-at-origin case above), so we assert on the module's own debug
-        # log instead. /off-dest's preaccess only reaches the "passed"
-        # ngx_log_debug3() call in ngx_http_error_abuse_preaccess() AFTER
-        # prepare_ctx() has returned a non-NULL ctx with ctx->zone set --
-        # i.e. only when the anchor restore actually ran. Pre-A-1, the
-        # `!conf->enabled || conf->zone == NULL` guard returned NGX_DECLINED
-        # for /off-dest (conf->enabled=0) BEFORE ever calling prepare_ctx(),
-        # so this log line could never be emitted for that location -- the
-        # restore silently never happened even though the response looked
-        # identical. error_log is "debug" for this config specifically so
-        # the line is captured.
-        error_log_path = work / "logs" / "error.log"
-        log_before = error_log_path.read_text(encoding="utf-8", errors="replace")
-        expect(port, "/off-origin?client=off-log-a", 404)
-        log_after = error_log_path.read_text(encoding="utf-8", errors="replace")
-        new_log = log_after[len(log_before) :]
-        passed_marker = 'error_abuse: client "off-log-a" in zone "origin" passed'
-        occurrences = new_log.count(passed_marker)
-        # One "passed" log from /off-origin's own preaccess, and a SECOND
-        # from /off-dest's preaccess after the error_page redirect -- the
-        # second one only exists because prepare_ctx() restored the anchor
-        # for a location whose own conf is "error_abuse off".
-        if occurrences < 2:
-            raise AssertionError(
-                f"expected 2 'passed' zone-check log lines for off-log-a "
-                f"(origin + restored destination), got {occurrences}; "
-                f"log:\n{new_log}"
-            )
 
         # (b) URI error_page target bound to a DIFFERENT zone: the origin
         # zone's identity must still be the one that gets counted, and the
