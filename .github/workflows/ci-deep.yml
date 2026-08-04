@@ -104,8 +104,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if ! printf '%s' "${FUZZ_SECONDS_INPUT}" | grep -qzE '^[0-9]+$'; then
-              echo "::error::fuzz_seconds must be a plain decimal integer (got invalid/empty/malformed input)"
+            # The LENGTH bound is load-bearing. `[ "$v" -lt 1 ]` does not return
+            # false on a value too large for the shell's integer type -- it
+            # ERRORS, and `if !` / `||` consume that error, so with a bare
+            # `^[0-9]+$` a 26-digit input passed the digit test, made both
+            # comparisons fail rather than compare, and was written to
+            # $GITHUB_ENV unbounded. Five digits covers the 86400 ceiling.
+            # (Caught by CodeRabbit on nginx-skeleton-module PR #18.)
+            if ! printf '%s' "${FUZZ_SECONDS_INPUT}" | grep -qzE '^[0-9]{1,5}$'; then
+              echo "::error::fuzz_seconds must be 1-5 decimal digits (got invalid/empty/oversized input)"
               exit 1
             fi
             if [ "${FUZZ_SECONDS_INPUT}" -lt 1 ] || [ "${FUZZ_SECONDS_INPUT}" -gt 86400 ]; then
