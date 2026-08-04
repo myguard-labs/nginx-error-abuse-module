@@ -859,6 +859,296 @@ def test_on_full_policy(
         redis.stop()
 
 
+def _error_page_config(
+    root: pathlib.Path, port: int, module: pathlib.Path | None
+) -> str:
+    # F-2: an error_page internal redirect (URI target AND named-location
+    # target -- nginx clears r->ctx on two distinct code paths) must not
+    # erase the ORIGIN's error_abuse ctx. Each origin location is bound to
+    # zone "origin" (threshold=1, so a single error both counts AND, on a
+    # follow-up request, proves the identity was tracked). Destinations cover
+    # the three audited cases: (a) error_abuse off, (b) bound to a DIFFERENT
+    # zone "other", (c) a custom rejection status whose headers must still be
+    # the module's own (private/no-store/Retry-After).
+    load = f"load_module {module};\n" if module else ""
+    return f"""{load}worker_processes 1;
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log notice;
+
+events {{
+    worker_connections 512;
+}}
+
+http {{
+    access_log off;
+
+    error_abuse_zone zone=origin:1m key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=600s;
+    error_abuse_zone zone=other:1m key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=600s;
+    error_abuse_zone zone=dryorigin:1m key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=600s;
+
+    server {{
+        listen 127.0.0.1:{port};
+
+        # (a) URI error_page target with error_abuse off.
+        location = /off-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 /off-dest;
+            root {root}/empty;
+        }}
+        location = /off-dest {{
+            internal;
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # (a) named-location target with error_abuse off.
+        location = /off-named-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 @off_named;
+            root {root}/empty;
+        }}
+        location @off_named {{
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # (b) URI error_page target bound to a DIFFERENT zone.
+        location = /other-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 /other-dest;
+            root {root}/empty;
+        }}
+        location = /other-dest {{
+            internal;
+            error_abuse zone=other status=429;
+            empty_gif;
+        }}
+
+        # (b) named-location target bound to a DIFFERENT zone.
+        location = /other-named-origin {{
+            error_abuse zone=origin status=429;
+            error_page 404 @other_named;
+            root {root}/empty;
+        }}
+        location @other_named {{
+            error_abuse zone=other status=429;
+            empty_gif;
+        }}
+
+        # (c) URI error_page target: custom 503 rejection page.
+        location = /custom-origin {{
+            error_abuse zone=origin status=503;
+            error_page 404 /custom-dest;
+            root {root}/empty;
+        }}
+        location = /custom-dest {{
+            internal;
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # (c) named-location target: custom 503 rejection page.
+        location = /custom-named-origin {{
+            error_abuse zone=origin status=503;
+            error_page 404 @custom_named;
+            root {root}/empty;
+        }}
+        location @custom_named {{
+            error_abuse off;
+            empty_gif;
+        }}
+
+        # (d) origin-wins dry_run: the ORIGIN location has dry_run=on, the
+        # error_page destination does NOT. A destination that could
+        # retroactively turn dry-run observation into real enforcement would
+        # ban an identity the operator explicitly asked to only observe.
+        location = /dryorigin-origin {{
+            error_abuse zone=dryorigin dry_run=on;
+            error_page 404 /dryorigin-dest;
+            root {root}/empty;
+        }}
+        location = /dryorigin-dest {{
+            internal;
+            error_abuse zone=dryorigin status=429;
+            empty_gif;
+        }}
+
+        # Plain probes to read back the "origin" / "other" / "dryorigin" zone
+        # identity counters without going through error_page.
+        location = /origin-ok {{
+            error_abuse zone=origin status=429;
+            empty_gif;
+        }}
+        location = /other-ok {{
+            error_abuse zone=other status=429;
+            empty_gif;
+        }}
+        # 404-capable probe to seed a ban directly in zone "other" without
+        # ever touching zone "origin" -- needed to build the cross-zone
+        # scenario below (an identity banned in "other" but clean in
+        # "origin").
+        location = /other-dest-direct {{
+            error_abuse zone=other status=429;
+            root {root}/empty;
+        }}
+        location = /dryorigin-ok {{
+            error_abuse zone=dryorigin status=429;
+            empty_gif;
+        }}
+    }}
+}}
+"""
+
+
+def test_error_page_redirect(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> None:
+    work = root / "error-page"
+    (work / "conf").mkdir(parents=True)
+    (work / "logs").mkdir()
+    (work / "empty").mkdir()
+    (work / "conf" / "nginx.conf").write_text(
+        _error_page_config(work, port, module), encoding="ascii"
+    )
+    output = (work / "nginx-output.log").open("a", encoding="utf-8")
+    proc = _track(
+        subprocess.Popen(
+            shlex.split(runner)
+            + [
+                str(binary),
+                "-p",
+                str(work),
+                "-c",
+                str(work / "conf" / "nginx.conf"),
+                "-g",
+                "daemon off; master_process off;",
+            ],
+            text=True,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    output.close()
+    try:
+        wait_port(port)
+
+        # (a) error_page URI target with "error_abuse off": the origin 404
+        # must still be COUNTED against zone "origin", not silently dropped.
+        # threshold=1 means the FIRST error alone cannot distinguish counted
+        # from uncounted (a tracked identity also answers via its own 404 on
+        # request 1) -- the follow-up /origin-ok request on the SAME key is
+        # the proof: 200 would mean untracked, 429 means the identity was
+        # recorded and is now banned.
+        expect(port, "/off-origin?client=off-a", 404)
+        expect(port, "/origin-ok?client=off-a", 429)
+
+        # (a) named-location target with "error_abuse off".
+        expect(port, "/off-named-origin?client=off-b", 404)
+        expect(port, "/origin-ok?client=off-b", 429)
+
+        # (b) URI error_page target bound to a DIFFERENT zone: the origin
+        # zone's identity must still be the one that gets counted, and the
+        # destination zone ("other") must NOT record it instead.
+        expect(port, "/other-origin?client=other-a", 404)
+        expect(port, "/origin-ok?client=other-a", 429)
+        expect(port, "/other-ok?client=other-a", 200)
+
+        # Cross-zone preaccess proof: ban a DIFFERENT identity in zone
+        # "other" only (zone "origin" has no record for it), then route that
+        # identity through /other-origin -> /other-dest. /other-origin's own
+        # preaccess (conf->zone=origin, unbanned) passes and produces the
+        # 404 that triggers the redirect; the interesting check is
+        # /other-dest's preaccess, which runs again after r->ctx is zeroed
+        # by the internal redirect. With the F-2 restore, prepare_ctx()
+        # there recovers the ORIGIN ctx (ctx->zone=origin, unbanned for this
+        # key) and preaccess must therefore PASS. Reading ctx->zone (not
+        # conf->zone="other", which IS banned for this key) is the only
+        # thing standing between this and a false reject -- the single-pass
+        # /other-origin assertions above cannot reach this because they
+        # never leave "origin" banned while "other" is clean for a DIFFERENT
+        # identity than the one that trips the redirect.
+        #
+        # `error_page 404 /other-dest;` (no `=` overwrite) preserves the
+        # ORIGIN's 404 status regardless of what the destination serves, so
+        # a PASSING preaccess at /other-dest is observed as 404 (the
+        # original error, now counted once against "origin"), not 200. A
+        # preaccess REJECT at the destination, by contrast, finalizes the
+        # request directly with the destination's own reject_status (429),
+        # short-circuiting the error_page status preservation entirely --
+        # that is the visible difference the bug vs the fix produces.
+        expect(port, "/other-dest-direct?client=cross-x", 404)
+        expect(port, "/other-ok?client=cross-x", 429)
+        expect(port, "/other-origin?client=cross-x", 404)
+
+        # (b) named-location target bound to a DIFFERENT zone.
+        expect(port, "/other-named-origin?client=other-b", 404)
+        expect(port, "/origin-ok?client=other-b", 429)
+        expect(port, "/other-ok?client=other-b", 200)
+        expect(port, "/other-named-origin?client=other-b", 429)
+
+        # (c) custom rejection page (URI target): the SECOND request against
+        # the now-banned identity must come back through the origin's own
+        # status=503 with the synthetic rejection headers -- proving the
+        # restored ctx kept own_rejection/state, not just the counter.
+        expect(port, "/custom-origin?client=custom-a", 404)
+        status, headers = fetch(port, "/custom-origin?client=custom-a")
+        if status != 503:
+            raise AssertionError(f"/custom-origin expected 503, got {status}")
+        cache_control = headers.get("cache-control", "")
+        if "no-store" not in cache_control or "private" not in cache_control:
+            raise AssertionError(
+                f"custom rejection page Cache-Control missing "
+                f"private/no-store: {cache_control!r}"
+            )
+        if "retry-after" not in headers:
+            raise AssertionError("custom rejection page missing Retry-After")
+
+        # (c) custom rejection page (named-location target).
+        expect(port, "/custom-named-origin?client=custom-b", 404)
+        status, headers = fetch(port, "/custom-named-origin?client=custom-b")
+        if status != 503:
+            raise AssertionError(f"/custom-named-origin expected 503, got {status}")
+        cache_control = headers.get("cache-control", "")
+        if "no-store" not in cache_control or "private" not in cache_control:
+            raise AssertionError(
+                f"custom rejection page (named) Cache-Control missing "
+                f"private/no-store: {cache_control!r}"
+            )
+        if "retry-after" not in headers:
+            raise AssertionError("custom rejection page (named) missing Retry-After")
+
+        # (d) origin-wins dry_run: the origin location (dry_run=on) must keep
+        # dry_run TRUE across the redirect even though the destination
+        # location's own conf has dry_run=off (COR-2's non-restored
+        # re-derivation would flip it). A follow-up /dryorigin-ok on the same
+        # key proves no ban was actually created: dry-run must never insert
+        # events or set a block deadline, so a real enforcing sibling
+        # location on the SAME zone still serves 200, not 429.
+        expect(port, "/dryorigin-origin?client=dry-a", 404)
+        expect(port, "/dryorigin-ok?client=dry-a", 200)
+    finally:
+        rc = proc.poll()
+        if rc is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        elif rc not in (0, -signal.SIGTERM):
+            text = (work / "nginx-output.log").read_text(
+                encoding="utf-8", errors="replace"
+            )
+            raise AssertionError(f"nginx exited with {rc}:\n{text}")
+
+
 def expect_invalid_config(
     binary: pathlib.Path,
     module: pathlib.Path | None,
@@ -1191,6 +1481,7 @@ def main() -> int:
             args.port,
             pathlib.Path(args.redis_server).absolute() if args.redis_server else None,
         )
+        test_error_page_redirect(binary, module, root, args.runner, args.port + 20)
         if args.redis_server:
             test_redis_multi_host(
                 binary,

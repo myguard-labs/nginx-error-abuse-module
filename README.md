@@ -183,6 +183,13 @@ no-store` so a downstream shared cache can never replay one client's ban to
 another; `429`/`503` responses also get a `Retry-After` reflecting the ban
 deadline.
 
+An `error_page` internal redirect (either a URI target or a named
+`@location`) does not lose enforcement: the identity, counter and ban status
+earned at the ORIGIN location follow the redirect to the destination even
+when the destination has `error_abuse off`, is bound to a different zone, or
+serves a custom rejection page. The destination's `dry_run=` is ignored in
+that case — the origin's `dry_run` wins for the whole request.
+
 ### `error_abuse_redis host=[tls://]name [port] [user] [password] [db] [prefix] [timeout]` — context: `http`
 
 Points the module at one Redis server (see below).
