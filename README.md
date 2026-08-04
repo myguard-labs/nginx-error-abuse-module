@@ -131,7 +131,8 @@ leave a truncated state file. On builds with `--with-threads` the snapshot file
 I/O runs on a thread pool, so a slow disk never stalls the worker event loop.
 The on-disk format is a portable little-endian byte stream (not a native struct
 dump). Set `persist_secret=<hex>` to additionally authenticate the file with
-HMAC-SHA256.
+HMAC-SHA256. The key must be at least 16 bytes (32 hex characters); 32 bytes
+(64 hex characters) is recommended. Generate with `openssl rand -hex 32`.
 
 Client identities are stored as a fixed 32-byte SHA-256 digest of the `key`, so
 a large key variable (`$request_uri`, `$http_*`) costs the same memory and Redis
@@ -164,7 +165,7 @@ deliberately relaxed policy that catches *sustained* abuse, not the odd 404.
 | `redis`            | `off`                 | Share this zone's state via Redis.                 |
 | `persist`          | *(none)*              | File path to snapshot state to disk.               |
 | `persist_interval` | `5s`                  | How often to write the snapshot.                   |
-| `persist_secret`   | *(none)*              | Hex-encoded key; when set, the snapshot is authenticated with HMAC-SHA256 and a tampered/forged file is rejected on load. Requires `persist`. |
+| `persist_secret`   | *(none)*              | Hex-encoded HMAC-SHA256 key (min. 32 hex chars / 16 bytes, recommended 64 hex chars / 32 bytes); when set, the snapshot is authenticated and a tampered/forged file is rejected on load. Requires `persist`. Generate with `openssl rand -hex 32`. |
 
 ### `error_abuse zone=name [status=code] [dry_run=on|off] [log_level=level]` — context: `http`, `server`, `location`
 

@@ -85,3 +85,55 @@ deadfeedcafebeef0badf00dfeed5a5
 --- error_log: duplicate error_abuse_redis parameter "password=<redacted>"
 --- no_error_log
 f00dcafebabe5a5a
+
+=== TEST 6: persist_secret rejects 1-byte key
+--- http_config
+    error_abuse_zone zone=test6:1m key=$binary_remote_addr
+                     persist=/tmp/test6.bin persist_secret=00;
+--- config
+    location = /ok {
+        error_abuse zone=test6;
+        empty_gif;
+    }
+--- must_die
+--- error_log: persist_secret: min 16 bytes (32 hex chars); got 1 bytes
+
+=== TEST 7: persist_secret rejects 15-byte key
+--- http_config
+    error_abuse_zone zone=test7:1m key=$binary_remote_addr
+                     persist=/tmp/test7.bin persist_secret=000102030405060708090a0b0c0d0e;
+--- config
+    location = /ok {
+        error_abuse zone=test7;
+        empty_gif;
+    }
+--- must_die
+--- error_log: persist_secret: min 16 bytes (32 hex chars); got 15 bytes
+
+=== TEST 8: persist_secret accepts 16-byte key
+--- http_config
+    error_abuse_zone zone=test8:1m key=$binary_remote_addr
+                     persist=/tmp/test8.bin persist_secret=000102030405060708090a0b0c0d0e0f;
+--- config
+    location = /ok {
+        error_abuse zone=test8;
+        empty_gif;
+    }
+--- pipelined_requests eval
+["GET /ok"]
+--- error_code eval
+[200]
+
+=== TEST 9: persist_secret accepts 32-byte key (recommended)
+--- http_config
+    error_abuse_zone zone=test9:1m key=$binary_remote_addr
+                     persist=/tmp/test9.bin persist_secret=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;
+--- config
+    location = /ok {
+        error_abuse zone=test9;
+        empty_gif;
+    }
+--- pipelined_requests eval
+["GET /ok"]
+--- error_code eval
+[200]

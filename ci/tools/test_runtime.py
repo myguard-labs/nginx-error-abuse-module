@@ -753,7 +753,7 @@ def test_invalid_configs(
         "secret-without-persist",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s
-                         persist_secret=00ff;""",
+                         persist_secret=00112233445566778899aabbccddeeff;""",  # gitleaks:allow
         "persist_secret requires persist",
     )
     secret_state = root / "oddsecret.state"
@@ -767,6 +767,20 @@ def test_invalid_configs(
                          statuses=404 interval=1s threshold=2 block=1s
                          persist={secret_state} persist_secret=abc;""",
         "invalid error_abuse_zone parameter",
+    )
+    # F-5: persist_secret shorter than the 16-byte minimum is rejected before
+    # allocation, distinct from the requires-persist and odd-hex checks above.
+    short_secret_state = root / "shortsecret.state"
+    expect_invalid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "secret-below-minimum",
+        f"""    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         persist={short_secret_state} persist_secret=00112233445566778899aabbccddee;""",  # gitleaks:allow
+        "persist_secret: min 16 bytes (32 hex chars); got 15 bytes",
     )
     # COR-6: "off" then a real declaration in the same block is a duplicate,
     # regardless of order.
