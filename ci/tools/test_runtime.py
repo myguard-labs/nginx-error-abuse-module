@@ -1070,14 +1070,45 @@ def main() -> int:
             ]
             if len(lines) != 4:
                 raise AssertionError(f"vars.log expected 4 lines, got {lines}")
-            states = [ln[1] for ln in lines]
-            if states != ["PASSED", "COUNTED", "BLOCKED", "BLOCKED"]:
-                raise AssertionError(f"unexpected $error_abuse_status: {states}")
-            if lines[0][2] != "0" or lines[0][3] != "0":
-                raise AssertionError(f"PASSED count/until not zero: {lines[0]}")
-            if lines[1][2] != "1" or lines[1][3] != "0":
-                raise AssertionError(f"COUNTED expected count=1 until=0: {lines[1]}")
-            for ln in lines[2:]:
+
+            # Line ORDER is deliberately not asserted. Both locations log to the
+            # same vars.log with no buffer=, so each of the 4 workers issues its
+            # own unsynchronized write(); the kernel orders those by which worker
+            # reaches the syscall, not by request arrival. Asserting the sequence
+            # flaked exactly that way on run 30941891262 (COUNTED before PASSED,
+            # counters all correct), and passed on a bare rerun of the same sha.
+            #
+            # What the module actually guarantees is per-request: each URI gets
+            # the state and counters its own request earned. So key by URI, and
+            # keep every counter assertion the sequence version had -- those are
+            # what would catch a real counting or identity bug.
+            by_uri = {}
+            for ln in lines:
+                by_uri.setdefault(ln[0], []).append(ln)
+
+            ok = by_uri.get("/var-ok", [])
+            if len(ok) != 1:
+                raise AssertionError(f"expected 1 /var-ok line, got {ok}")
+            if ok[0][1] != "PASSED":
+                raise AssertionError(f"/var-ok expected PASSED: {ok[0]}")
+            if ok[0][2] != "0" or ok[0][3] != "0":
+                raise AssertionError(f"PASSED count/until not zero: {ok[0]}")
+
+            err = by_uri.get("/var-error", [])
+            if len(err) != 3:
+                raise AssertionError(f"expected 3 /var-error lines, got {err}")
+
+            # The 3 /var-error requests are sequential on one connection, so the
+            # STATES they earned are fixed even though their log order is not:
+            # one COUNTED (1st 404, below threshold) then two BLOCKED.
+            err_states = sorted(ln[1] for ln in err)
+            if err_states != ["BLOCKED", "BLOCKED", "COUNTED"]:
+                raise AssertionError(f"unexpected /var-error states: {err_states}")
+
+            counted = [ln for ln in err if ln[1] == "COUNTED"]
+            if counted[0][2] != "1" or counted[0][3] != "0":
+                raise AssertionError(f"COUNTED expected count=1 until=0: {counted[0]}")
+            for ln in [x for x in err if x[1] == "BLOCKED"]:
                 if ln[2] != "2" or int(ln[3]) <= 0:
                     raise AssertionError(f"BLOCKED expected count=2 until>0: {ln}")
 
