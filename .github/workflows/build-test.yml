@@ -2,7 +2,11 @@ name: Build and Test
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: "1.31.1"
+  # NGINX_VERSION is deliberately NOT set here. It comes from
+  # .github/versions.env via the "Load version pins" step in each job below.
+  # A workflow-level env of the same name would WIN over the $GITHUB_ENV write
+  # that step makes, silently pinning the build to this literal while the file
+  # that claims to be the single source of truth was ignored.
 
 on:
   push:
@@ -74,16 +78,23 @@ jobs:
           /tmp/actionlint -color .github/workflows/*.yml
 
   build:
-    name: Build (${{ matrix.flavor }} ${{ matrix.version }} / ${{ matrix.cc }})
+    # NOTE: this name is a REQUIRED STATUS CHECK on main. Changing it strands
+    # the protection rule -- the old context never reports again and the merge
+    # blocks while CI is green. Retarget the rule in the same change if it ever
+    # has to move; do not merge with --admin.
+    name: Build (${{ matrix.flavor }} / ${{ matrix.cc }})
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 30
-    # Latest nginx mainline only, amd64, gcc.
+    # Latest nginx mainline only, amd64, gcc. The version is NOT a matrix
+    # value: it is resolved from .github/versions.env at run time, because a
+    # literal here and $NGINX_VERSION in the artifact step below were two
+    # independent copies of the same number, and only one of them moved when
+    # the pin was bumped.
     strategy:
       fail-fast: false
       matrix:
         include:
           - flavor: nginx
-            version: "1.31.1"
             cc: gcc
             primary: true
     steps:
@@ -91,6 +102,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install build dependencies
         run: |
@@ -107,7 +121,7 @@ jobs:
         with:
           mode: debug
           flavor: ${{ matrix.flavor }}
-          nginx-version: ${{ matrix.version }}
+          nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Build server and dynamic module
         env:
@@ -118,20 +132,18 @@ jobs:
           # workflow's own strategy.matrix, never attacker input. env: goes
           # through the shell as an ordinary variable instead.
           MATRIX_FLAVOR: ${{ matrix.flavor }}
-          MATRIX_VERSION: ${{ matrix.version }}
         run: |
-          bash ci/tools/ci-build.sh "$MATRIX_FLAVOR" "$MATRIX_VERSION"
-          build=".build/${MATRIX_FLAVOR}-${MATRIX_VERSION}-debug/objs"
+          bash ci/tools/ci-build.sh "$MATRIX_FLAVOR" "$NGINX_VERSION"
+          build=".build/${MATRIX_FLAVOR}-${NGINX_VERSION}-debug/objs"
           test -f "$build/ngx_http_error_abuse_module.so"
           ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
 
       - name: Strict module compile
         env:
           MATRIX_FLAVOR: ${{ matrix.flavor }}
-          MATRIX_VERSION: ${{ matrix.version }}
           MATRIX_CC: ${{ matrix.cc }}
         run: |
-          build=".build/${MATRIX_FLAVOR}-${MATRIX_VERSION}-debug"
+          build=".build/${MATRIX_FLAVOR}-${NGINX_VERSION}-debug"
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           # cflags and incs are compiler flag lists and must word-split.
@@ -235,6 +247,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Install dependencies
         run: |
