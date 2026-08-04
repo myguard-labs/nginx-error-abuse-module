@@ -54,3 +54,34 @@ __DATA__
 ["GET /dry", "GET /dry"]
 --- error_code eval
 [404, 404]
+
+=== TEST 4: invalid persist_secret does not leak the key into the error log
+--- http_config
+    error_abuse_zone zone=test4:1m key=$binary_remote_addr
+                     persist=/tmp/test4.bin
+                     persist_secret=deadfeedcafebeef0badf00dfeed5a5;
+--- config
+    location = /ok {
+        error_abuse zone=test4;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "persist_secret=<redacted>"
+--- no_error_log
+deadfeedcafebeef0badf00dfeed5a5
+
+=== TEST 5: duplicate redis password does not leak the value into the error log
+--- http_config
+    error_abuse_redis host=127.0.0.1 port=6390
+                      password=f00dcafebabe5a5a
+                      password=f00dcafebabe5a5a;
+    error_abuse_zone zone=test5:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test5;
+        empty_gif;
+    }
+--- must_die
+--- error_log: duplicate error_abuse_redis parameter "password=<redacted>"
+--- no_error_log
+f00dcafebabe5a5a
