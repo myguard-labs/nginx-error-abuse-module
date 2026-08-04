@@ -188,13 +188,24 @@ case_parse_boundaries_and_ok(void)
 
     /* len == 0: the `while (p < last)` loop body never runs (the loop's
      * false-on-entry arm, otherwise unreached -- every other case here
-     * enters the loop at least once). Falls straight through to OK with an
-     * untouched, all-zero bitmap; not a reject path. */
-    memset(bitmap, 0, sizeof(bitmap));
-    check(parse_str("", bitmap) == NGX_HTTP_ERROR_ABUSE_STATUSES_OK,
-          "empty status list is accepted as OK (loop never entered)");
-    check(popcount_bitmap(bitmap) == 0,
-          "empty status list leaves the bitmap untouched");
+     * enters the loop at least once). Falls straight through to OK without
+     * touching the bitmap; not a reject path.
+     *
+     * Seeded with a non-zero pattern rather than zeroed, so this asserts
+     * "the parser wrote nothing" rather than the weaker "the result is
+     * all-zero" -- a parser that cleared the bitmap on entry would satisfy
+     * the zeroed form and still be wrong. */
+    {
+        u_char before[sizeof(bitmap)];
+
+        memset(bitmap, 0xa5, sizeof(bitmap));
+        memcpy(before, bitmap, sizeof(bitmap));
+
+        check(parse_str("", bitmap) == NGX_HTTP_ERROR_ABUSE_STATUSES_OK,
+              "empty status list is accepted as OK (loop never entered)");
+        check(memcmp(bitmap, before, sizeof(bitmap)) == 0,
+              "empty status list leaves the bitmap byte-for-byte untouched");
+    }
 }
 
 
