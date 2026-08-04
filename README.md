@@ -46,6 +46,12 @@ mechanism, not a promised CI time):
 | Warm re-run, nothing changed (build tree hit, configure skipped, `make` no-op) | 0.02s |
 | One source file touched, warm tree (configure skipped, one TU recompiles via ccache) | 0.1s |
 
+nginx's `configure` ignores a bare `CC=`, so ccache is wired through the
+`--with-cc="ccache $BASE_CC"` argument instead. Verified by measurement, not by
+reading the log: with the build tree removed and ccache warm, a rebuild reports
+**132/132 hits (100.0%)**. A 0% rate on a second identical run is the signature
+of ccache not being wired through configure at all.
+
 The honest win here is the warm no-op case, not a claimed multi-minute save —
 this module's from-scratch build is already only a few seconds on a fast
 network, so the layers mostly buy back CI minutes on *repeat* PR pushes and
