@@ -174,3 +174,36 @@ ngx_http_error_abuse_validate_snapshot(u_char *p, u_char *last,
 
     return (p == last) ? NGX_OK : NGX_ERROR;
 }
+
+
+size_t
+ngx_http_error_abuse_redis_key_len(size_t prefix_len, size_t zone_name_len,
+    size_t digest_len)
+{
+    /* prefix + '{' + zone_name + ':' + hex(digest) + '}' */
+    return prefix_len + 1 + zone_name_len + 1 + digest_len * 2 + 1;
+}
+
+
+u_char *
+ngx_http_error_abuse_redis_key_write(u_char *buf,
+    const u_char *prefix, size_t prefix_len,
+    const u_char *zone_name, size_t zone_name_len,
+    const u_char *digest, size_t digest_len)
+{
+    static const u_char  hex[] = "0123456789abcdef";
+    u_char              *p;
+    size_t               i;
+
+    p = ngx_cpymem(buf, prefix, prefix_len);
+    *p++ = '{';
+    p = ngx_cpymem(p, zone_name, zone_name_len);
+    *p++ = ':';
+    for (i = 0; i < digest_len; i++) {
+        *p++ = hex[digest[i] >> 4];
+        *p++ = hex[digest[i] & 0x0f];
+    }
+    *p++ = '}';
+
+    return p;
+}
