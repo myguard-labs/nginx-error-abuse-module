@@ -601,6 +601,20 @@ def test_redis_auth(
         redis.stop()
 
 
+# ngx_http_error_abuse_zone() rejects anything under 8 * ngx_pagesize, so the
+# smallest legal zone is page-size dependent: 32k on a 4 KiB host, 128k on a
+# 16 KiB one (arm64 Linux, macOS on Apple silicon). Hardcoding 32k makes nginx
+# refuse the config outright on those hosts and the test never reaches the
+# allocation-failure path it exists to check.
+_ZONE_FULL_PAGES = 8
+_ZONE_FULL_BYTES = _ZONE_FULL_PAGES * os.sysconf("SC_PAGE_SIZE")
+_ZONE_FULL_SIZE = f"{_ZONE_FULL_BYTES // 1024}k"
+# 300 identities overflow a 32k zone with room to spare; scale with the zone so
+# a 16 KiB-page host still fills it rather than asserting against a zone that
+# never ran out.
+_ZONE_FILL_REQUESTS = 300 * max(1, _ZONE_FULL_BYTES // 32768)
+
+
 def _on_full_config(
     root: pathlib.Path,
     port: int,
@@ -633,7 +647,7 @@ events {{
 http {{
     access_log off;
 
-{redis}    error_abuse_zone zone=full:32k key=$arg_client
+{redis}    error_abuse_zone zone=full:{_ZONE_FULL_SIZE} key=$arg_client
                      statuses=404 interval=60s threshold=1 block=600s
                      on_full={on_full}{redis_param};
 
@@ -698,16 +712,25 @@ def _on_full_start(
 
 
 def _on_full_stop(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+    # A crash AFTER the response has been written still satisfies every expect()
+    # above, so an already-dead nginx here is a test failure, not a no-op. This
+    # is exactly how the callback-lifetime regression manifests: the 503 goes
+    # out, then the worker dies unwinding the request.
+    rc = proc.poll()
+    if rc is not None:
+        raise AssertionError(
+            f"nginx exited with {rc} before shutdown -- it crashed while "
+            f"serving the on_full requests"
+        )
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
-def _fill_zone(port: int, tag: str, n: int = 300) -> None:
+def _fill_zone(port: int, tag: str, n: int = _ZONE_FILL_REQUESTS) -> None:
     # Each distinct client=<tag><N> both creates a node and immediately
     # blocks it (threshold=1) -- the node is never evicted afterward (an
     # active ban is never evicted to make room), so n distinct identities
@@ -743,6 +766,13 @@ def test_on_full_policy(
         # F-3 default: the zone is full, so the fresh identity's error
         # response passes through untracked -- same as historical behaviour.
         expect(nginx_port + 10, "/err?client=fresh-allow", 404)
+        # The 404 above is NOT by itself evidence of pass-through: at
+        # threshold=1 a successfully TRACKED identity also gets 404 on its
+        # first error (it is blocked only from the next request on). Ask for a
+        # non-error URI with the same key -- 200 means no node was created and
+        # the identity really is untracked; a tracked one would be banned and
+        # answer 503 here.
+        expect(nginx_port + 10, "/ok?client=fresh-allow", 200)
     finally:
         _on_full_stop(proc)
 
@@ -756,6 +786,10 @@ def test_on_full_policy(
         # response is rejected with the location's configured status instead
         # of passing through untracked.
         expect(nginx_port + 11, "/err?client=fresh-reject", 503)
+        # Serve one more request afterwards: the filter_finalize path unwinds
+        # after the 503 is already on the wire, so a crash there is invisible
+        # to the assertion above but kills the next request.
+        expect(nginx_port + 11, "/err?client=after-reject", 503)
     finally:
         _on_full_stop(proc)
 
@@ -790,6 +824,13 @@ def test_on_full_policy(
         try:
             _fill_zone(nginx_port + 12, "allowredis")
             expect(nginx_port + 12, "/err?client=fresh-allow-redis", 404)
+            # NOT the untracked proof used on the non-Redis leg: with redis=on,
+            # ngx_http_error_abuse_redis_record() runs before the rc==NGX_ERROR
+            # branch, so a full LOCAL zone still records the identity in Redis
+            # and threshold=1 bans it there. The follow-up is therefore 503 even
+            # under on_full=allow. That is the module's actual behaviour, so
+            # assert it rather than the local-only expectation.
+            expect(nginx_port + 12, "/ok?client=fresh-allow-redis", 503)
         finally:
             _on_full_stop(proc)
 
@@ -807,6 +848,11 @@ def test_on_full_policy(
         try:
             _fill_zone(nginx_port + 13, "rejectredis")
             expect(nginx_port + 13, "/err?client=fresh-reject-redis", 503)
+            # This is the leg that actually segfaulted before the callback
+            # ordering fix: the reject unwinds inside the phase chain resumed
+            # by the Redis callback. A second request proves the worker
+            # survived it.
+            expect(nginx_port + 13, "/err?client=after-reject-redis", 503)
         finally:
             _on_full_stop(proc)
     finally:
