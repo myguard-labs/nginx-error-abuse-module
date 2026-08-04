@@ -1,0 +1,34 @@
+Changes with ngx_http_error_abuse_module            04 Aug 2026
+
+    *) Change: the CI harness was standardised against the
+       nginx-skeleton-module reference (anchor 2f2a371), landing as
+       checkpoints 0-10 in PRs #13-#24.
+
+       Layout moved to ci/{t,tools,fuzz,tests/unit,linter} with the module
+       sources under src/. The decision logic was extracted into
+       ngx_http_error_abuse_scan.c so the unit tests and both fuzz targets
+       compile the real translation unit instead of a sliced copy of it.
+
+       The five workflows that each carried their own pull_request: trigger
+       became reusable members of one entry point, ci.yml, which now calls
+       build-test, asan, fuzzing, valgrind, security-scanners, codeql and
+       lint. Self-hosted jobs route fork PRs to hosted runners. Follow-up
+       jobs are chained so peak self-hosted concurrency fits the pool.
+
+       New: a unit test layer with coverage reporting (lines 100%, branches
+       100%), a second fuzz target for the status-list parser, replay of
+       past crashes from ci/fuzz/regressions/ before fresh fuzzing, and a
+       ci/linter/ gate that also runs as .githooks/pre-commit.
+
+    *) Bugfix: the CodeQL job produced an empty database on any run with a
+       warm ccache, failing with "CodeQL could not process any code written
+       in C/C++". Both module translation units were served from cache, so
+       no compiler ran under the tracer. The job had been a silent no-op
+       since caching was introduced.
+
+    *) Bugfix: ci-deep.yml wrote its manual fuzz_seconds input straight to
+       $GITHUB_ENV without validation, so a value containing a newline could
+       inject further environment variables into every later step on the
+       runner. The value is now rejected unless it matches ^[0-9]+$ within
+       1..86400, checked in NUL mode so an embedded newline cannot pass an
+       anchored match.
