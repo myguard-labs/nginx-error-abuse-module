@@ -886,6 +886,8 @@ http {{
                      statuses=404 interval=60s threshold=1 block=600s;
     error_abuse_zone zone=other:1m key=$arg_client
                      statuses=404 interval=60s threshold=1 block=600s;
+    error_abuse_zone zone=dryorigin:1m key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=600s;
 
     server {{
         listen 127.0.0.1:{port};
@@ -959,14 +961,41 @@ http {{
             empty_gif;
         }}
 
-        # Plain probes to read back the "origin" / "other" zone identity
-        # counters without going through error_page.
+        # (d) origin-wins dry_run: the ORIGIN location has dry_run=on, the
+        # error_page destination does NOT. A destination that could
+        # retroactively turn dry-run observation into real enforcement would
+        # ban an identity the operator explicitly asked to only observe.
+        location = /dryorigin-origin {{
+            error_abuse zone=dryorigin dry_run=on;
+            error_page 404 /dryorigin-dest;
+            root {root}/empty;
+        }}
+        location = /dryorigin-dest {{
+            internal;
+            error_abuse zone=dryorigin status=429;
+            empty_gif;
+        }}
+
+        # Plain probes to read back the "origin" / "other" / "dryorigin" zone
+        # identity counters without going through error_page.
         location = /origin-ok {{
             error_abuse zone=origin status=429;
             empty_gif;
         }}
         location = /other-ok {{
             error_abuse zone=other status=429;
+            empty_gif;
+        }}
+        # 404-capable probe to seed a ban directly in zone "other" without
+        # ever touching zone "origin" -- needed to build the cross-zone
+        # scenario below (an identity banned in "other" but clean in
+        # "origin").
+        location = /other-dest-direct {{
+            error_abuse zone=other status=429;
+            root {root}/empty;
+        }}
+        location = /dryorigin-ok {{
+            error_abuse zone=dryorigin status=429;
             empty_gif;
         }}
     }}
@@ -1031,10 +1060,38 @@ def test_error_page_redirect(
         expect(port, "/origin-ok?client=other-a", 429)
         expect(port, "/other-ok?client=other-a", 200)
 
+        # Cross-zone preaccess proof: ban a DIFFERENT identity in zone
+        # "other" only (zone "origin" has no record for it), then route that
+        # identity through /other-origin -> /other-dest. /other-origin's own
+        # preaccess (conf->zone=origin, unbanned) passes and produces the
+        # 404 that triggers the redirect; the interesting check is
+        # /other-dest's preaccess, which runs again after r->ctx is zeroed
+        # by the internal redirect. With the F-2 restore, prepare_ctx()
+        # there recovers the ORIGIN ctx (ctx->zone=origin, unbanned for this
+        # key) and preaccess must therefore PASS. Reading ctx->zone (not
+        # conf->zone="other", which IS banned for this key) is the only
+        # thing standing between this and a false reject -- the single-pass
+        # /other-origin assertions above cannot reach this because they
+        # never leave "origin" banned while "other" is clean for a DIFFERENT
+        # identity than the one that trips the redirect.
+        #
+        # `error_page 404 /other-dest;` (no `=` overwrite) preserves the
+        # ORIGIN's 404 status regardless of what the destination serves, so
+        # a PASSING preaccess at /other-dest is observed as 404 (the
+        # original error, now counted once against "origin"), not 200. A
+        # preaccess REJECT at the destination, by contrast, finalizes the
+        # request directly with the destination's own reject_status (429),
+        # short-circuiting the error_page status preservation entirely --
+        # that is the visible difference the bug vs the fix produces.
+        expect(port, "/other-dest-direct?client=cross-x", 404)
+        expect(port, "/other-ok?client=cross-x", 429)
+        expect(port, "/other-origin?client=cross-x", 404)
+
         # (b) named-location target bound to a DIFFERENT zone.
         expect(port, "/other-named-origin?client=other-b", 404)
         expect(port, "/origin-ok?client=other-b", 429)
         expect(port, "/other-ok?client=other-b", 200)
+        expect(port, "/other-named-origin?client=other-b", 429)
 
         # (c) custom rejection page (URI target): the SECOND request against
         # the now-banned identity must come back through the origin's own
@@ -1066,6 +1123,16 @@ def test_error_page_redirect(
             )
         if "retry-after" not in headers:
             raise AssertionError("custom rejection page (named) missing Retry-After")
+
+        # (d) origin-wins dry_run: the origin location (dry_run=on) must keep
+        # dry_run TRUE across the redirect even though the destination
+        # location's own conf has dry_run=off (COR-2's non-restored
+        # re-derivation would flip it). A follow-up /dryorigin-ok on the same
+        # key proves no ban was actually created: dry-run must never insert
+        # events or set a block deadline, so a real enforcing sibling
+        # location on the SAME zone still serves 200, not 429.
+        expect(port, "/dryorigin-origin?client=dry-a", 404)
+        expect(port, "/dryorigin-ok?client=dry-a", 200)
     finally:
         rc = proc.poll()
         if rc is None:
