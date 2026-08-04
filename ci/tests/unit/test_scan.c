@@ -185,6 +185,16 @@ case_parse_boundaries_and_ok(void)
     check(parse_str("403,404,500-599", bitmap)
               == NGX_HTTP_ERROR_ABUSE_STATUSES_OK,
           "\"403,404,500-599\" is accepted");
+
+    /* len == 0: the `while (p < last)` loop body never runs (the loop's
+     * false-on-entry arm, otherwise unreached -- every other case here
+     * enters the loop at least once). Falls straight through to OK with an
+     * untouched, all-zero bitmap; not a reject path. */
+    memset(bitmap, 0, sizeof(bitmap));
+    check(parse_str("", bitmap) == NGX_HTTP_ERROR_ABUSE_STATUSES_OK,
+          "empty status list is accepted as OK (loop never entered)");
+    check(popcount_bitmap(bitmap) == 0,
+          "empty status list leaves the bitmap untouched");
 }
 
 
