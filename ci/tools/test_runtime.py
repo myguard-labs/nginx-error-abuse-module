@@ -1068,15 +1068,15 @@ def test_error_page_redirect(
         expect(port, "/off-named-origin?client=off-b", 404)
         expect(port, "/origin-ok?client=off-b", 429)
 
-        # A-1: preaccess must still honour a ban already recorded in the
-        # ORIGIN's zone when the SAME identity's next request is routed
-        # through error_page to an "error_abuse off" destination. off-a is
-        # already banned in zone "origin" (from the assertions above, a
-        # SEPARATE prior request). /off-origin shares that zone, so its own
-        # preaccess is the one that (correctly) rejects first -- 429,
-        # own_rejection -- without ever reaching the backend or the
-        # error_page redirect. The ban is honoured either way; this guards
-        # against a regression that silently lets the request through.
+        # Smoke coverage, NOT the A-1 regression guard: off-a is already
+        # banned in zone "origin" (from the assertions above, a SEPARATE
+        # prior request). /off-origin shares that zone, so its own
+        # preaccess -- unaffected by A-1, it was never behind the removed
+        # guard -- rejects first (429, own_rejection) without ever reaching
+        # the backend or the error_page redirect to /off-dest. Kept as an
+        # end-to-end sanity check that the ban is honoured on repeat
+        # requests; the debug-log assertion further down is what actually
+        # exercises /off-dest's own restored preaccess.
         expect(port, "/off-origin?client=off-a", 429)
 
         # Negative control: a FRESH identity, never seen anywhere, taking

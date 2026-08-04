@@ -876,8 +876,18 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
      * a chance to fire even when THIS location is disabled or unzoned. */
     ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
     if (ctx == NULL) {
-        /* No anchored ctx and this location is disabled/unzoned: the
-         * genuinely-off case, not an error. */
+        /* A-1: NULL from prepare_ctx() is ambiguous -- it means EITHER "no
+         * anchor and this location is genuinely disabled/unzoned" (normal,
+         * NGX_DECLINED) OR "this location IS enabled/zoned but allocating a
+         * fresh ctx failed" (complex-value evaluation, ctx/anchor/digest/
+         * raw-key pool allocation -- a real error). Only THIS location's own
+         * conf tells them apart; ctx itself is gone in both cases. Getting
+         * this backwards fails the module open under memory pressure on
+         * every enabled location, the opposite of F-3's fail-closed
+         * on_full=reject intent. */
+        if (conf->enabled && conf->zone != NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
         return NGX_DECLINED;
     }
 
