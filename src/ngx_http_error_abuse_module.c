@@ -2110,10 +2110,8 @@ static ngx_int_t
 ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
     ngx_http_error_abuse_req_ctx_t *ctx, ngx_str_t *events, ngx_str_t *block)
 {
-    static u_char hex[] = "0123456789abcdef";
     u_char       *p;
     size_t        base_len;
-    ngx_uint_t    i;
     ngx_str_t    *prefix;
 
     /* PERF-3: the keys are stable for the life of the request; build the hex
@@ -2126,8 +2124,9 @@ ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
     }
 
     prefix = &ngx_http_error_abuse_redis_worker.conf->prefix;
-    base_len = prefix->len + 1 + ctx->zone->name.len + 1
-               + ctx->key.len * 2 + 1;
+    base_len = ngx_http_error_abuse_redis_key_len(prefix->len,
+                                                  ctx->zone->name.len,
+                                                  ctx->key.len);
 
     events->len = base_len + sizeof(":events") - 1;
     events->data = ngx_pnalloc(pool, events->len);
@@ -2137,16 +2136,11 @@ ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
         return NGX_ERROR;
     }
 
-    p = events->data;
-    p = ngx_cpymem(p, prefix->data, prefix->len);
-    *p++ = '{';
-    p = ngx_cpymem(p, ctx->zone->name.data, ctx->zone->name.len);
-    *p++ = ':';
-    for (i = 0; i < ctx->key.len; i++) {
-        *p++ = hex[ctx->key.data[i] >> 4];
-        *p++ = hex[ctx->key.data[i] & 0x0f];
-    }
-    *p++ = '}';
+    p = ngx_http_error_abuse_redis_key_write(events->data,
+                                             prefix->data, prefix->len,
+                                             ctx->zone->name.data,
+                                             ctx->zone->name.len,
+                                             ctx->key.data, ctx->key.len);
     p = ngx_cpymem(p, ":events", sizeof(":events") - 1);
 
     ngx_memcpy(block->data, events->data, base_len);

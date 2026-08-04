@@ -586,6 +586,90 @@ case_codec_u64(void)
 }
 
 
+/* --- redis_key_len() vs redis_key_write() ------------------------------- */
+
+/*
+ * The module allocates redis_key_len() bytes and then fills them through a
+ * completely different route: five summed terms on one side, seven write steps
+ * with a *2 hex expansion on the other. Nothing in the compiler makes those
+ * agree, and when they disagree the module overruns an ngx_pnalloc'd block by
+ * a handful of bytes -- the exact size of overrun cp10 10b proved ASan cannot
+ * see. So assert the agreement directly, with a canary, across the shapes that
+ * move each term independently.
+ */
+static void
+case_redis_key_len_matches_write(void)
+{
+    static const struct {
+        const char  *prefix;
+        const char  *zone;
+        size_t       digest_len;
+        const char  *what;
+    } cases[] = {
+        { "",       "",     0,  "all three lengths zero" },
+        { "ea:",    "one",  32, "the shape the module actually uses" },
+        { "p",      "z",    1,  "one byte of each" },
+        { "prefix", "zn",   32, "a longer prefix" },
+        { "ea:",    "a-much-longer-zone-name", 32, "a longer zone name" },
+    };
+
+    u_char   buf[512];
+    u_char   digest[32];
+    size_t   i, j;
+
+    for (j = 0; j < sizeof(digest); j++) {
+        /* Cover both nibbles across the digest, so a hex-expansion mistake
+         * cannot hide behind an all-zero key. */
+        digest[j] = (u_char) (j * 8 + j);
+    }
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const u_char  *prefix = (const u_char *) cases[i].prefix;
+        const u_char  *zone = (const u_char *) cases[i].zone;
+        size_t         prefix_len = strlen(cases[i].prefix);
+        size_t         zone_len = strlen(cases[i].zone);
+        size_t         claimed;
+        u_char        *end;
+
+        claimed = ngx_http_error_abuse_redis_key_len(prefix_len, zone_len,
+                                                     cases[i].digest_len);
+
+        if (claimed + 1 > sizeof(buf)) {
+            printf("FAIL: case \"%s\" does not fit the test buffer\n",
+                   cases[i].what);
+            failures++;
+            checks++;
+            continue;
+        }
+
+        memset(buf, 0, sizeof(buf));
+        buf[claimed] = 0xAA;
+
+        end = ngx_http_error_abuse_redis_key_write(buf, prefix, prefix_len,
+                                                   zone, zone_len,
+                                                   digest,
+                                                   cases[i].digest_len);
+
+        check((size_t) (end - buf) == claimed,
+              cases[i].what);
+        check(buf[claimed] == 0xAA,
+              "canary past the claimed length is untouched");
+    }
+
+    /* The layout itself, spelled out once: a wrong separator or a dropped
+     * brace keeps every length above correct while breaking the Redis Cluster
+     * slot the braces exist to pin. */
+    memset(buf, 0, sizeof(buf));
+    digest[0] = 0xAB;
+    (void) ngx_http_error_abuse_redis_key_write(buf,
+                                                (const u_char *) "ea:", 3,
+                                                (const u_char *) "zn", 2,
+                                                digest, 1);
+    check(memcmp(buf, "ea:{zn:ab}", 10) == 0,
+          "layout is \"<prefix>{<zone>:<hex>}\" with the slot braces intact");
+}
+
+
 int
 main(void)
 {
@@ -601,6 +685,8 @@ main(void)
     case_snapshot_reject_off_by_one_stride();
     case_snapshot_reject_records_zero_with_bytes_left();
     case_snapshot_accept_two_records();
+
+    case_redis_key_len_matches_write();
 
     case_codec_u16();
     case_codec_u32();

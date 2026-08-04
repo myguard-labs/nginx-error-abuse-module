@@ -104,6 +104,39 @@ ngx_int_t ngx_http_error_abuse_validate_snapshot(u_char *p, u_char *last,
  * harness's load()-stride replay must all decode with the SAME code. A second
  * copy in the harness is exactly the drift the seam removes.
  */
+/*
+ * Redis key construction, split out of the module's redis_keys() so the size
+ * arithmetic and the write sequence can be checked against each other without
+ * a pool.
+ *
+ * The two must agree exactly: the caller allocates key_len() bytes (plus a
+ * suffix) and key_write() then fills them by a different route -- five summed
+ * terms on one side, seven write steps with a *2 hex expansion on the other.
+ * A wrong term overruns the pool by a few bytes, which is precisely the size
+ * of overrun ASan does not see on an ngx_pnalloc'd block (cp10 10b). So the
+ * agreement is asserted directly, with canaries, in ci/tests/unit/test_scan.c.
+ *
+ * Layout written is "<prefix>{<zone_name>:<hex digest>}", with the braces
+ * making the two per-identity keys hash to one Redis Cluster slot. key_len()
+ * returns the length of that base, excluding any suffix the caller appends.
+ *
+ * Precondition: the three lengths must be small enough that the sum below
+ * cannot wrap size_t. The module's only caller passes a prefix and zone name
+ * bounded by the config file and a digest_len fixed at
+ * NGX_HTTP_ERROR_ABUSE_DIGEST_LEN, so this holds by construction there; a new
+ * caller passing an attacker-influenced length would have to bound it first.
+ * Stated rather than checked because a size_t return has no error value, and
+ * inventing one would put a branch on the hot path for a condition the
+ * allocation itself cannot survive anyway.
+ */
+size_t ngx_http_error_abuse_redis_key_len(size_t prefix_len,
+    size_t zone_name_len, size_t digest_len);
+u_char *ngx_http_error_abuse_redis_key_write(u_char *buf,
+    const u_char *prefix, size_t prefix_len,
+    const u_char *zone_name, size_t zone_name_len,
+    const u_char *digest, size_t digest_len);
+
+
 u_char *ngx_http_error_abuse_put_u16(u_char *p, uint16_t v);
 u_char *ngx_http_error_abuse_put_u32(u_char *p, uint32_t v);
 u_char *ngx_http_error_abuse_put_u64(u_char *p, uint64_t v);
