@@ -1,5 +1,94 @@
 #!/usr/bin/env python3
-"""End-to-end tests for ngx_http_error_abuse_module."""
+"""End-to-end tests for ngx_http_error_abuse_module.
+
+MODULE-UNLOADED BASELINE (2026-08-05, no --module flag): the suite does not
+silently pass -- it fails at the very first case, before any HTTP traffic:
+
+    $ python3 ci/tools/test_runtime.py --port 18880 \\
+          --nginx-binary $PWD/.build/nginx-1.31.3-debug/objs/nginx \\
+          --redis-server $(which redis-server)
+    ERROR: minimal-zone config was rejected but should be valid:
+    nginx: [emerg] unknown directive "error_abuse_zone" in
+    /tmp/error-abuse-ci-*/minimal-zone/conf/nginx.conf:4
+
+This is the expected and correct failure mode: with no module loaded, nginx
+does not know the error_abuse_zone directive at all, so test_valid_configs()
+(the first thing main() calls) fails immediately on its first
+expect_valid_config() case. There is no code path in this file that can run
+any further without the module.
+
+MUTATION LEDGER -- SEEN RED. Every mutation below was APPLIED to
+src/ngx_http_error_abuse_module.c, rebuilt with
+`bash ci/tools/ci-build.sh nginx 1.31.3`, run against this suite with
+`python3 ci/tools/test_runtime.py --port 18880 --nginx-binary
+$PWD/.build/nginx-1.31.3-debug/objs/nginx --module
+$PWD/.build/nginx-1.31.3-debug/objs/ngx_http_error_abuse_module.so
+--redis-server $(which redis-server)`, and observed FAILING; each was then
+reverted (`git diff src/` empty) and the unmutated build reconfirmed green in
+the same session before moving to the next. Re-run these after touching the
+runtime enforcement path: a check that has never failed is not known to be a
+check. Ordered by the priority this ledger was built in: ban enforcement,
+zone/key handling, error-page/redirect, then persistence.
+
+  * threshold off-by-one (ban enforcement) -- in
+    ngx_http_error_abuse_record(), change `if (ean->event_count >=
+    zone->threshold)` to `> zone->threshold`, so a client sitting exactly AT
+    the configured threshold is never banned.
+      -> test_on_full_policy(): "/err?client=fresh-reject" expected 503, got
+         404 (the reject-on-full leg never sees the zone fill, because
+         _fill_zone()'s last request stops one short of tripping the ban).
+
+  * interval/window boundary widened (zone/key handling -- event pruning) --
+    in ngx_http_error_abuse_prune_events(), change `events[ean->event_head]
+    <= cutoff` to `< cutoff`, so an event exactly AT the window cutoff is
+    kept instead of pruned, one interval-width too long.
+      -> main(): "/window-ok" expected 200, got 429 (an event that should
+         have aged out of the interval window is still counted, so the
+         identity is still banned after the window elapsed).
+
+  * key hashing collapsed (zone/key handling -- per-identity isolation) --
+    in ngx_http_error_abuse_prepare_ctx(), change `SHA256(key.data, key.len,
+    ctx->key.data)` to `SHA256(key.data, 1, ctx->key.data)`, so only the
+    first raw key byte feeds the identity hash; distinct keys sharing a
+    first byte collapse onto one shared node.
+      -> test_on_full_policy(): "/ok?client=fresh-allow" expected 200, got
+         503 (caught incidentally via zone-fill cross-contamination between
+         "fresh-allow" and the fill clients that share a leading byte, not
+         via a case built to isolate key hashing specifically -- see the
+         open follow-up in TODO.md).
+
+  * anchor restore disabled (error-page/redirect) -- in
+    ngx_http_error_abuse_prepare_ctx(), change `if (ctx != NULL)` (the F-2
+    anchor-restore branch after ngx_http_error_abuse_find_anchor_ctx()) to
+    `if (0 && ctx != NULL)`, so every error_page-redirected destination
+    location gets a FRESH ctx instead of reusing the origin's.
+      -> test_error_page_redirect(): "/origin-ok?client=off-a" expected 429,
+         got 200 (the origin's threshold=1 hit never reaches the zone,
+         because the destination location silently allocated a new,
+         unrelated ctx instead of restoring the one the origin earned).
+
+  * HMAC verification disabled (persistence, SEC-5) -- in the persistence
+    loader, change the tampered-MAC rejection condition's
+    `CRYPTO_memcmp(mac, buffer + payload_size, NGX_HTTP_ERROR_ABUSE_MAC_LEN)
+    != 0` to a literal `0`, so a snapshot whose trailing HMAC does not match
+    is trusted and loaded anyway.
+      -> main(): "/secret-ok" expected 200, got 429 (a snapshot with a
+         deliberately bit-flipped HMAC tail was loaded and its ban
+         restored, instead of being ignored).
+
+UNMEASURED (not attempted this pass -- time/context budget; see TODO.md for
+the follow-up item): test_redis_multi_host(), test_redis_auth(),
+test_invalid_configs() (config-parser rejection paths), the reload/key-change
+guard ("key cannot change during reload"), the persistence file
+truncation/corruption recovery blocks, the dry-run-does-not-write-state case
+specifically isolated from the error-page-redirect harness (attempted here
+but only reachable through test_error_page_redirect()'s dryorigin location,
+which is documented above under key hashing's caveat), and the
+$error_abuse_status/_count/_blocked_until exposed-variable assertions at the
+end of main(). None of these were built, run, or observed failing in this
+pass -- do not read their absence here as a passing or a survived result,
+they were simply not measured.
+"""
 
 from __future__ import annotations
 
