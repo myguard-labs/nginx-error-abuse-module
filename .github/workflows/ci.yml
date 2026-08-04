@@ -16,12 +16,24 @@ concurrency:
   group: orchestrator-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Default-deny at the orchestrator level; every job below declares the exact
+# permission its called workflow needs, so this workflow itself owns none.
+permissions: {}
+
+# secrets: inherit on the five jobs below predates this PR (cp4a) and is
+# pre-existing on every member except lint (which needs no secret and does not
+# use it). This repo carries no repository/environment secrets today -- inherit
+# is defensive boilerplate with nothing to leak, not an active grant -- so
+# narrowing it to a named `secrets:` block is a no-op until a real secret is
+# added, and auditing which member will eventually need which one is a separate
+# task from porting the lint gate (cp7b). Flagged here rather than silently
+# ignored; narrow this the day a secret is actually introduced.
 jobs:
   build-test:
     permissions:
       contents: read
     uses: ./.github/workflows/build-test.yml
-    secrets: inherit
+    secrets: inherit # zizmor: ignore[secrets-inherit] -- no secrets configured on this repo yet, see note above jobs:
 
   asan:
     permissions:
@@ -32,23 +44,28 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/fuzzing.yml
-    secrets: inherit
+    secrets: inherit # zizmor: ignore[secrets-inherit] -- no secrets configured on this repo yet, see note above jobs:
 
   valgrind:
     permissions:
       contents: read
     uses: ./.github/workflows/valgrind.yml
-    secrets: inherit
+    secrets: inherit # zizmor: ignore[secrets-inherit] -- no secrets configured on this repo yet, see note above jobs:
 
   security-scanners:
     permissions:
       contents: read
     uses: ./.github/workflows/security-scanners.yml
-    secrets: inherit
+    secrets: inherit # zizmor: ignore[secrets-inherit] -- no secrets configured on this repo yet, see note above jobs:
 
   codeql:
     permissions:
       contents: read
-      security-events: write
+      security-events: write # required so the CodeQL upload step can publish results
     uses: ./.github/workflows/codeql.yml
-    secrets: inherit
+    secrets: inherit # zizmor: ignore[secrets-inherit] -- no secrets configured on this repo yet, see note above jobs:
+
+  lint:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/lint.yml

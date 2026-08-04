@@ -19,7 +19,6 @@ import time
 import urllib.error
 import urllib.request
 
-
 # A test that raises before stop() would orphan every child we spawned:
 # an nginx master (or redis) keeps listening on its test port, which
 # collides with later runs of any repo sharing the runner. Track every
@@ -107,18 +106,22 @@ def fetch(port: int, path: str) -> tuple[int, dict[str, str]]:
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
             response.read()
-            return response.status, {k.lower(): v
-                                     for k, v in response.headers.items()}
+            return response.status, {k.lower(): v for k, v in response.headers.items()}
     except urllib.error.HTTPError as exc:
         exc.read()
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}
 
 
-def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
-                 workers: int, keyed_key: str = "$arg_client",
-                 redis_port: int | None = None,
-                 redis_prefix: str = "error-abuse-ci:",
-                 redis_password: str | None = None) -> str:
+def nginx_config(
+    root: pathlib.Path,
+    port: int,
+    module: pathlib.Path | None,
+    workers: int,
+    keyed_key: str = "$arg_client",
+    redis_port: int | None = None,
+    redis_prefix: str = "error-abuse-ci:",
+    redis_password: str | None = None,
+) -> str:
     load = f"load_module {module};\n" if module else ""
     redis = ""
     redis_zone = ""
@@ -273,11 +276,18 @@ http {{
 
 
 class Nginx:
-    def __init__(self, binary: pathlib.Path, module: pathlib.Path | None,
-                 root: pathlib.Path, port: int, runner: str,
-                 single_process: bool, redis_port: int | None = None,
-                 redis_prefix: str = "error-abuse-ci:",
-                 redis_password: str | None = None) -> None:
+    def __init__(
+        self,
+        binary: pathlib.Path,
+        module: pathlib.Path | None,
+        root: pathlib.Path,
+        port: int,
+        runner: str,
+        single_process: bool,
+        redis_port: int | None = None,
+        redis_prefix: str = "error-abuse-ci:",
+        redis_password: str | None = None,
+    ) -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -297,8 +307,14 @@ class Nginx:
         (self.root / "empty").mkdir(parents=True, exist_ok=True)
         (self.root / "conf" / "nginx.conf").write_text(
             nginx_config(
-                self.root, self.port, self.module, workers, keyed_key,
-                self.redis_port, self.redis_prefix, self.redis_password,
+                self.root,
+                self.port,
+                self.module,
+                workers,
+                keyed_key,
+                self.redis_port,
+                self.redis_prefix,
+                self.redis_password,
             ),
             encoding="ascii",
         )
@@ -317,7 +333,7 @@ class Nginx:
             # nginx leaks and mask the real config-test result.
             command.append("-t")
             return command
-        elif self.single_process:
+        if self.single_process:
             command.extend(["-g", "daemon off; master_process off;"])
         else:
             command.extend(["-g", "daemon off;"])
@@ -330,6 +346,7 @@ class Nginx:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=20,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(f"nginx -t failed:\n{result.stdout}")
@@ -337,12 +354,14 @@ class Nginx:
     def start(self) -> None:
         self.write_config()
         output = self.output_path.open("a", encoding="utf-8")
-        self.process = _track(subprocess.Popen(
-            self.command(),
-            text=True,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-        ))
+        self.process = _track(
+            subprocess.Popen(
+                self.command(),
+                text=True,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+            )
+        )
         output.close()
         try:
             wait_port(self.port)
@@ -371,16 +390,19 @@ class Nginx:
         rc = self.process.returncode
         self.process = None
         if rc not in (0, -signal.SIGTERM):
-            output = self.output_path.read_text(
-                encoding="utf-8", errors="replace"
-            ) if self.output_path.exists() else ""
+            output = (
+                self.output_path.read_text(encoding="utf-8", errors="replace")
+                if self.output_path.exists()
+                else ""
+            )
             raise RuntimeError(f"nginx exited with {rc}:\n{output}")
 
     def assert_clean_logs(self) -> None:
         paths = [self.output_path, self.root / "logs" / "error.log"]
         combined = "\n".join(
             path.read_text(encoding="utf-8", errors="replace")
-            for path in paths if path.exists()
+            for path in paths
+            if path.exists()
         )
         for marker in SANITIZER_MARKERS:
             if marker == "ERROR SUMMARY:" and "ERROR SUMMARY: 0 errors" in combined:
@@ -388,7 +410,8 @@ class Nginx:
             if marker in combined:
                 raise AssertionError(f"runtime checker marker found: {marker}")
         fatal_lines = [
-            line for line in combined.splitlines()
+            line
+            for line in combined.splitlines()
             if ("[alert]" in line or "[emerg]" in line)
             and "key cannot change during reload" not in line
         ]
@@ -399,8 +422,13 @@ class Nginx:
 
 
 class RedisServer:
-    def __init__(self, binary: pathlib.Path, root: pathlib.Path,
-                 port: int, requirepass: str | None = None) -> None:
+    def __init__(
+        self,
+        binary: pathlib.Path,
+        root: pathlib.Path,
+        port: int,
+        requirepass: str | None = None,
+    ) -> None:
         self.binary = binary
         self.root = root
         self.port = port
@@ -411,17 +439,27 @@ class RedisServer:
         self.root.mkdir(parents=True, exist_ok=True)
         cmd = [
             str(self.binary),
-            "--bind", "127.0.0.1",
-            "--port", str(self.port),
-            "--save", "",
-            "--appendonly", "no",
-            "--dir", str(self.root),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            str(self.port),
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--dir",
+            str(self.root),
         ]
         if self.requirepass:
             cmd += ["--requirepass", self.requirepass]
-        self.process = _track(subprocess.Popen(
-            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        ))
+        self.process = _track(
+            subprocess.Popen(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        )
         wait_port(self.port)
         # Flush all data to ensure clean state for each test
         flush = ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port)]
@@ -446,21 +484,37 @@ class RedisServer:
         self.process = None
 
 
-def test_redis_multi_host(binary: pathlib.Path,
-                          module: pathlib.Path | None,
-                          root: pathlib.Path, runner: str,
-                          single_process: bool, nginx_port: int,
-                          redis_binary: pathlib.Path) -> None:
+def test_redis_multi_host(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    single_process: bool,
+    nginx_port: int,
+    redis_binary: pathlib.Path,
+) -> None:
     redis_port = nginx_port + 20
-    prefix = f"error-abuse-ci-{os.getpid()}-{int(time.time()*1000)}:"
+    prefix = f"error-abuse-ci-{os.getpid()}-{int(time.time() * 1000)}:"
     redis = RedisServer(redis_binary, root / "redis", redis_port)
     first = Nginx(
-        binary, module, root / "redis-nginx-a", nginx_port + 1, runner,
-        single_process, redis_port, prefix,
+        binary,
+        module,
+        root / "redis-nginx-a",
+        nginx_port + 1,
+        runner,
+        single_process,
+        redis_port,
+        prefix,
     )
     second = Nginx(
-        binary, module, root / "redis-nginx-b", nginx_port + 2, runner,
-        single_process, redis_port, prefix,
+        binary,
+        module,
+        root / "redis-nginx-b",
+        nginx_port + 2,
+        runner,
+        single_process,
+        redis_port,
+        prefix,
     )
 
     try:
@@ -486,7 +540,7 @@ def test_redis_multi_host(binary: pathlib.Path,
         # blocking resumes.
         redis = RedisServer(redis_binary, root / "redis", redis_port)
         redis.start()
-        time.sleep(3.0)   # allow reconnect backoff + handshake
+        time.sleep(3.0)  # allow reconnect backoff + handshake
         expect(first.port, "/redis-error?client=again", 404)
         time.sleep(0.05)
         expect(second.port, "/redis-error?client=again", 404)
@@ -500,18 +554,32 @@ def test_redis_multi_host(binary: pathlib.Path,
         redis.stop()
 
 
-def test_redis_auth(binary: pathlib.Path, module: pathlib.Path | None,
-                    root: pathlib.Path, runner: str, single_process: bool,
-                    nginx_port: int, redis_binary: pathlib.Path) -> None:
+def test_redis_auth(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    single_process: bool,
+    nginx_port: int,
+    redis_binary: pathlib.Path,
+) -> None:
     # CI-5: password-protected Redis exercises the AUTH handshake (COR-5) and
     # that blocking still works through it.
     redis_port = nginx_port + 30
-    prefix = f"error-abuse-auth-{os.getpid()}-{int(time.time()*1000)}:"
-    redis = RedisServer(redis_binary, root / "redis-auth", redis_port,
-                        requirepass="s3cr3t-pass")
+    prefix = f"error-abuse-auth-{os.getpid()}-{int(time.time() * 1000)}:"
+    redis = RedisServer(
+        redis_binary, root / "redis-auth", redis_port, requirepass="s3cr3t-pass"
+    )
     server = Nginx(
-        binary, module, root / "redis-auth-nginx", nginx_port + 3, runner,
-        single_process, redis_port, prefix, redis_password="s3cr3t-pass",
+        binary,
+        module,
+        root / "redis-auth-nginx",
+        nginx_port + 3,
+        runner,
+        single_process,
+        redis_port,
+        prefix,
+        redis_password="s3cr3t-pass",
     )
     try:
         redis.start()
@@ -533,9 +601,15 @@ def test_redis_auth(binary: pathlib.Path, module: pathlib.Path | None,
         redis.stop()
 
 
-def expect_invalid_config(binary: pathlib.Path, module: pathlib.Path | None,
-                          root: pathlib.Path, runner: str, name: str,
-                          http_config: str, expected: str) -> None:
+def expect_invalid_config(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    name: str,
+    http_config: str,
+    expected: str,
+) -> None:
     bad = root / name
     (bad / "conf").mkdir(parents=True)
     (bad / "logs").mkdir()
@@ -553,12 +627,20 @@ http {{
     # nginx's -t path intentionally never frees the cycle pool, so Valgrind
     # always reports indirect leaks and --error-exitcode masks the real result.
     command = [
-        str(binary), "-p", str(bad), "-c", str(bad / "conf" / "nginx.conf"),
+        str(binary),
+        "-p",
+        str(bad),
+        "-c",
+        str(bad / "conf" / "nginx.conf"),
         "-t",
     ]
     result = subprocess.run(
-        command, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, timeout=20,
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+        check=False,
     )
     if result.returncode == 0 or expected not in result.stdout:
         raise AssertionError(
@@ -566,9 +648,14 @@ http {{
         )
 
 
-def expect_valid_config(binary: pathlib.Path, module: pathlib.Path | None,
-                        root: pathlib.Path, runner: str, name: str,
-                        http_config: str) -> None:
+def expect_valid_config(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    name: str,
+    http_config: str,
+) -> None:
     good = root / name
     (good / "conf").mkdir(parents=True)
     (good / "logs").mkdir()
@@ -586,12 +673,20 @@ http {{
     # nginx -t leaves the cycle pool unfreed, so Valgrind's leak exit code
     # would fail an otherwise valid config.
     command = [
-        str(binary), "-p", str(good), "-c", str(good / "conf" / "nginx.conf"),
+        str(binary),
+        "-p",
+        str(good),
+        "-c",
+        str(good / "conf" / "nginx.conf"),
         "-t",
     ]
     result = subprocess.run(
-        command, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, timeout=20,
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+        check=False,
     )
     if result.returncode != 0:
         raise AssertionError(
@@ -599,33 +694,51 @@ http {{
         )
 
 
-def test_valid_configs(binary: pathlib.Path, module: pathlib.Path | None,
-                       root: pathlib.Path, runner: str) -> None:
+def test_valid_configs(
+    binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
+) -> None:
     # COR-1: the documented one-argument forms must be accepted (were rejected
     # by NGX_CONF_2MORE before the fix).
     expect_valid_config(
-        binary, module, root, runner, "minimal-zone",
+        binary,
+        module,
+        root,
+        runner,
+        "minimal-zone",
         "    error_abuse_zone zone=minimal:1m;",
     )
     expect_valid_config(
-        binary, module, root, runner, "minimal-redis",
+        binary,
+        module,
+        root,
+        runner,
+        "minimal-redis",
         """    error_abuse_redis host=127.0.0.1;
     error_abuse_zone zone=minimal:1m redis=on;""",
     )
 
 
-def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
-                         root: pathlib.Path, runner: str) -> None:
+def test_invalid_configs(
+    binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
+) -> None:
     # COR-8: a trailing comma in the status list is malformed, not ignored.
     expect_invalid_config(
-        binary, module, root, runner, "trailing-comma-status",
+        binary,
+        module,
+        root,
+        runner,
+        "trailing-comma-status",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404, interval=1s threshold=2 block=1s;""",
         "invalid error_abuse status list",
     )
     # COR-3: an explicit inactive shorter than interval/block is rejected.
     expect_invalid_config(
-        binary, module, root, runner, "short-inactive",
+        binary,
+        module,
+        root,
+        runner,
+        "short-inactive",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=5m threshold=2 block=1h
                          inactive=1s;""",
@@ -633,7 +746,11 @@ def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
     )
     # SEC-5: persist_secret without persist, and odd-length hex, are rejected.
     expect_invalid_config(
-        binary, module, root, runner, "secret-without-persist",
+        binary,
+        module,
+        root,
+        runner,
+        "secret-without-persist",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s
                          persist_secret=00ff;""",
@@ -641,7 +758,11 @@ def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
     )
     secret_state = root / "oddsecret.state"
     expect_invalid_config(
-        binary, module, root, runner, "secret-odd-hex",
+        binary,
+        module,
+        root,
+        runner,
+        "secret-odd-hex",
         f"""    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s
                          persist={secret_state} persist_secret=abc;""",
@@ -650,7 +771,11 @@ def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
     # COR-6: "off" then a real declaration in the same block is a duplicate,
     # regardless of order.
     expect_invalid_config(
-        binary, module, root, runner, "off-then-zone",
+        binary,
+        module,
+        root,
+        runner,
+        "off-then-zone",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s;
     server {
@@ -660,20 +785,32 @@ def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
         "is duplicate",
     )
     expect_invalid_config(
-        binary, module, root, runner, "bad-status",
+        binary,
+        module,
+        root,
+        runner,
+        "bad-status",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404,700 interval=1s threshold=2 block=1s;""",
         "invalid error_abuse status list",
     )
     expect_invalid_config(
-        binary, module, root, runner, "duplicate-parameter",
+        binary,
+        module,
+        root,
+        runner,
+        "duplicate-parameter",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s interval=2s
                          threshold=2 block=1s;""",
         "duplicate error_abuse_zone parameter",
     )
     expect_invalid_config(
-        binary, module, root, runner, "duplicate-enable-parameter",
+        binary,
+        module,
+        root,
+        runner,
+        "duplicate-enable-parameter",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s;
     server {
@@ -682,14 +819,22 @@ def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
         "duplicate error_abuse parameter",
     )
     expect_invalid_config(
-        binary, module, root, runner, "redis-without-backend",
+        binary,
+        module,
+        root,
+        runner,
+        "redis-without-backend",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s
                          redis=on;""",
         "requires error_abuse_redis",
     )
     expect_invalid_config(
-        binary, module, root, runner, "bad-redis-prefix",
+        binary,
+        module,
+        root,
+        runner,
+        "bad-redis-prefix",
         """    error_abuse_redis host=127.0.0.1 "prefix=bad{prefix";
     error_abuse_zone zone=bad:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s
@@ -698,7 +843,11 @@ def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
     )
     shared = root / "shared.state"
     expect_invalid_config(
-        binary, module, root, runner, "duplicate-persistence",
+        binary,
+        module,
+        root,
+        runner,
+        "duplicate-persistence",
         f"""    error_abuse_zone zone=one:1m key=$binary_remote_addr
                          statuses=404 interval=1s threshold=2 block=1s
                          persist={shared};
@@ -724,15 +873,29 @@ def main() -> int:
         test_invalid_configs(binary, module, root, args.runner)
         if args.redis_server:
             test_redis_multi_host(
-                binary, module, root, args.runner, args.single_process,
-                args.port, pathlib.Path(args.redis_server).absolute(),
+                binary,
+                module,
+                root,
+                args.runner,
+                args.single_process,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
             )
             test_redis_auth(
-                binary, module, root, args.runner, args.single_process,
-                args.port, pathlib.Path(args.redis_server).absolute(),
+                binary,
+                module,
+                root,
+                args.runner,
+                args.single_process,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
             )
         nginx = Nginx(
-            binary, module, root / "server", args.port, args.runner,
+            binary,
+            module,
+            root / "server",
+            args.port,
+            args.runner,
             args.single_process,
         )
         nginx.write_config()
@@ -827,10 +990,12 @@ def main() -> int:
                 nginx.reload()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                codes = list(pool.map(
-                    lambda _: request(args.port, "/dry-error"),
-                    range(200),
-                ))
+                codes = list(
+                    pool.map(
+                        lambda _: request(args.port, "/dry-error"),
+                        range(200),
+                    )
+                )
             if set(codes) != {404}:
                 raise AssertionError(f"dry-run concurrency returned {set(codes)}")
 
@@ -872,7 +1037,7 @@ def main() -> int:
             if len(sdata) < 33:
                 raise AssertionError("secret snapshot missing HMAC tail")
 
-            nginx.start()                       # untampered: ban restored
+            nginx.start()  # untampered: ban restored
             expect(args.port, "/secret-ok", 429)
             nginx.stop()
 
@@ -884,22 +1049,25 @@ def main() -> int:
             os.chmod(secret_state, 0o600)
 
             nginx.start()
-            expect(args.port, "/secret-ok", 200)   # not restored
+            expect(args.port, "/secret-ok", 200)  # not restored
             nginx.stop()
 
             # Exposed variables: drive PASSED -> COUNTED -> BLOCKED and assert
             # $error_abuse_status / _count / _blocked_until via the access log.
             nginx.start()
-            expect(args.port, "/var-ok", 200)       # 200 untracked -> PASSED
-            expect(args.port, "/var-error", 404)    # 1st 404      -> COUNTED 1
-            expect(args.port, "/var-error", 404)    # threshold    -> BLOCKED 2
-            expect(args.port, "/var-error", 429)    # now banned   -> BLOCKED 2
+            expect(args.port, "/var-ok", 200)  # 200 untracked -> PASSED
+            expect(args.port, "/var-error", 404)  # 1st 404      -> COUNTED 1
+            expect(args.port, "/var-error", 404)  # threshold    -> BLOCKED 2
+            expect(args.port, "/var-error", 429)  # now banned   -> BLOCKED 2
             time.sleep(0.3)
             nginx.stop()
 
             vars_log = nginx.root / "logs" / "vars.log"
-            lines = [ln.split() for ln in
-                     vars_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            lines = [
+                ln.split()
+                for ln in vars_log.read_text(encoding="utf-8").splitlines()
+                if ln.strip()
+            ]
             if len(lines) != 4:
                 raise AssertionError(f"vars.log expected 4 lines, got {lines}")
             states = [ln[1] for ln in lines]

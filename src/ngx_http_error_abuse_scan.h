@@ -13,9 +13,9 @@
  * Before this seam existed the fuzz targets ran fuzz/extract_parser.sh, which
  * sliced the two function bodies out of the module .c with sed and compiled
  * them against a hand-written ngx_shim.h carrying re-typed copies of ngx_atoi()
- * and ngx_strlchr(). That fuzzed a textual copy of the parser against a copy of
- * the decoder -- two drift surfaces the build could not detect. Linking the real
- * TU removes both.
+ * and ngx_strlchr(). That fuzzed a textual copy of the parser against a copy
+ * of the decoder -- two drift surfaces the build could not detect. Linking
+ * the real TU removes both.
  *
  * The rule when extending this module: parsing and validation of attacker- or
  * operator-supplied bytes goes here; only the ngx_http_request_t / ngx_conf_t
