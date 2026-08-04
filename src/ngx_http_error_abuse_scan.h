@@ -96,15 +96,6 @@ ngx_int_t ngx_http_error_abuse_validate_snapshot(u_char *p, u_char *last,
 
 
 /*
- * RFC-3: explicit little-endian field codecs so a snapshot is portable across
- * endianness and compiler ABI, not a raw native struct dump.
- *
- * Declared here (and defined in the scan TU) rather than left as static inlines
- * in the module .c because the snapshot validator, the loader and the fuzz
- * harness's load()-stride replay must all decode with the SAME code. A second
- * copy in the harness is exactly the drift the seam removes.
- */
-/*
  * Redis key construction, split out of the module's redis_keys() so the size
  * arithmetic and the write sequence can be checked against each other without
  * a pool.
@@ -163,6 +154,15 @@ size_t ngx_http_error_abuse_serialize_rec_len(size_t key_len,
     size_t event_count);
 
 
+/*
+ * RFC-3: explicit little-endian field codecs so a snapshot is portable across
+ * endianness and compiler ABI, not a raw native struct dump.
+ *
+ * Declared here (and defined in the scan TU) rather than left as static inlines
+ * in the module .c because the snapshot validator, the loader and the fuzz
+ * harness's load()-stride replay must all decode with the SAME code. A second
+ * copy in the harness is exactly the drift the seam removes.
+ */
 u_char *ngx_http_error_abuse_put_u16(u_char *p, uint16_t v);
 u_char *ngx_http_error_abuse_put_u32(u_char *p, uint32_t v);
 u_char *ngx_http_error_abuse_put_u64(u_char *p, uint64_t v);
