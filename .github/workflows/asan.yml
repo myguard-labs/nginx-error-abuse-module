@@ -39,7 +39,13 @@ jobs:
       # asan-reload job -- all three can land on the same self-hosted runner
       # with no concurrency group serialising them (lint-ci-ports.sh gates on
       # this; see build-test.yml:runtime for the sibling band).
+      #
+      # WIDTH MUST BE DECLARED. max-port.sh defaults to 64, but the bands are
+      # only 32 apart, so the default made this job "verify" 18912-18975 --
+      # straight across asan-reload's 18944. The check then fails on a
+      # sibling's healthy listener instead of on a real collision.
       TEST_BASE_PORT: "18912"
+      TEST_PORT_WIDTH: "32"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -68,10 +74,18 @@ jobs:
 
       - name: Sweep stale test listeners
         run: |
-          # Kill leftovers from earlier crashed runs still holding test
+          # Kill leftovers from earlier crashed runs still holding THIS job's
           # ports (cross-repo collisions on shared runners).
+          #
+          # Scoped to this job's own band, not the whole 18870-18999 range.
+          # The wide sweep was PID-blind TERM: a sibling job mid-run in the
+          # range lost its listeners to another job's cleanup, which surfaces
+          # as a connection-refused flake in a job that did nothing wrong.
+          # Disjoint bands (build-test 18880, asan 18912, asan-reload 18944)
+          # only prevent two jobs from BINDING the same port; they do nothing
+          # about one job killing across all of them.
           command -v fuser >/dev/null || sudo apt-get install -y psmisc
-          for p in $(seq 18870 18999); do
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + TEST_PORT_WIDTH - 1))); do
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1
@@ -96,8 +110,10 @@ jobs:
     timeout-minutes: 30
     env:
       # Own band -- see the asan job above and build-test.yml:runtime for the
-      # sibling bands this must stay disjoint from.
+      # sibling bands this must stay disjoint from. Width declared for the
+      # reason spelled out on the asan job's band above.
       TEST_BASE_PORT: "18944"
+      TEST_PORT_WIDTH: "32"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -130,10 +146,18 @@ jobs:
       # nginx's own arena is not freed at fast shutdown.
       - name: Sweep stale test listeners
         run: |
-          # Kill leftovers from earlier crashed runs still holding test
+          # Kill leftovers from earlier crashed runs still holding THIS job's
           # ports (cross-repo collisions on shared runners).
+          #
+          # Scoped to this job's own band, not the whole 18870-18999 range.
+          # The wide sweep was PID-blind TERM: a sibling job mid-run in the
+          # range lost its listeners to another job's cleanup, which surfaces
+          # as a connection-refused flake in a job that did nothing wrong.
+          # Disjoint bands (build-test 18880, asan 18912, asan-reload 18944)
+          # only prevent two jobs from BINDING the same port; they do nothing
+          # about one job killing across all of them.
           command -v fuser >/dev/null || sudo apt-get install -y psmisc
-          for p in $(seq 18870 18999); do
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + TEST_PORT_WIDTH - 1))); do
             fuser -k -TERM "${p}/tcp" 2>/dev/null || true
           done
           sleep 1

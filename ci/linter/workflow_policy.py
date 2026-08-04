@@ -103,6 +103,9 @@ RUNTIME_DRIVER = "ci/tools/test_runtime.py"
 # below needs both: a verify step is only a guard for the binders that come
 # after it, and `prove` is a binder even though it is not the runtime driver.
 BAND_VERIFIER = "ci/tools/max-port.sh"
+# max-port.sh's fallback width. Mirrored here only to name the number in the
+# "declare TEST_PORT_WIDTH" error; keep the two in step if that default moves.
+DEFAULT_PORT_WIDTH = 64
 # Word-bounded on purpose: a bare "prove" substring also matches `approve`,
 # `improve` and `prover`, and a run block that merely says "improve the fixture"
 # is not a binder. A shell comment inside a run block still counts -- treating a
@@ -351,14 +354,36 @@ def _order_finding(where: str, node: dict) -> str | None:
 def check_ports() -> int:
     errors: list[str] = []
     bands: dict[str, str] = {}  # port value -> "file:job" that claimed it
+    # (first, last, where, width-was-declared) for the overlap check
+    spans: list[tuple[int, int, str, bool]] = []
 
     for path in workflows():
         doc = load(path)
         for job, node in jobs(doc):
             body = _body(node)
             declared = re.search(r"(?m)^\s*TEST_BASE_PORT:\s*[\"']?(\d+)", body)
+            width_m = re.search(r"(?m)^\s*TEST_PORT_WIDTH:\s*[\"']?(\d+)", body)
             starts_runtime = RUNTIME_DRIVER in body
             where = f"{path.name}:{job}"
+
+            # A port sweep must be scoped to the job's OWN band. A literal
+            # range sweeps across every sibling's band, and `fuser -k` is
+            # PID-blind: it TERMs a healthy listener belonging to a job that
+            # merely happens to share the runner. That surfaces as a
+            # connection-refused flake in the victim, which is diagnosed as
+            # test flakiness rather than as another job's cleanup step.
+            # _body() is the SERIALISED node: newlines are the two characters
+            # \n and quotes come through backslash-escaped, so this cannot be
+            # anchored with ^ or matched against a bare `"`.
+            for literal in re.findall(r"for\s+p\s+in\s+\$\(seq\s+(\S+?)\s", body):
+                if "TEST_BASE_PORT" not in literal:
+                    errors.append(
+                        f"{where} sweeps a literal port range (seq {literal}) "
+                        "-- scope it to this job's own band with "
+                        '`seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + '
+                        "TEST_PORT_WIDTH - 1))`, or it TERMs a sibling job's "
+                        "live listeners"
+                    )
 
             order = _order_finding(where, node)
             if order:
@@ -389,6 +414,38 @@ def check_ports() -> int:
                 )
             else:
                 bands[port] = where
+
+            # Distinct BASES are not disjoint BANDS. The uniqueness check above
+            # compares only the first port of each band, so it cannot see a
+            # band that runs into its neighbour: this module's three bands sit
+            # 32 apart while max-port.sh assumes 64, which had the asan job
+            # verifying 18912-18975 straight across asan-reload's 18944.
+            #
+            # The width is therefore only REQUIRED where the default would
+            # actually overrun. A layout with room to spare (bands 100 apart)
+            # is correct without declaring anything, so demanding it there
+            # would be noise rather than a finding.
+            first = int(port)
+            width = int(width_m.group(1)) if width_m else DEFAULT_PORT_WIDTH
+            last = first + width - 1
+            for o_first, o_last, o_where, o_declared in spans:
+                if first <= o_last and o_first <= last:
+                    culprit = (
+                        f"{where} band {first}-{last} overlaps {o_where} band "
+                        f"{o_first}-{o_last}"
+                    )
+                    if width_m and o_declared:
+                        errors.append(
+                            f"{culprit} -- the sweep and the verifier would "
+                            "both reach into a sibling"
+                        )
+                    else:
+                        errors.append(
+                            f"{culprit}, using the assumed width of "
+                            f"{DEFAULT_PORT_WIDTH} -- declare TEST_PORT_WIDTH "
+                            "on the jobs whose bands sit closer than that"
+                        )
+            spans.append((first, last, where, bool(width_m)))
 
             # A declared band that is not passed through is decoration: the
             # driver still binds its default.

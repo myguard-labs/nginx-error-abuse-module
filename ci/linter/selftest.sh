@@ -112,6 +112,23 @@ policy_ 1 bypass-commented-job-key ports
 # build-test.yml sat in exactly this shape until 2026-08-02.
 policy_ 1 verify-after-bind ports
 
+# A cleanup step that sweeps a literal port range covering a sibling's band.
+# Every band declaration in that fixture is correct, so the declaration,
+# uniqueness, width and overlap checks are all green -- the kill is the defect.
+# CodeRabbit flagged this on PR #19 and the bands added at cp7b did not close
+# it: disjoint bands stop two jobs binding the same port, not one job TERMing
+# across all of them.
+policy_ 1 wide-port-sweep ports
+
+# Two distinct bases 32 apart with no declared width. Uniqueness compares only
+# the first port of each band and passes, while max-port.sh assumes 64 and has
+# the first job verifying 32 ports into the second. This repo's three live
+# bands sat in exactly this shape until 2026-08-04. Pairs with the `clean`
+# fixture above, whose bands are 100 apart and therefore legal WITHOUT a
+# declared width -- without that pair, the red here is equally consistent with
+# "TEST_PORT_WIDTH is now mandatory everywhere".
+policy_ 1 overlapping-port-bands ports
+
 # A mistyped pool label in a schedule-only workflow. The trust half of the
 # runners check does not apply to a workflow no fork can reach, and skipping it
 # used to skip the LABEL membership test with it -- while actionlint, the only

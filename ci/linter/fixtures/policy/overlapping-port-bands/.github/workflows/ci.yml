@@ -1,0 +1,24 @@
+---
+name: ci
+on:
+  pull_request:
+jobs:
+  # Two DISTINCT bases, 32 apart, neither declaring a width. The uniqueness
+  # check passes -- 19200 and 19232 are different values. But max-port.sh
+  # assumes 64, so runtime-a verifies 19200-19263 and rejects on runtime-b's
+  # perfectly healthy listener at 19232.
+  runtime-a:
+    runs-on: ubuntu-latest
+    env:
+      TEST_BASE_PORT: '19200'
+    steps:
+      - run: bash ci/tools/max-port.sh "$TEST_BASE_PORT"
+      - run: python3 ci/tools/test_runtime.py --port "$TEST_BASE_PORT"
+
+  runtime-b:
+    runs-on: ubuntu-latest
+    env:
+      TEST_BASE_PORT: '19232'
+    steps:
+      - run: bash ci/tools/max-port.sh "$TEST_BASE_PORT"
+      - run: python3 ci/tools/test_runtime.py --port "$TEST_BASE_PORT"
