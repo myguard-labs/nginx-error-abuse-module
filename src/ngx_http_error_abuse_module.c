@@ -1244,6 +1244,35 @@ ngx_http_error_abuse_parse_seconds(u_char *data, size_t len, time_t *out)
     return NGX_OK;
 }
 
+/*
+ * F-4: invalid/duplicate error_abuse_zone and error_abuse_redis parameters
+ * are echoed verbatim into the error log for debuggability. That is fine for
+ * ordinary options but persist_secret=<hex> and password=<...> carry secret
+ * material, so an invalid or duplicated occurrence of either must never put
+ * the value itself in the log. Return only the option name (the part before
+ * "=", or the whole token if there is no "=") for those two; every other
+ * parameter is returned unchanged so its full value still prints.
+ */
+static ngx_str_t
+ngx_http_error_abuse_log_safe_param(ngx_str_t *param)
+{
+    static ngx_str_t  persist_secret_name =
+                           ngx_string("persist_secret=<redacted>");
+    static ngx_str_t  password_name = ngx_string("password=<redacted>");
+
+    if (param->len >= 15
+        && ngx_strncmp(param->data, "persist_secret=", 15) == 0)
+    {
+        return persist_secret_name;
+    }
+
+    if (param->len >= 9 && ngx_strncmp(param->data, "password=", 9) == 0) {
+        return password_name;
+    }
+
+    return *param;
+}
+
 static char *
 ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -1597,15 +1626,21 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 
 invalid:
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "invalid error_abuse_zone parameter \"%V\"",
-                       &value[i]);
+    {
+        ngx_str_t safe = ngx_http_error_abuse_log_safe_param(&value[i]);
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid error_abuse_zone parameter \"%V\"",
+                           &safe);
+    }
     return NGX_CONF_ERROR;
 
 duplicate:
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "duplicate error_abuse_zone parameter \"%V\"",
-                       &value[i]);
+    {
+        ngx_str_t safe = ngx_http_error_abuse_log_safe_param(&value[i]);
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate error_abuse_zone parameter \"%V\"",
+                           &safe);
+    }
     return NGX_CONF_ERROR;
 }
 
@@ -1982,15 +2017,21 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 
 invalid:
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "invalid error_abuse_redis parameter \"%V\"",
-                       &value[i]);
+    {
+        ngx_str_t safe = ngx_http_error_abuse_log_safe_param(&value[i]);
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid error_abuse_redis parameter \"%V\"",
+                           &safe);
+    }
     return NGX_CONF_ERROR;
 
 duplicate:
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "duplicate error_abuse_redis parameter \"%V\"",
-                       &value[i]);
+    {
+        ngx_str_t safe = ngx_http_error_abuse_log_safe_param(&value[i]);
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "duplicate error_abuse_redis parameter \"%V\"",
+                           &safe);
+    }
     return NGX_CONF_ERROR;
 }
 
