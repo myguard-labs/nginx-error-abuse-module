@@ -34,9 +34,17 @@ jobs:
     name: ASan and UBSan
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 30
+    env:
+      # Own band, disjoint from build-test.yml:runtime and this file's
+      # asan-reload job -- all three can land on the same self-hosted runner
+      # with no concurrency group serialising them (lint-ci-ports.sh gates on
+      # this; see build-test.yml:runtime for the sibling band).
+      TEST_BASE_PORT: "18912"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -68,12 +76,16 @@ jobs:
           done
           sleep 1
 
+      - name: Verify test port band is free
+        run: bash ci/tools/max-port.sh "$TEST_BASE_PORT"
+
       - name: Run runtime suite under ASan and UBSan
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           python3 ci/tools/test_runtime.py \
+            --port "$TEST_BASE_PORT" \
             --single-process \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}-asan/objs/nginx"
@@ -82,9 +94,15 @@ jobs:
     name: ASan multi-worker + reload
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 30
+    env:
+      # Own band -- see the asan job above and build-test.yml:runtime for the
+      # sibling bands this must stay disjoint from.
+      TEST_BASE_PORT: "18944"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -120,11 +138,15 @@ jobs:
           done
           sleep 1
 
+      - name: Verify test port band is free
+        run: bash ci/tools/max-port.sh "$TEST_BASE_PORT"
+
       - name: Run multi-worker suite under ASan and UBSan
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           python3 ci/tools/test_runtime.py \
+            --port "$TEST_BASE_PORT" \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}-asan/objs/nginx"

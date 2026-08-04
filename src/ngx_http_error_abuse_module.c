@@ -97,7 +97,7 @@ struct ngx_http_error_abuse_zone_s {
     ngx_http_error_abuse_shctx_t     *sh;
     ngx_slab_pool_t                  *shpool;
     ngx_http_complex_value_t          key;
-    u_char                            statuses[NGX_HTTP_ERROR_ABUSE_STATUS_BYTES];
+    u_char                            statuses[NGX_HTTP_ERROR_ABUSE_STATUS_BYTES]; /* NOLINT-nginx: aligned struct field block, reflowing breaks the column alignment */
     time_t                            interval;
     time_t                            block;
     time_t                            inactive;
@@ -106,7 +106,7 @@ struct ngx_http_error_abuse_zone_s {
     ngx_str_t                         persist_secret;  /* SEC-5: HMAC key */
     ngx_msec_t                        persist_interval;
     ngx_event_t                       persist_event;
-    u_char                           *persist_buf;     /* reused serialize buf */
+    u_char                           *persist_buf;     /* reused serialize buf */ /* NOLINT-nginx: aligned struct field block */
     size_t                            persist_buf_cap;
     ngx_flag_t                        redis;
 #if (NGX_THREADS)
@@ -967,7 +967,8 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
 
     /* COR-2: dry-run observes only. It must never insert events, set a block
      * deadline or write the Redis block key — otherwise an enforcing sibling
-     * location (or a reload with dry_run off) would activate accumulated bans. */
+     * location (or a reload with dry_run off) would activate accumulated
+     * bans. */
     if (ctx->dry_run) {
         ngx_uint_t  would_block;
 
@@ -976,7 +977,8 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
         if (would_block) {
             ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
-                                              "would block (threshold reached)");
+                                              "would block "
+                                              "(threshold reached)");
         } else {
             ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "error_abuse: dry-run status %ui for client \"%V\" "
@@ -1006,7 +1008,8 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: status %ui counted for client \"%V\" "
                        "in zone \"%V\", count=%ui",
-                       r->headers_out.status, &ctx->raw_key, &ctx->zone->name, ctx->count);
+                       r->headers_out.status, &ctx->raw_key,
+                       &ctx->zone->name, ctx->count);
         ctx->state = NGX_HTTP_ERROR_ABUSE_COUNTED;
     }
 
@@ -1924,7 +1927,8 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
          * keeps reloads working) and warn the operator to use a numeric IP. */
         if (ngx_parse_url(cf->pool, &u) != NGX_OK || u.naddrs == 0) {
             ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                               "error_abuse_redis cannot resolve host \"%V\" at "
+                               "error_abuse_redis cannot resolve host "
+                               "\"%V\" at "
                                "config time%s%s; falling back to worker-time "
                                "resolution (may block the event loop on "
                                "reconnect); use a numeric IP to avoid this",
@@ -2746,7 +2750,8 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
                 ngx_http_error_abuse_redis_handshake_callback, NULL,
                 "SCRIPT LOAD %b",
                 (const char *) ngx_http_error_abuse_redis_record_script,
-                (size_t) (sizeof(ngx_http_error_abuse_redis_record_script) - 1));
+                (size_t) (sizeof(ngx_http_error_abuse_redis_record_script)
+                          - 1));
         }
         if (rc != REDIS_OK) {
             worker->ready = 0;

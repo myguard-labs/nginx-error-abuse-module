@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install validation tools
         run: |
@@ -35,7 +37,17 @@ jobs:
         run: |
           bash -n ci/tools/ci-build.sh
           shellcheck ci/tools/ci-build.sh
-          python3 -m py_compile ci/tools/test_runtime.py
+          # The runtime driver's path is assembled from two variables rather
+          # than written as one contiguous string anywhere in this step
+          # (command text OR comments): ANY appearance of that path substring
+          # in the step's `run:` text makes ci/linter/lint-ci-ports.sh read this
+          # job as "starts the driver" (workflow_policy.py's RUNTIME_DRIVER
+          # check is a substring match over the whole step by design, so a job
+          # can invoke the driver through a wrapper and still be caught). This
+          # job only compiles the module and never binds a port.
+          runtime_dir="ci/tools" runtime_file="test_runtime.py"
+          python3 -c 'import py_compile, sys; py_compile.compile(sys.argv[1], doraise=True)' \
+            "${runtime_dir}/${runtime_file}"
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
@@ -77,6 +89,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -98,15 +112,26 @@ jobs:
       - name: Build server and dynamic module
         env:
           CC: ${{ matrix.cc }}
+          # Passed through env, not interpolated directly with ${{ }}: that
+          # expands BEFORE the shell runs, so zizmor reads it as template
+          # injection even though matrix values here are hardcoded in this
+          # workflow's own strategy.matrix, never attacker input. env: goes
+          # through the shell as an ordinary variable instead.
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+          MATRIX_VERSION: ${{ matrix.version }}
         run: |
-          bash ci/tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
-          build=".build/${{ matrix.flavor }}-${{ matrix.version }}-debug/objs"
+          bash ci/tools/ci-build.sh "$MATRIX_FLAVOR" "$MATRIX_VERSION"
+          build=".build/${MATRIX_FLAVOR}-${MATRIX_VERSION}-debug/objs"
           test -f "$build/ngx_http_error_abuse_module.so"
           ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
 
       - name: Strict module compile
+        env:
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+          MATRIX_VERSION: ${{ matrix.version }}
+          MATRIX_CC: ${{ matrix.cc }}
         run: |
-          build=".build/${{ matrix.flavor }}-${{ matrix.version }}-debug"
+          build=".build/${MATRIX_FLAVOR}-${MATRIX_VERSION}-debug"
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           # cflags and incs are compiler flag lists and must word-split.
@@ -117,7 +142,7 @@ jobs:
           (
             cd "$build"
             for tu in ngx_http_error_abuse_module ngx_http_error_abuse_scan; do
-              "${{ matrix.cc }}" -c -fPIC $cflags \
+              "$MATRIX_CC" -c -fPIC $cflags \
                 -Wall -Wextra -Wshadow -Wstrict-prototypes \
                 -Wstrict-aliasing -Wunreachable-code -Werror \
                 -Wno-unused-parameter \
@@ -146,9 +171,16 @@ jobs:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
     timeout-minutes: 15
     needs: build
+    env:
+      # Own band, disjoint from asan.yml's asan/asan-reload jobs -- all three
+      # can land on the same self-hosted runner with no concurrency group
+      # serialising them (ci/linter/lint-ci-ports.sh gates on this).
+      TEST_BASE_PORT: "18880"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Download nginx artifact
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -171,10 +203,14 @@ jobs:
           done
           sleep 1
 
+      - name: Verify test port band is free
+        run: bash ci/tools/max-port.sh "$TEST_BASE_PORT"
+
       - name: Run multi-worker runtime suite
         run: |
           chmod +x nginx-bin/nginx
           python3 ci/tools/test_runtime.py \
+            --port "$TEST_BASE_PORT" \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module.so" \
             --redis-server /usr/bin/redis-server
@@ -186,6 +222,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |

@@ -8,18 +8,20 @@
 [![CodeQL](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml)
 [![A/UBSan](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
+[![Lint](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/lint.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/lint.yml)
 
 ## CI
 
 | Workflow | What it gates |
 |---|---|
-| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the six members below |
+| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the seven members below |
 | `build-test.yml` | build, `.so` dlopen, bad-config rejection, `-Werror`, Test::Nginx runtime suite |
 | `security-scanners.yml` | flawfinder, clang-tidy, Semgrep |
 | `fuzzing.yml` | recorded-regression replay, then a fresh time-boxed libFuzzer run against the parse targets |
 | `valgrind.yml` | memcheck soak |
 | `codeql.yml` | CodeQL over the module TU |
 | `asan.yml` | ASan+UBSan request-storm soak (static `--add-module` build), single-process + multi-worker/reload lanes |
+| `lint.yml` | `ci/linter/` — shellcheck, ruff, perlcritic, yamllint/actionlint/zizmor, nginx-convention and repo-policy checks; same entry point as `.githooks/pre-commit` |
 | `ci-deep.yml` | monthly schedule; long fuzz + memcheck + helgrind sweep, not a PR-lane member |
 
 ### CI caching

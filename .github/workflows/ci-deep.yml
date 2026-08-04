@@ -49,6 +49,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install clang + libFuzzer
         run: |
@@ -84,9 +86,17 @@ jobs:
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Select fuzz duration
+        # The input is passed through env, not interpolated directly into the
+        # run: block -- zizmor's template-injection audit flags the latter
+        # because ${{ }} expands BEFORE the shell runs, so an attacker-supplied
+        # value becomes shell syntax rather than a string. env: assignment goes
+        # through the shell as a normal variable instead.
+        env:
+          FUZZ_SECONDS_INPUT: ${{ github.event.inputs.fuzz_seconds }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "FUZZ_SECS=${{ github.event.inputs.fuzz_seconds }}" >> "$GITHUB_ENV"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "FUZZ_SECS=${FUZZ_SECONDS_INPUT}" >> "$GITHUB_ENV"
           else
             echo "FUZZ_SECS=3600" >> "$GITHUB_ENV"
           fi
@@ -138,12 +148,14 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / fuzz FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 ${REPO} — CI Deep / fuzz FAILED. ${RUN_URL}\"}" || true
 
   memcheck:
     name: Valgrind Memcheck soak
@@ -152,6 +164,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Resolve latest mainline nginx
         run: |
           set -euo pipefail
@@ -189,12 +203,14 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / memcheck FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 ${REPO} — CI Deep / memcheck FAILED. ${RUN_URL}\"}" || true
 
   helgrind:
     name: Valgrind Helgrind soak
@@ -203,6 +219,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Resolve latest mainline nginx
         run: |
           set -euo pipefail
@@ -240,12 +258,14 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / helgrind FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"content\":\"🔴 ${REPO} — CI Deep / helgrind FAILED. ${RUN_URL}\"}" || true
 
   scanners:
     name: Security scanners
@@ -254,6 +274,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
