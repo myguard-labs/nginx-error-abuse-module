@@ -1,4 +1,3 @@
-# sync-sha: b8deb92e1b165b085953273cdbf0b646998cf3dd502d97553892a8704a5c4257
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on the status-list
@@ -71,6 +70,11 @@ jobs:
       # run. libFuzzer treats a file argument (not a corpus dir) as a
       # one-shot replay, so a returning crash aborts here in seconds instead
       # of waiting on the 120s fresh budget below.
+      #
+      # Each fixture is dispatched to its target based on the filename prefix:
+      # snapshot-*.bin runs through fuzz_snapshot, statuses-*.bin through
+      # fuzz_statuses. A fixture with no recognized prefix causes the step
+      # to exit non-zero and fail the gate (no silent skip).
       - name: Replay regression corpus
         run: |
           set -euo pipefail
@@ -83,8 +87,19 @@ jobs:
           fi
           fail=0
           for f in "${files[@]}"; do
+            filename=$(basename "$f")
+            bin=""
+            if [[ "$filename" == snapshot-* ]]; then
+              bin="./fuzz_snapshot"
+            elif [[ "$filename" == statuses-* ]]; then
+              bin="./fuzz_statuses"
+            else
+              echo "❌ fixture has no recognized prefix (snapshot-* or statuses-*): $f"
+              fail=1
+              continue
+            fi
             echo "=== replay $f ==="
-            if ! ./fuzz_snapshot "$f"; then
+            if ! "$bin" "$f"; then
               echo "❌ regression returned: $f"
               fail=1
             fi
@@ -119,3 +134,4 @@ jobs:
           name: fuzz-fast-crashes
           path: ${{ github.workspace }}/ci/fuzz/crash-*
           retention-days: 14
+# sync-sha: 681df52a5e76aee67a503f257863060d1170373a6722a348b8cd6ce0346cc881
