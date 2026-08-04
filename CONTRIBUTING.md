@@ -25,10 +25,36 @@ this code started by not knowing nginx internals either.
 - [ ] Commit messages: imperative subject, body explains *why*.
       No AI co-author trailers.
 
+## Run the linters before you push
+
+This repo ships its own linter gate in `ci/linter/`, and the same entry point
+runs as a git hook. Turn it on once, in your clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+That gives you a pre-commit run over the files you staged — about half a second
+in practice, and it checks its own budget against `/proc/loadavg` before doing
+anything expensive. To run the whole tree by hand:
+
+```sh
+bash ci/linter/run-all.sh
+```
+
+One wrinkle worth knowing, because it produces a clean run that proves nothing:
+`run-all.sh` reads `git ls-files`, so a **file you have not staged yet is
+invisible to it**. `git add` first, then trust the result.
+
+The hook is not a substitute for CI, and skipping it is not a crime — the
+`lint` workflow runs the same checkers on your PR. It just means you find out
+in seconds instead of minutes.
+
 ## How CI works here
 
-Every push and every PR runs four short gates. They exist to catch the
-classes of bugs that C code in a web server cannot afford:
+Every push and every PR runs through a single entry point, `ci.yml`, which
+calls seven member workflows. They exist to catch the classes of bugs that C
+code in a web server cannot afford:
 
 - **Build & Test** — builds the module against current nginx (and, where
   applicable, Angie) and runs the unit tests under **ASan/UBSan**.
@@ -47,12 +73,20 @@ classes of bugs that C code in a web server cannot afford:
 - **Valgrind** (`valgrind.yml`) — a short Memcheck soak. Valgrind executes
   the code in an emulated CPU and reports every invalid read/write and
   every leaked byte.
+- **ASan/UBSan** (`asan.yml`) — the sanitizer soak, including a multi-worker
+  reload cycle. One thing to know rather than learn the hard way: ASan does
+  **not** see small overruns of nginx pool (`ngx_pnalloc`) or shm slab
+  allocations, because those are carved out of a larger block and land in
+  slack rather than a redzone. A green ASan run is not proof your pool
+  arithmetic is in bounds — write the unit assertion.
+- **CodeQL** (`codeql.yml`) — semantic analysis over a traced build.
+- **Lint** (`lint.yml`) — the same `ci/linter/` checkers as your hook.
 
 The expensive versions of these — hours-long fuzzing per target, full
 Memcheck **and** Helgrind (thread-race detection) soaks — run monthly and
-on manual dispatch in `ci-deep.yml`, not on your PR. Some modules also run
-an extra runtime test suite; check the repo's `.github/workflows/` and the
-badges at the top of the README for the exact set.
+on manual dispatch in `ci-deep.yml`, not on your PR. The README's `## CI`
+table lists the full set and stays in sync with `.github/workflows/`; a
+linter check fails the build if it drifts.
 
 Your PR merges when **all** checks are green. If a gate fails and you
 believe the gate is wrong, say so in the PR — with evidence, not vibes.
