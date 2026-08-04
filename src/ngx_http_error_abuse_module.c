@@ -2409,15 +2409,15 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
      * synchronously from inside run_phases() -- including via
      * ngx_http_terminate_request(), which closes the request UNCONDITIONALLY
      * (it does not consult r->main->count, so holding an extra reference
-     * does not protect against it). That means `r` and its connection may be
-     * fully freed by the time run_phases() returns, so nothing after that
-     * call may touch `r` -- only the already-captured `c`. This mirrors
-     * nginx's own ngx_http_request_handler(): resume the phase chain first
-     * (its write_event_handler(r) call), THEN run posted requests via the
-     * pre-captured connection, last. Release our park reference before
-     * resuming phases, same as ngx_http_finalize_request(r, NGX_DECLINED)
-     * does for its own NGX_AGAIN resume (run_phases is its last statement,
-     * nothing after it touches r either). */
+     * does not protect it). `r` and its connection may therefore be fully
+     * freed by the time run_phases() returns, so nothing after that call may
+     * touch `r` -- only the already-captured `c`. Release our park
+     * reference and resume phases in that order, same as
+     * ngx_http_finalize_request(r, NGX_DECLINED) resuming its own NGX_AGAIN:
+     * ngx_http_core_run_phases(r) is its last statement, nothing after it
+     * touches r either. run_posted_requests(c) then runs LAST, off the
+     * pre-captured connection, the same way ngx_http_request_handler() calls
+     * it after its event handler, never re-touching r itself. */
     ngx_http_finalize_request(r, NGX_DONE);
     ngx_http_core_run_phases(r);
     ngx_http_run_posted_requests(c);
