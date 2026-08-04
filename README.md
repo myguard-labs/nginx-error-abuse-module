@@ -49,8 +49,15 @@ mechanism, not a promised CI time):
 nginx's `configure` ignores a bare `CC=`, so ccache is wired through the
 `--with-cc="ccache $BASE_CC"` argument instead. Verified by measurement, not by
 reading the log: with the build tree removed and ccache warm, a rebuild reports
-**132/132 hits (100.0%)**. A 0% rate on a second identical run is the signature
-of ccache not being wired through configure at all.
+**132/132 hits (100.0%)**. Under those same conditions (warm cache, build tree
+removed, unchanged compiler and flags) a 0% rate means ccache is not wired
+through configure at all. A cold cache, a changed `CC_OPT`/`LD_OPT`, or a
+different `CCACHE_DIR` also produce 0% for their own reasons, so rule those out
+before reading it as a wiring fault.
+
+Note that `ci/tools/ci-build.sh` sets `CCACHE_DIR=$HOME/.cache/ccache`; a bare
+`ccache --show-stats` reads `$HOME/.ccache` instead and reports a different
+cache. Export `CCACHE_DIR` before checking these numbers by hand.
 
 The honest win here is the warm no-op case, not a claimed multi-minute save —
 this module's from-scratch build is already only a few seconds on a fast
