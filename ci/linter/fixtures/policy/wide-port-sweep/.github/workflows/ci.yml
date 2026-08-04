@@ -1,0 +1,30 @@
+---
+name: ci
+on:
+  pull_request:
+jobs:
+  # Two adjacent bands, each correctly declared, so nothing here trips the
+  # band checks. The defect is the sweep: a literal range that covers BOTH
+  # bands. `fuser -k` is PID-blind, so this job TERMs the sibling's listeners
+  # while the sibling is mid-run.
+  runtime-a:
+    runs-on: ubuntu-latest
+    env:
+      TEST_BASE_PORT: '19200'
+      TEST_PORT_WIDTH: '32'
+    steps:
+      - run: bash ci/tools/max-port.sh "$TEST_BASE_PORT"
+      - run: |
+          for p in $(seq 19200 19263); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+      - run: python3 ci/tools/test_runtime.py --port "$TEST_BASE_PORT"
+
+  runtime-b:
+    runs-on: ubuntu-latest
+    env:
+      TEST_BASE_PORT: '19232'
+      TEST_PORT_WIDTH: '32'
+    steps:
+      - run: bash ci/tools/max-port.sh "$TEST_BASE_PORT"
+      - run: python3 ci/tools/test_runtime.py --port "$TEST_BASE_PORT"
