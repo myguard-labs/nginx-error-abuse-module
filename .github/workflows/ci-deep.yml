@@ -1,4 +1,3 @@
-# sync-sha: 12ac2d90ccf325046ad1fe777c49e2a6bc0a2567c3a5c6652fb04d0ace7ed76c
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -359,8 +358,21 @@ jobs:
             -- $INCLUDES $(pkg-config --cflags hiredis 2>/dev/null) \
             2>&1 | tee clang-tidy.log
       - name: semgrep
+        # --jobs=1 --metrics=off: a correctness fix, not a speed one. semgrep-core
+        # opens one io_uring ring per OCaml domain against this host's 8 MB
+        # RLIMIT_MEMLOCK, shared with every other job on builder02; a busy box
+        # aborts with `Unix_error: Cannot allocate memory io_uring_queue_init`,
+        # exit 2 -- a red gate caused by a neighbouring job, not this diff. See
+        # ci/linter/lint-c.sh and security-scanners.yml, which carry the same two
+        # flags for the identical reason and must stay in sync with this step.
+        #
+        # Kept as `|| true` deliberately: this step is a REPORT, not a gate --
+        # unlike flawfinder and clang-tidy above, nothing here fails the job on
+        # a semgrep finding. Promoting it to a gate needs a red-then-green proof
+        # first (worker-contract "protect gates").
         run: |
           semgrep scan --config p/c --config p/security-audit \
+            --jobs=1 --metrics=off \
             "$GITHUB_WORKSPACE"/src/ngx_http_error_abuse_*.c 2>&1 | tee semgrep.log || true
       - name: Upload reports
         if: always()
@@ -372,3 +384,4 @@ jobs:
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
+# sync-sha: 06f0a816aa7af7368ad4fe68cf747d6b44ac95818c6388c87641a160259329d0
