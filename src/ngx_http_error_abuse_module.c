@@ -864,13 +864,21 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     }
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_error_abuse_module);
-    if (!conf->enabled || conf->zone == NULL) {
-        return NGX_DECLINED;
-    }
 
+    /* F-2: nginx re-runs preaccess for the destination location after an
+     * internal redirect zeroes r->ctx (URI error_page target and
+     * named-location target both do this). prepare_ctx() itself restores the
+     * ORIGIN ctx from the durable r->cleanup anchor when r->ctx is empty,
+     * regardless of the destination's enabled/zone gate -- an "error_abuse
+     * off" or differently-zoned destination must not skip enforcement the
+     * origin already earned. Call it unconditionally here (it is a no-op
+     * returning the existing ctx when one is already set) so the anchor gets
+     * a chance to fire even when THIS location is disabled or unzoned. */
     ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
     if (ctx == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        /* No anchored ctx and this location is disabled/unzoned: the
+         * genuinely-off case, not an error. */
+        return NGX_DECLINED;
     }
 
     if (ctx->zone == NULL) {
