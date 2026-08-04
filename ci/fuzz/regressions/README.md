@@ -8,19 +8,27 @@ must fail in seconds, not after the fresh-run budget.
 
 ## Naming
 
-`<bug-slug>.bin`, named for the defect it reproduces — not the date or a hash.
+`<target>-<bug-slug>.bin`, prefixed with the fuzz target it should run against:
+- `snapshot-*` for fixtures replayed through `fuzz_snapshot`
+- `statuses-*` for fixtures replayed through `fuzz_statuses`
+
+The `<bug-slug>` portion names the defect it reproduces — not the date or a hash.
+A fixture matching no known prefix (`snapshot-`, `statuses-`) must FAIL the replay
+step loudly, never be silently skipped.
 
 ## Contract
 
 - Every file here must be **clean** (no crash, no ASan/UBSan report) against
-  the current, unmutated `ngx_http_error_abuse_validate_snapshot()`. A file
-  that crashes production code belongs in `ci/fuzz/corpus/` as a seed for
-  discovery, not here — this directory is a negative-control replay set.
+  the current, unmutated target function it is destined for. A file that crashes
+  production code belongs in `ci/fuzz/corpus/` as a seed for discovery, not here
+  — this directory is a negative-control replay set.
 - Adding a file here after a real crash requires the minimized reproducer
   (`libFuzzer -minimize_crash=1`), not the raw fuzzer-generated blob.
-- `fuzzing.yml`'s replay step runs every file in this directory through
-  `fuzz_snapshot -runs=1 <file>` before the fresh 120s run. A regression here
-  that starts crashing again fails the PR gate in seconds.
+- `fuzzing.yml`'s replay step dispatches each file to its declared target binary
+  based on the filename prefix (e.g., `snapshot-*.bin` runs through `fuzz_snapshot`,
+  `statuses-*.bin` through `fuzz_statuses`). A fixture with no matching prefix
+  causes the replay step to exit non-zero and fail the gate. A regression that
+  starts crashing again fails the PR gate in seconds.
 
 ## Provenance of the current set
 
@@ -36,7 +44,7 @@ observes the intermediate out-of-bounds read directly. cp6 verified each
 mutation is caught, then reverted it — evidence below and in
 `memory/labs/nginx-error-abuse-module/lessons.md`.
 
-- **`record-length-bound-exact.bin`** — three records: one full valid
+- **`snapshot-record-length-bound-exact.bin`** — three records: one full valid
   record, then a second record whose remaining buffer is exactly
   `NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN - 1` (19) bytes, with header bytes that
   parse as a *valid* key_len/event_count. Weakening the guard at
@@ -48,7 +56,7 @@ mutation is caught, then reverted it — evidence below and in
   - 1` reproduces `heap-buffer-overflow ... ngx_http_error_abuse_get_u16` at
   `ngx_http_error_abuse_scan.c:56`; mutation reverted after confirmation.
 
-- **`payload-overrun-bound-exact.bin`** — two records: the first declares
+- **`snapshot-payload-overrun-bound-exact.bin`** — two records: the first declares
   `key_len=32, event_count=1` (a 40-byte payload) but only 5 payload bytes are
   actually present in the buffer. Deleting the guard at
   `(last - p) < payload` lets `p += payload` overshoot `last` by 35 bytes;
