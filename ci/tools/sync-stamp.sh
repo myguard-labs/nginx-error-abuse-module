@@ -43,16 +43,27 @@ MODE=stamp
 case "${1:-}" in
     --check) MODE=check ;;
     --list)  MODE=list ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    # Anchor to the end of the header block, not a line number: any edit to the
+    # comments above would otherwise silently truncate this output.
+    -h|--help) sed -n '2,/^set -/{/^set -/!p;}' "$0"; exit 0 ;;
     "") ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
 esac
 
 # NUL-delimited: paths with spaces must not split. -print0/-d '' throughout.
+#
+# Sorted, and both YAML spellings. `--list` is documented above as a two-repo
+# diff, so the order must not depend on directory order -- two checkouts holding
+# identical files would otherwise produce a diff made entirely of moved lines.
+# GitHub honours .yml and .yaml alike; matching only one lets a file be added
+# under the other spelling and never enter the gate.
+# Prints the NUL-delimited list on stdout, non-zero if any find failed. The
+# caller redirects this to a file rather than capturing it: a command
+# substitution would strip the NUL bytes that keep the paths apart.
 targets() {
-    find .github/workflows -maxdepth 1 -name '*.yml' -print0
-    find .github/scripts    -maxdepth 1 -name '*.sh'  -print0
-    find .github/actions    -name 'action.yml'        -print0
+    find .github/workflows -maxdepth 1 \( -name '*.yml' -o -name '*.yaml' \) -print0 &&
+    find .github/scripts   -maxdepth 1 -name '*.sh' -print0 &&
+    find .github/actions    \( -name 'action.yml' -o -name 'action.yaml' \) -print0
 }
 
 # The digest of a file with its own stamp line stripped -- see THE
@@ -63,6 +74,14 @@ content_sha() {
 
 stamp_of() {
     sed -n 's/^# sync-sha: \([0-9a-f]\{64\}\)$/\1/p' -- "$1" | head -1
+}
+
+# A file must carry exactly one stamp. content_sha() strips EVERY stamp line
+# while stamp_of() reads only the first, so a second line -- appended by a bad
+# merge, or injected to launder an edit past the gate -- is invisible to both
+# and --check would pass. Count them separately and reject more than one.
+stamp_count() {
+    grep -c '^# sync-sha: ' -- "$1" || true
 }
 
 # Insert the stamp as a LONE line, adding no blank line of its own.
@@ -79,24 +98,46 @@ stamp_of() {
 # files start with `name:` and their comments come after it, so there is no
 # single header shape to aim for, and the top is unambiguous for a reader
 # looking to compare two repos' copies.
+# Any existing stamp is dropped in the same awk pass, so re-stamping cannot
+# accumulate lines and the strip filter is expressed in exactly one place.
 insert_stamp() {
     local f="$1" sha="$2" tmp
     tmp="$(mktemp)"
+    # RETURN, not EXIT: this runs per file, and an EXIT trap here would replace
+    # the one guarding $raw_list.
+    trap 'rm -f "$tmp"' RETURN
     awk -v sha="$sha" '
+        /^# sync-sha: / { next }
         NR == 1 && /^#!/ { print; print "# sync-sha: " sha; done = 1; next }
         NR == 1 && !done { print "# sync-sha: " sha; done = 1 }
         { print }
         END { if (!done) print "# sync-sha: " sha }
     ' "$f" > "$tmp"
-    # Preserve the mode: .github/scripts/*.sh are executable and a plain mv
-    # from mktemp would drop that to 0600.
-    chmod --reference="$f" "$tmp"
-    mv "$tmp" "$f"
+    # Write back through the original file rather than mv'ing over it: the mode,
+    # owner and inode are kept with no chmod --reference (GNU-only) and no
+    # cross-filesystem mv. .github/scripts/*.sh must stay executable.
+    cat "$tmp" > "$f"
 }
+
+# A process substitution discards the exit status of what runs inside it. With
+# targets() piped straight into the loop, a find that aborts under `set -e`
+# -- a renamed or removed .github/actions, say -- reaches the loop as a plain
+# EOF: the files found BEFORE the failure are checked, `count` is non-zero, and
+# --check reports "all N file(s) current" while silently covering fewer files
+# than it should. Materialising the list first makes that failure catchable.
+raw_list="$(mktemp)"
+trap 'rm -f "$raw_list"' EXIT
+if ! targets > "$raw_list"; then
+    echo "sync-stamp: target discovery failed -- refusing to report a partial result" >&2
+    exit 2
+fi
+
+targets_list=()
+mapfile -t -d '' targets_list < <(LC_ALL=C sort -z -- "$raw_list")
 
 rc=0
 count=0
-while IFS= read -r -d '' f; do
+for f in "${targets_list[@]}"; do
     count=$((count + 1))
     want="$(content_sha "$f")"
     have="$(stamp_of "$f")"
@@ -105,7 +146,11 @@ while IFS= read -r -d '' f; do
             printf '%s\t%s\n' "$f" "$want"
             ;;
         check)
-            if [ -z "$have" ]; then
+            if [ "$(stamp_count "$f")" -gt 1 ]; then
+                echo "DUPLICATE stamp: $f" >&2
+                echo "  a file must carry exactly one # sync-sha: line" >&2
+                rc=1
+            elif [ -z "$have" ]; then
                 echo "MISSING stamp: $f" >&2; rc=1
             elif [ "$have" != "$want" ]; then
                 echo "STALE stamp:   $f" >&2
@@ -115,22 +160,17 @@ while IFS= read -r -d '' f; do
             fi
             ;;
         stamp)
-            if [ "$have" = "$want" ]; then
+            # The stamp_count test matters even when the sha matches: a file
+            # carrying a duplicate line is not correctly stamped, and skipping
+            # it here would leave --check permanently red.
+            if [ "$have" = "$want" ] && [ "$(stamp_count "$f")" -eq 1 ]; then
                 continue
-            fi
-            # Drop any existing stamp before inserting the new one, or
-            # re-stamping accumulates lines.
-            if [ -n "$have" ]; then
-                tmp="$(mktemp)"
-                grep -v '^# sync-sha: ' -- "$f" > "$tmp"
-                chmod --reference="$f" "$tmp"
-                mv "$tmp" "$f"
             fi
             insert_stamp "$f" "$want"
             echo "stamped: $f"
             ;;
     esac
-done < <(targets)
+done
 
 if [ "$count" -eq 0 ]; then
     # A selector that matches nothing must not report success -- that is how a
