@@ -51,9 +51,6 @@
 # touching the scan core or this script: a check that has never failed is not
 # known to be a check.
 #
-#   * status-range floor removed -- change `first < 100 || final < first` to
-#     `final < first` (drop the `first < 100` half of the OOB-write guard)
-#       -> "status 0 alone is rejected (floor)" FAILS.
 #   * status-range ceiling removed -- change
 #     `final > NGX_HTTP_ERROR_ABUSE_MAX_STATUS` to `final > 700`
 #       -> "status 600 alone is rejected (ceiling)" FAILS.
@@ -74,16 +71,21 @@
 #
 # THREE MUTATIONS THAT SURVIVE, recorded so the next person does not mistake
 # any of them for a gap in this file:
-#   * status floor removed -- change `first < 100 || final < first` to
-#     `final < first` (drop the `first < 100` half of the guard). "abc" (which
-#     ngx_atoi() maps to first=final=-1) now passes the range check and enters
-#     the fill loop as `status = (ngx_uint_t) -1`, an enormous unsigned value
-#     -- the process crashes with SIGBUS/SIGSEGV before any check() runs.
-#     run.sh's own exit code still goes non-zero (bash reports the killed
-#     child's signal as the exit status), so the mutation IS caught at the
-#     process level, just not as a clean check() FAIL line. Recorded rather
-#     than "fixed" because turning this into a graceful assertion would mean
-#     pre-validating the exact bug under test, which defeats the point.
+#   * status-range floor removed -- change `first < 100 || final < first` to
+#     `final < first` (drop the `first < 100` half of the guard). Has two
+#     effects depending on input: parse_str("0") fails the check cleanly, so
+#     "status 0 alone is rejected (floor)" (SEEN RED in 2026-08-04 run, test
+#     at ci/tests/unit/test_scan.c:139) runs first and the suite goes red on a
+#     clean check() FAIL; parse_str("abc") yields first=final=-1 from ngx_atoi(),
+#     enters the fill loop as `status = (ngx_uint_t) -1` (enormous unsigned
+#     value), and crashes with SIGBUS/SIGSEGV before any check() runs. The
+#     mutation IS caught, just not as a clean check() FAIL line for the "abc"
+#     case. Recorded rather than "fixed" as a single entry because the suite
+#     exit goes non-zero in both paths (bash reports the killed child's signal as
+#     exit status), and separating them would mean pre-validating the exact bug
+#     under test, which defeats the point. This entry carries both facts because
+#     the next maintainer must trust the ledger and know the suite saw the
+#     `"0"` FAIL-on-check path first.
 #   * record-length bound weakened by 1 -- change
 #     `(last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN` to
 #     `... - 1` in ngx_http_error_abuse_validate_snapshot(). ALL 41 checks stay
