@@ -51,11 +51,22 @@ zone/key handling, error-page/redirect, then persistence.
     ctx->key.data)` to `SHA256(key.data, 1, ctx->key.data)`, so only the
     first raw key byte feeds the identity hash; distinct keys sharing a
     first byte collapse onto one shared node.
-      -> test_on_full_policy(): "/ok?client=fresh-allow" expected 200, got
-         503 (caught incidentally via zone-fill cross-contamination between
-         "fresh-allow" and the fill clients that share a leading byte, not
-         via a case built to isolate key hashing specifically -- see the
-         open follow-up in TODO.md).
+      -> T-1 follow-up: the existing "/key-*" block (client=a / client=b)
+         does NOT catch this mutation -- verified by running it in
+         isolation against the mutated build: it stayed GREEN, because "a"
+         and "b" differ in their FIRST byte, which is exactly the one byte
+         a truncated hash still reads, so truncated hashing still separates
+         them. A dedicated case was added: zone=keyiso, threshold=1, two
+         locations, with client=aaa / client=aab (identical first byte,
+         differ only after it). Isolated against the mutated build this
+         case fails -- "/keyiso-ok?client=aab" expected 200, got 429 (the
+         "aab" identity was wrongly banned by "aaa"'s hit, because the
+         truncated hash collapsed both onto the same node). Reverted and
+         reconfirmed green. This was previously caught only incidentally
+         via test_on_full_policy()'s zone-fill cross-contamination between
+         "fresh-allow" and its fill clients (see TODO.md history) -- that
+         incidental catch still holds, but no longer needs to carry the
+         key-hashing case; T-1 makes it explicit and reachable on its own.
 
   * anchor restore disabled (error-page/redirect) -- in
     ngx_http_error_abuse_prepare_ctx(), change `if (ctx != NULL)` (the F-2
@@ -259,6 +270,8 @@ http {{
                      persist={root}/basic.state persist_interval=100ms;
     error_abuse_zone zone=keyed:1m key={keyed_key}
                      statuses=404 interval=5s threshold=2 block=10s;
+    error_abuse_zone zone=keyiso:1m key=$arg_client
+                     statuses=404 interval=30s threshold=1 block=10s;
     error_abuse_zone zone=dry:1m key=$binary_remote_addr
                      statuses=404 interval=5s threshold=1 block=10s;
     error_abuse_zone zone=dryshared:1m key=$binary_remote_addr
@@ -300,6 +313,15 @@ http {{
         }}
         location = /key-ok {{
             error_abuse zone=keyed status=429;
+            empty_gif;
+        }}
+
+        location = /keyiso-error {{
+            error_abuse zone=keyiso status=429;
+            root {root}/empty;
+        }}
+        location = /keyiso-ok {{
+            error_abuse zone=keyiso status=429;
             empty_gif;
         }}
 
@@ -1685,6 +1707,19 @@ def main() -> int:
             expect(args.port, "/key-error?client=a", 404)
             expect(args.port, "/key-ok?client=a", 429)
             expect(args.port, "/key-ok?client=b", 200)
+
+            # Dedicated per-identity key-hashing isolation case (T-1). The
+            # two client values below differ only AFTER their shared first
+            # byte ("aaa" vs "aab"), so a hash that truncates the key to its
+            # first raw byte (see the key-hashing mutation ledger entry
+            # above) would collapse them onto the same node -- unlike
+            # "a"/"b" above, which differ in the first byte and so still
+            # separate under a truncated hash. threshold=1 means a single
+            # 404 bans that identity immediately: "aaa" must ban while its
+            # sibling "aab" stays unaffected.
+            expect(args.port, "/keyiso-error?client=aaa", 404)
+            expect(args.port, "/keyiso-ok?client=aaa", 429)
+            expect(args.port, "/keyiso-ok?client=aab", 200)
 
             expect(args.port, "/window-error", 404)
             expect(args.port, "/window-error", 404)
