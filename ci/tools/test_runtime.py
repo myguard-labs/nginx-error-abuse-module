@@ -144,25 +144,32 @@ revert, reconfirm green in the same session before moving on.
     u32(buffer + 20) != ngx_crc32_long(p, last - p)` to `0 && (...)`, so a
     snapshot whose payload CRC does not match the header is trusted and
     parsed anyway.
-      -> main(): SURVIVED. The truncation scenario the suite exercises
-         (`state.write_bytes(data[:-1])`, dropping exactly the trailing
-         byte) still recovered correctly with the CRC check disabled,
-         because it hit an independent guard first: shrinking the buffer by
-         one byte shifts `last - p` short of what the still-intact header's
-         record/field-length fields expect, so the mid-parse bounds checks
-         (`(size_t) (last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN` and the
-         per-record key/event-length check right after it) already reject
-         the malformed tail and drop the record -- with or without CRC32.
-         The CRC32 guard is real (it is the only thing that would catch a
-         corruption that flips bytes WITHOUT changing the file's length --
-         e.g. a bit-flip mid-payload that still parses as structurally
-         valid), but this suite's only corruption case is a length
-         truncation, which the bounds checks alone already cover. A case
-         that would actually isolate CRC32 needs to flip a payload byte
-         in-place (same length, same field boundaries) rather than truncate
-         -- analogous to the existing HMAC-tampering case a few lines above
-         (`tampered[-1] ^= 0x01`), but applied to a payload byte instead of
-         the trailing MAC.
+      -> main() (pre-B-3): SURVIVED. The truncation scenario the suite
+         exercised (`state.write_bytes(data[:-1])`, dropping exactly the
+         trailing byte) still recovered correctly with the CRC check
+         disabled, because it hit an independent guard first: shrinking the
+         buffer by one byte shifts `last - p` short of what the still-intact
+         header's record/field-length fields expect, so the mid-parse
+         bounds checks (`(size_t) (last - p) < NGX_HTTP_ERROR_ABUSE_FILE_
+         REC_LEN` and the per-record key/event-length check right after it)
+         already reject the malformed tail and drop the record -- with or
+         without CRC32.
+      -> main() (B-3, added an in-place byte flip): KILLED. Re-banned
+         `persisted.state`, stopped nginx, then flipped one byte inside a
+         record's `blocked_until` field (file offset 24+4+2, same length,
+         same field boundaries -- the value is only ever range-clamped and
+         compared with `>`, never validated against a length or count, so
+         every downstream bounds check still passes). With the CRC32 check
+         live: `/persist-ok` after reload correctly stayed 200 (corrupted
+         snapshot rejected, file deleted, no ban restored). With the CRC32
+         mismatch branch disabled via `if (0 && ...)`, rebuilt
+         (ngx_http_error_abuse_module.so mtime 2026-08-05 03:02:21, 985008
+         bytes) and rerun: `/persist-ok` came back 429 -- the tampered ban
+         was restored. AssertionError: "/persist-ok: expected 200, got 429".
+         SEEN RED. Reverted the `if (0 && ...)`, rebuilt (mtime 03:02:59,
+         985296 bytes, confirming a real second rebuild), reran: green
+         again. `git diff src/` was empty both before the mutation and
+         after the revert.
 
   * $error_abuse_count always zero -- in
     ngx_http_error_abuse_variable_count(), change `ctx ? ctx->count : 0` to
@@ -171,13 +178,12 @@ revert, reconfirm green in the same session before moving on.
          count=1 and got count=0 ("COUNTED expected count=1 until=0:
          ['/var-error', 'COUNTED', '0', '0']"). SEEN RED.
 
-Ledger tally after T-2: 4 SEEN RED (test_redis_multi_host, the short-inactive
+Ledger tally after B-3: 5 SEEN RED (test_redis_multi_host, the short-inactive
 leg of test_invalid_configs, the reload key-change guard, the exposed
-$error_abuse_count variable), 2 SURVIVED (test_redis_auth's AUTH handshake --
-masked by same-node local fallback; the persistence CRC32 corruption check --
-masked by the length-truncation scenario already being caught by bounds
-checks). Every mutation above was reverted; `git diff src/` is empty at the
-end of this ledger's construction.
+$error_abuse_count variable, the persistence CRC32 corruption check once
+isolated with an in-place byte flip), 1 SURVIVED (test_redis_auth's AUTH
+handshake -- masked by same-node local fallback). Every mutation above was
+reverted; `git diff src/` is empty at the end of this ledger's construction.
 """
 
 from __future__ import annotations
@@ -1912,6 +1918,45 @@ def main() -> int:
 
             nginx.start()
             expect(args.port, "/persist-ok", 200)
+            expect(args.port, "/persist-error", 404)
+            expect(args.port, "/persist-error", 404)
+            expect(args.port, "/persist-ok", 200)
+            nginx.stop()
+
+            # CRC32 isolation case (B-3). The truncation case above shrinks the
+            # file, which trips an independent bounds check before CRC32 is
+            # ever consulted (see the mutation ledger entry above) -- it
+            # cannot tell us whether the CRC32 check itself does anything.
+            # Re-ban, persist, then flip one byte of blocked_until IN PLACE
+            # (same file length, same field boundaries, still a value every
+            # bounds/range check downstream accepts -- it is compared with
+            # `>` against `now`, never validated against a length or count).
+            # Only the CRC32 check can now catch the corruption. The reload
+            # above already restored a count=2 state (two 404s counted, none
+            # blocking yet -- the trailing /persist-ok 200 checks did not
+            # reset it), so one more 404 crosses threshold=3.
+            nginx.start()
+            expect(args.port, "/persist-error", 404)
+            expect(args.port, "/persist-ok", 429)
+            time.sleep(0.3)
+            nginx.stop()
+
+            data = bytearray(state.read_bytes())
+            # header(24) + record: key_len(u16) + event_count(u16) +
+            # blocked_until(i64) @ offset 4 within the record -> file offset
+            # 24 + 4 = 28. Flip a low-order byte in the middle of the i64
+            # (offset +2) so the value stays a plausible (still in-the-
+            # future) timestamp rather than flipping sign/magnitude into
+            # something a later stage might reject for an unrelated reason.
+            blocked_until_off = 24 + 4 + 2
+            if len(data) <= blocked_until_off:
+                raise AssertionError("snapshot too small for CRC32 flip case")
+            data[blocked_until_off] ^= 0x01
+            state.write_bytes(bytes(data))
+            os.chmod(state, 0o600)
+
+            nginx.start()
+            expect(args.port, "/persist-ok", 200)  # not restored: CRC32 caught it
             expect(args.port, "/persist-error", 404)
             expect(args.port, "/persist-error", 404)
             expect(args.port, "/persist-ok", 200)
