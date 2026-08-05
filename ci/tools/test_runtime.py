@@ -755,6 +755,23 @@ def test_redis_auth(
 ) -> None:
     # CI-5: password-protected Redis exercises the AUTH handshake (COR-5) and
     # that blocking still works through it.
+    #
+    # B-2: a single node cannot prove AUTH actually ran -- the module's
+    # single-node local-zone fallback enforces blocking entirely in-process
+    # when every Redis command fails with NOAUTH, so a lone `server` making
+    # /redis-ok return 429 is satisfied even with AUTH never sent (proven by
+    # mutating the AUTH send site to `if (0 && worker->conf->password.len)`:
+    # NOAUTH floods error.log but the single-node assertions below still went
+    # green). Mirror test_redis_multi_host: run a SECOND, independent nginx
+    # node against the same authed Redis + prefix. Blocking state can only be
+    # observed on the second node if the first node's requests actually
+    # reached and were recorded in Redis -- the local-zone fallback is
+    # strictly per-process and cannot leak state across two separate nginx
+    # binaries. If AUTH is never sent, every Redis command from both nodes
+    # gets NOAUTH, nothing is ever written to the shared counter, and
+    # `second`'s /redis-ok request observes a fresh (unblocked) identity,
+    # i.e. 200 instead of 429 -- turning the fallback's fail-open behavior
+    # into a hard test failure instead of a silent pass.
     redis_port = nginx_port + 30
     prefix = f"error-abuse-auth-{os.getpid()}-{int(time.time() * 1000)}:"
     redis = RedisServer(
@@ -771,9 +788,21 @@ def test_redis_auth(
         prefix,
         redis_password="s3cr3t-pass",
     )
+    second = Nginx(
+        binary,
+        module,
+        root / "redis-auth-nginx-b",
+        nginx_port + 4,
+        runner,
+        single_process,
+        redis_port,
+        prefix,
+        redis_password="s3cr3t-pass",
+    )
     try:
         redis.start()
         server.start()
+        second.start()
         time.sleep(0.3)
 
         expect(server.port, "/redis-error?client=authed", 404)
@@ -784,10 +813,18 @@ def test_redis_auth(
         time.sleep(0.05)
         expect(server.port, "/redis-ok?client=authed", 429)
 
+        # B-2: the block for "authed" must be visible from the SECOND,
+        # independent node -- only possible if `server`'s three 404s were
+        # actually recorded in the shared, authed Redis instance.
+        expect(second.port, "/redis-ok?client=authed", 429)
+
         server.stop()
         server.assert_clean_logs()
+        second.stop()
+        second.assert_clean_logs()
     finally:
         server.stop()
+        second.stop()
         redis.stop()
 
 
