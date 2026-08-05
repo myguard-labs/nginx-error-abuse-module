@@ -87,18 +87,97 @@ zone/key handling, error-page/redirect, then persistence.
          deliberately bit-flipped HMAC tail was loaded and its ban
          restored, instead of being ignored).
 
-UNMEASURED (not attempted this pass -- time/context budget; see TODO.md for
-the follow-up item): test_redis_multi_host(), test_redis_auth(),
-test_invalid_configs() (config-parser rejection paths), the reload/key-change
-guard ("key cannot change during reload"), the persistence file
-truncation/corruption recovery blocks, the dry-run-does-not-write-state case
-specifically isolated from the error-page-redirect harness (attempted here
-but only reachable through test_error_page_redirect()'s dryorigin location,
-which is documented above under key hashing's caveat), and the
-$error_abuse_status/_count/_blocked_until exposed-variable assertions at the
-end of main(). None of these were built, run, or observed failing in this
-pass -- do not read their absence here as a passing or a survived result,
-they were simply not measured.
+T-2 follow-up (2026-08-05) measured the six areas the pass above left
+UNMEASURED. Same build/run/revert discipline: mutate src/, rebuild, observe,
+revert, reconfirm green in the same session before moving on.
+
+  * shared Redis blocking never applied (test_redis_multi_host()) -- in
+    ngx_http_error_abuse_redis_check_callback(), change `ctx->redis_blocked
+    = 1;` (REDIS_REPLY_STRING branch) to `= 0;`, so a GET that finds an
+    existing block key in Redis is treated as not-blocked.
+      -> test_redis_multi_host(): "/redis-ok?client=shared" (second host,
+         after the first host's two 404s) expected 429, got 200 -- the
+         second nginx instance never saw the block the first instance wrote
+         to the shared Redis backend. SEEN RED.
+
+  * AUTH handshake skipped (test_redis_auth()) -- in
+    ngx_http_error_abuse_redis_connect_callback(), change `if
+    (worker->conf->password.len)` to `if (0 && worker->conf->password.len)`,
+    so the AUTH command is never sent to a password-protected Redis.
+      -> test_redis_auth(): SURVIVED. Confirmed via error.log that the
+         mutation did take effect -- every worker logged "error_abuse: Redis
+         handshake (AUTH/SELECT) failed: NOAUTH Authentication required."
+         (COR-5 failure path), yet all 4 requests still got their expected
+         status (404/404/404/429) and assert_clean_logs() passed. Root
+         cause: test_redis_auth() runs a single nginx instance, so once
+         Redis is unreachable (NOAUTH trips the circuit breaker exactly like
+         a connection failure), the module falls back to the same-node
+         shared-memory zone, which independently enforces threshold=1 --
+         masking whether AUTH ever ran. A case that would actually catch a
+         disabled/broken AUTH handshake needs two nginx instances sharing
+         one Redis (like test_redis_multi_host()'s topology) so only Redis-
+         mediated blocking can make the second instance's request succeed
+         or fail -- local zone enforcement can't cover for a second process.
+
+  * COR-3 inactive-vs-interval/block check disabled (test_invalid_configs())
+    -- in the error_abuse_zone merge validation, change `} else if
+    (zone->inactive < zone->interval || zone->inactive < zone->block) {` to
+    `} else if (0 && (...)) {`, so an explicit inactive shorter than
+    interval/block is accepted instead of rejected.
+      -> test_invalid_configs(): the "short-inactive" case (interval=5m,
+         block=1h, inactive=1s) expected the config to be rejected with
+         "inactive must be >=" and instead got "syntax is ok" /
+         "test is successful". SEEN RED.
+
+  * reload key-change guard disabled -- in
+    ngx_http_error_abuse_init_zone(), change the `if (old->key.value.len !=
+    zone->key.value.len || ngx_strncmp(...) != 0)` key-mismatch check to `if
+    (0 && (...))`, so a reload with a changed zone key is silently accepted
+    instead of rejected.
+      -> main(): after write_config("$binary_remote_addr") followed by
+         reload, error.log was expected to contain "key cannot change
+         during reload" and did not -- the reload was accepted.
+         AssertionError: "reload accepted a changed zone key". SEEN RED.
+
+  * persistence CRC32 corruption check disabled -- in the persistence
+    loader, change the CRC32 mismatch condition's `ngx_http_error_abuse_get_
+    u32(buffer + 20) != ngx_crc32_long(p, last - p)` to `0 && (...)`, so a
+    snapshot whose payload CRC does not match the header is trusted and
+    parsed anyway.
+      -> main(): SURVIVED. The truncation scenario the suite exercises
+         (`state.write_bytes(data[:-1])`, dropping exactly the trailing
+         byte) still recovered correctly with the CRC check disabled,
+         because it hit an independent guard first: shrinking the buffer by
+         one byte shifts `last - p` short of what the still-intact header's
+         record/field-length fields expect, so the mid-parse bounds checks
+         (`(size_t) (last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN` and the
+         per-record key/event-length check right after it) already reject
+         the malformed tail and drop the record -- with or without CRC32.
+         The CRC32 guard is real (it is the only thing that would catch a
+         corruption that flips bytes WITHOUT changing the file's length --
+         e.g. a bit-flip mid-payload that still parses as structurally
+         valid), but this suite's only corruption case is a length
+         truncation, which the bounds checks alone already cover. A case
+         that would actually isolate CRC32 needs to flip a payload byte
+         in-place (same length, same field boundaries) rather than truncate
+         -- analogous to the existing HMAC-tampering case a few lines above
+         (`tampered[-1] ^= 0x01`), but applied to a payload byte instead of
+         the trailing MAC.
+
+  * $error_abuse_count always zero -- in
+    ngx_http_error_abuse_variable_count(), change `ctx ? ctx->count : 0` to
+    always emit 0.
+      -> main(): the exposed-variable block's COUNTED assertion expected
+         count=1 and got count=0 ("COUNTED expected count=1 until=0:
+         ['/var-error', 'COUNTED', '0', '0']"). SEEN RED.
+
+Ledger tally after T-2: 4 SEEN RED (test_redis_multi_host, the short-inactive
+leg of test_invalid_configs, the reload key-change guard, the exposed
+$error_abuse_count variable), 2 SURVIVED (test_redis_auth's AUTH handshake --
+masked by same-node local fallback; the persistence CRC32 corruption check --
+masked by the length-truncation scenario already being caught by bounds
+checks). Every mutation above was reverted; `git diff src/` is empty at the
+end of this ledger's construction.
 """
 
 from __future__ import annotations
