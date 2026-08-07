@@ -117,6 +117,9 @@ BINDERS = (
     re.escape("ci/tools/coverage.sh"),
 )
 BINDER_RE = re.compile("|".join(BINDERS))
+# `prove` alone, for the pass-through check: it is the one binder whose band
+# arrives through an env var (TEST_NGINX_PORT) rather than an argument.
+PROVE_RE = re.compile(r"(?<![\w./-])prove(?![\w./-])")
 
 
 def workflows() -> list[pathlib.Path]:
@@ -457,6 +460,32 @@ def check_ports() -> int:
                             "on the jobs whose bands sit closer than that"
                         )
             spans.append((first, last, where, bool(width_m)))
+
+            # The same requirement for a `prove` binder. Test::Nginx reads
+            # TEST_NGINX_PORT and knows nothing about TEST_BASE_PORT, so a job
+            # can declare a unique band, satisfy every check above, and still
+            # bind 1984. Distinct from the driver case only in which variable
+            # carries the value: there it is an argument, here an env var.
+            if PROVE_RE.search(body):
+                nginx_port = re.search(
+                    r"(?m)^\s*TEST_NGINX_PORT:\s*[\"']?([^\"'\n]+)", body
+                )
+                # Either spelling is correct: an expression referring to the
+                # band, or the literal band value. What matters is that the
+                # number prove binds is the one this job declared -- a
+                # TEST_NGINX_PORT naming some OTHER port is the same defect as
+                # not setting it at all.
+                wired = nginx_port is not None and (
+                    "TEST_BASE_PORT" in nginx_port.group(1)
+                    or nginx_port.group(1).strip() == port
+                )
+                if not wired:
+                    errors.append(
+                        f"{where} declares TEST_BASE_PORT but never passes it "
+                        "to prove as TEST_NGINX_PORT -- Test::Nginx does not "
+                        "read TEST_BASE_PORT, so it would bind its 1984 "
+                        "default anyway"
+                    )
 
             # A declared band that is not passed through is decoration: the
             # driver still binds its default.

@@ -120,6 +120,13 @@ policy_ 1 verify-after-bind ports
 # port bands".
 policy_ 1 prove-only-binder-exempt ports
 
+# ...and the other half of the same rule: a prove job that DOES declare a band
+# but never passes it to Test::Nginx as TEST_NGINX_PORT. Every earlier check
+# passes -- declared, distinct, width fits -- and it still binds 1984. Raised by
+# CodeRabbit on PR #48 against the commit that made prove a first-class binder:
+# widening what must declare a band did not widen what must pass it through.
+policy_ 1 prove-band-not-passed-through ports
+
 # A cleanup step that sweeps a literal port range covering a sibling's band.
 # Every band declaration in that fixture is correct, so the declaration,
 # uniqueness, width and overlap checks are all green -- the kill is the defect.
