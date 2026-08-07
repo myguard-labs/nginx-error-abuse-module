@@ -38,7 +38,10 @@ rule() {
     local name="$1" re="$2" msg="$3" hits
     hits=$(grep -nE "$re" "${FILES[@]}" 2>/dev/null | grep -v 'NOLINT-nginx' || true)
     [ -n "$hits" ] || return 0
-    printf '%s\n' "$hits" | sed "s/^/  /; s/$/    [$name: $msg]/"
+    # $name/$msg are appended by awk, never interpolated into a sed s///
+    # expression: any delimiter chosen there is a character the messages may
+    # not contain, and they already contain both / and (potentially) |.
+    printf '%s\n' "$hits" | awk -v suffix="    [$name: $msg]" '{ print "  " $0 suffix }'
     rc=1
 }
 
