@@ -165,6 +165,11 @@ policy_ 0 schedule-only-runner-labels-ok runners
 policy_ 1 member-with-push cadence
 policy_ 0 member-with-push-ok cadence
 
+# repository_dispatch (and pull_request_target, same class) is per-change like
+# push/pull_request, not human/timer-invoked like schedule/workflow_dispatch.
+policy_ 1 member-with-repository-dispatch cadence
+policy_ 0 member-with-repository-dispatch-ok cadence
+
 # A caller reaching a member with `secrets: inherit` instead of naming what the
 # member needs. `inherit` works -- the pipeline stays green and the member gets
 # its token -- so the only symptom is a blast radius that silently grows every
