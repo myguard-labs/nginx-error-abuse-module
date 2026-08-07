@@ -109,7 +109,7 @@ insert_stamp() {
     awk -v sha="$sha" '
         /^# sync-sha: / { next }
         NR == 1 && /^#!/ { print; print "# sync-sha: " sha; done = 1; next }
-        NR == 1 && !done { print "# sync-sha: " sha; done = 1 }
+        !done { print "# sync-sha: " sha; done = 1 }
         { print }
         END { if (!done) print "# sync-sha: " sha }
     ' "$f" > "$tmp"
