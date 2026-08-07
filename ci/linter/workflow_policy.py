@@ -626,12 +626,13 @@ def check_secrets() -> int:
     (or omitted) `required` restores exactly the silent-empty-string failure
     this check exists to prevent; true makes GitHub refuse to start the call.
 
-    This repo declares no secrets today, and ci.yml's five members all carry
-    `secrets: inherit` (predating this check) with nothing behind it to leak --
-    but that is exactly the defensive-boilerplate shape this check exists to
-    close: the day a real secret is added under `inherit`, every member gets it
-    silently, and nothing here would notice until the audit that introduced
-    this checker is long forgotten.
+    This repo declares no secrets today, so the member half is vacuously green
+    by design. The caller half is live: porting this check found five ci.yml
+    members carrying `secrets: inherit` with nothing behind it to leak, and
+    removing them is part of the same change. That shape is exactly what this
+    check exists to close -- the day a real secret is added under a surviving
+    `inherit`, every member gets it silently, and nothing would notice until
+    the audit that introduced this checker is long forgotten.
     """
     errors: list[str] = []
     declared: dict[str, set[str]] = {}
