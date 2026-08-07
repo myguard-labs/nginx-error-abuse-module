@@ -1,0 +1,10 @@
+name: Build&Test
+on:
+  workflow_call: {}
+  repository_dispatch:
+    types: [run-build-test]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make

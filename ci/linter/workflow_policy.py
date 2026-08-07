@@ -582,13 +582,29 @@ def check_cadence() -> int:
     `schedule:` is explicitly allowed: codeql.yml and ci-deep.yml are reachable
     both from ci.yml and on their own cadence, which is the intended shape and
     not a duplicate run of the same tree.
+
+    The duplicate set is not just `push`/`pull_request`: `pull_request_target`
+    and `repository_dispatch` fire per-change too (an external dispatch, or a
+    bot mirroring the same event that already drives ci.yml), so a member
+    carrying either alongside `workflow_call` runs twice per change on two
+    concurrency keys that cannot cancel each other -- the same shape, just not
+    the trigger PR #48 happened to catch. `workflow_dispatch:` stays allowed:
+    it is human-invoked, not per-change.
     """
     errors: list[str] = []
     for path in workflows():
         trigger = events(load(path))
         if "workflow_call" not in trigger:
             continue
-        for dupe in sorted(trigger & {"push", "pull_request"}):
+        for dupe in sorted(
+            trigger
+            & {
+                "push",
+                "pull_request",
+                "pull_request_target",
+                "repository_dispatch",
+            }
+        ):
             errors.append(
                 f"{path.name} is a workflow_call member and also carries "
                 f"`{dupe}:` -- it would run twice per change, on two "
