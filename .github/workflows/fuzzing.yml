@@ -1,3 +1,4 @@
+# sync-sha: ae9150f8de495789d009bebe85ffa0a66b0be83557b925617f76b9bd63a2a9a0
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on the status-list
@@ -132,4 +133,3 @@ jobs:
           name: fuzz-fast-crashes
           path: ${{ github.workspace }}/ci/fuzz/crash-*
           retention-days: 14
-# sync-sha: 681df52a5e76aee67a503f257863060d1170373a6722a348b8cd6ce0346cc881

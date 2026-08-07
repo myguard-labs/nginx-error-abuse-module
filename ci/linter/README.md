@@ -20,6 +20,7 @@ same convention, checker set adapted to this module's tree.
 | `lint-ci-runners.sh` | `.github/workflows/` | fork PRs never select the self-hosted pool; `pull_request_target` forbidden; every `runs-on` names labels that exist, including on workflows no pull request can reach |
 | `lint-ci-ports.sh` | `.github/workflows/` | every job that BINDS (the runtime driver, `prove`, or `coverage.sh`) declares a distinct `TEST_BASE_PORT` band, binds it, and verifies it above the FIRST binding step |
 | `lint-ci-cadence.sh` | `.github/workflows/` | a `workflow_call` member carries no `push:`/`pull_request:` of its own, so it cannot run twice per change (`schedule:` is allowed) |
+| `lint-sync-stamp.sh` | `.github/workflows/`, `.github/scripts/`, `.github/actions/` | every stamped file's `# sync-sha:` matches its own content, so a `--list` diff against the skeleton names real drift |
 | `lint-docs-drift.sh` | `.github/workflows/`, `README.md` | every workflow documented, every documented workflow exists |
 | `lint-spelling.sh` | all tracked files | codespell over prose, comments and log strings; vendored/fuzz-corpus paths excluded via `lib.sh` |
 | `run-all.sh` | all of the above | runs every check, reports once |
@@ -40,7 +41,8 @@ p/security-audit`, `--jobs=1 --metrics=off` on both). Move one there and move
 it here **in the same commit**, or local-green stops predicting remote-green —
 the only reason this directory exists.
 
-The last three are **repo-policy** checks, not general linters — see
+The four `ci-*`/`docs-drift` checks are **repo-policy** checks, not general
+linters — see
 `labs/nginx-skeleton-module/ci/linter/README.md` for the full rationale. Each
 one goes red when a NEW workflow is added without a property every existing
 workflow happens to have.
@@ -119,11 +121,13 @@ for the exact commands.
 ## In CI
 
 `.github/workflows/lint.yml` runs `install-linters.sh` then
-`LINT_ONLY="nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence docs-drift" run-all.sh`
+`LINT_ONLY="nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence sync-stamp docs-drift" run-all.sh`
 — the same entry point as the hook, so a clone that never enabled
-`core.hooksPath` still cannot land a regression. **That string is duplicated
-here and in `lint.yml`, and nothing cross-checks the two**: a checker added to
-one and not the other runs in only one place, silently.
+`core.hooksPath` still cannot land a regression. `selftest.sh` now cross-checks
+that string against the `lint-*.sh` scripts on disk, with `c` the one
+deliberate exclusion: a checker added to `ci/linter/` without being named in
+`lint.yml` runs locally and in the hook while being absent from every PR, which
+is the one path where it is load-bearing.
 
 The `c` checker is left out there because `security-scanners.yml` already runs
 flawfinder/clang-tidy/semgrep over `src/` at the same thresholds. That is also

@@ -1,4 +1,3 @@
-# sync-sha: 6eb030dee20af14f90f7ea2b3ada7cc0362d835ae85c0e79f7a0863c99c9e98b
 name: Build and Test
 
 env:
@@ -306,3 +305,4 @@ jobs:
           TEST_NGINX_SERVROOT: ${{ github.workspace }}/ci/t/servroot
         run: |
           prove -v ci/t/basic.t
+# sync-sha: 331791aa2f0da72223f6f02ec34fbff5735a44c0d349fbc4dad93e50f9d745e1

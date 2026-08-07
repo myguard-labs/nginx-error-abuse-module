@@ -1,4 +1,3 @@
-# sync-sha: 4b87029b8751f26ddbbcc0445b53ef7701c8a1bf7862f19c9cc1b4d5a02cbf70
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml
@@ -183,3 +182,4 @@ jobs:
             --port "$TEST_BASE_PORT" \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}-asan/objs/nginx"
+# sync-sha: 880cd36c2eb3a31d2b328225a2fbc8fc2ff474116161f9cce68b7e199058eaf1

@@ -1,3 +1,4 @@
+# sync-sha: edf6c4469e86283aa7af8bfd343b1cf5f10095b44b3fc6a8f11ca63c79673c36
 name: CodeQL
 
 env:
@@ -84,4 +85,3 @@ jobs:
         uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
         with:
           category: /language:c-cpp
-# sync-sha: 3ff4766da0106418b10fa5f76734c40f91af5bb7c1a0965d83e37927a309815a
