@@ -84,7 +84,16 @@ if ! compgen -G "$OBJDIR/*.gcno" >/dev/null; then
 fi
 
 # Stale arcs from a previous run would be merged into this one's counts.
+# Both trees: $OBJDIR (the nginx-linked module objects, rebuilt by
+# ci-build.sh below so its .gcda is already fresh per run) AND
+# ci/tests/unit (the unit-harness objects gcovr also scans) -- run.sh
+# recompiles the .o/.gcno there every time but does NOT delete a leftover
+# .gcda from a previous local run before executing, so a stale arc count
+# silently merges into this run's numbers and a deleted test's branch can
+# still read 100% covered. Verified: deleting a test case changed nothing
+# until this directory was cleared too (step 42 depth pass).
 find "$OBJDIR" -name '*.gcda' -delete
+find "$ROOT/ci/tests/unit" -name '*.gcda' -delete
 
 echo "==> Unit tests (instrumented)"
 # NGINX_VERSION passed explicitly, with the -coverage suffix run.sh appends via
