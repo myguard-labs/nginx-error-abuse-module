@@ -6,6 +6,8 @@
     ci/linter/workflow_policy.py runners     runner trust boundary + pool labels
     ci/linter/workflow_policy.py ports       per-job test port bands
     ci/linter/workflow_policy.py docs        README <-> workflows drift
+    ci/linter/workflow_policy.py cadence     one PR entry point per member
+    ci/linter/workflow_policy.py secrets     typed per-member secrets, no inherit
 
 Each subcommand is wrapped by a ci/linter/lint-*.sh so run-all.sh picks it up by
 glob and a human can select it with LINT_ONLY. Exit: 0 clean, 1 findings,
@@ -13,13 +15,14 @@ glob and a human can select it with LINT_ONLY. Exit: 0 clean, 1 findings,
 
 WHY THESE ARE NOT actionlint OR zizmor RULES. Both of those read a workflow
 against GENERAL knowledge -- syntax, and a catalogue of known attack shapes.
-The three checks here encode facts about THIS repo that no general tool can
-know: which self-hosted labels exist, that the runners are persistent and
-shared with package builds, which port band each job owns, and which files
-document the pipeline. They are the checks that go red when a NEW workflow is
-added without the property every existing one happens to have -- the case where
-copying an existing file is the only thing standing between the repo and a
-regression, and nothing enforces the copy.
+The checks here encode facts about THIS repo that no general tool can know:
+which self-hosted labels exist, that the runners are persistent and shared
+with package builds, which port band each job owns, which files document the
+pipeline, that ci.yml is the single orchestrator, and that a member's secret
+surface is declared at the member. They are the checks that go red when a NEW
+workflow is added without the property every existing one happens to have --
+the case where copying an existing file is the only thing standing between the
+repo and a regression, and nothing enforces the copy.
 """
 
 from __future__ import annotations
@@ -599,11 +602,159 @@ def check_cadence() -> int:
     )
 
 
+# --------------------------------------------------------------------------
+# secrets
+
+
+def check_secrets() -> int:
+    """A member declares the secrets it needs, by name and typed; no `inherit`.
+
+    `workflow_call: {}` with no `secrets:` stanza is not "this member needs no
+    secrets" -- it is "this member can never receive one". An undeclared secret
+    is simply not passed, so a member that starts needing a token gets an empty
+    string and fails somewhere downstream of the cause: a checkout that 404s, a
+    curl that 401s. Nothing says the secret was dropped at the call boundary.
+
+    The stance this enforces is (a) of the two available: every member names the
+    secrets it needs with `required: true`, and callers wire them explicitly.
+    The rejected alternative is `secrets: inherit` at the caller, which is less
+    boilerplate and widens every member's blast radius to the caller's FULL
+    secret set -- including the ones that member has no business reading. A
+    member's secret surface should be visible at the member.
+
+    `required: true` over `required: false` is the load-bearing half. A false
+    (or omitted) `required` restores exactly the silent-empty-string failure
+    this check exists to prevent; true makes GitHub refuse to start the call.
+
+    This repo declares no secrets today, and ci.yml's five members all carry
+    `secrets: inherit` (predating this check) with nothing behind it to leak --
+    but that is exactly the defensive-boilerplate shape this check exists to
+    close: the day a real secret is added under `inherit`, every member gets it
+    silently, and nothing here would notice until the audit that introduced
+    this checker is long forgotten.
+    """
+    errors: list[str] = []
+    declared: dict[str, set[str]] = {}
+
+    for path in workflows():
+        data = load(path)
+        # Same `on:`-spelling quirk events() documents: PyYAML resolves the bare
+        # key to True. Only the mapping form can carry a secrets: block.
+        node = data.get("on", data.get(True))
+        # `workflow_call:` (null) and `workflow_call: {}` are the same workflow
+        # to GitHub. Both must register as members, or a caller passing a secret
+        # to a null-spelled member reads as "unknown member" and goes unchecked.
+        if not isinstance(node, dict) or "workflow_call" not in node:
+            continue
+        call = node["workflow_call"]
+        if call is not None and not isinstance(call, dict):
+            raise PolicyError(f"{path.name}: workflow_call is not a mapping")
+        secrets = (call or {}).get("secrets") or {}
+        if not isinstance(secrets, dict):
+            raise PolicyError(f"{path.name}: workflow_call.secrets is not a mapping")
+        declared[path.name] = set(secrets)
+        for name, spec in sorted(secrets.items()):
+            # These two branches must not overlap: every spec missing the
+            # `required` key yields None from .get(), and `None is not True`,
+            # so the value branch alone would already catch it -- but it cannot
+            # be asked about a spec that is not a mapping at all, so that shape
+            # needs its own branch.
+            if not isinstance(spec, dict):
+                errors.append(
+                    f"{path.name} declares secret `{name}` untyped -- give it "
+                    "`required: true`, or a member that stops being passed it "
+                    "fails on an empty string instead of refusing to start"
+                )
+            elif spec.get("required") is not True:
+                errors.append(
+                    f"{path.name} declares secret `{name}` with "
+                    # str(): a YAML-facing message must not print Python's
+                    # `False` for what the author wrote as `false`.
+                    f"`required: {str(spec.get('required')).lower()}` -- use "
+                    "`required: true`; "
+                    "an optional secret reintroduces the silent empty string"
+                )
+
+    # Caller side. `uses: ./.github/workflows/X.yml` with a `secrets:` block.
+    for path in workflows():
+        for job, spec in (load(path).get("jobs") or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            uses = spec.get("uses")
+            if not isinstance(uses, str):
+                continue
+            passed = spec.get("secrets")
+            local = uses.startswith("./.github/workflows/")
+            # `inherit` is judged BEFORE the local-member filter, because the
+            # blast radius it hands over is worst for the calls this filter
+            # would otherwise drop: `owner/repo/.github/workflows/x.yml@ref`
+            # sends the caller's entire secret set to ANOTHER REPOSITORY.
+            # Everything below this point compares against `declared`, which
+            # only knows local members, so the rest of the loop stays local-only.
+            if passed == "inherit":
+                errors.append(
+                    f"{path.name} job `{job}` uses `secrets: inherit` -- name "
+                    "the secrets the member needs instead; inherit hands it the "
+                    "caller's entire secret set, including ones it never reads"
+                )
+                continue
+            if passed is not None and not isinstance(passed, dict):
+                # Shape is judged BEFORE the local-member filter, for the same
+                # reason `inherit` is: `secrets:` that is neither a mapping nor
+                # `inherit` is a caller GitHub will refuse, and dropping it here
+                # because the member happens to live in another repository
+                # reports CLEAN over a call that cannot work.
+                #
+                # Without this, a bare string reaching `set(passed)` below is
+                # iterated CHARACTER by character, reporting a finding per
+                # letter -- red for the wrong reason.
+                raise PolicyError(
+                    f"{path.name} job `{job}`: `secrets:` is neither a mapping "
+                    f"nor `inherit` ({type(passed).__name__})"
+                )
+            if not local:
+                continue
+            member = uses.rsplit("/", 1)[-1]
+            # The other direction: a member that REQUIRES a secret nobody wires.
+            # GitHub refuses to start that call, which is the loud failure
+            # `required: true` was chosen for -- but it fails on the first run
+            # after merge, and the pairing is checkable here at review time.
+            # `inherit` and every non-mapping shape have already been rejected
+            # above, so `passed` here is a mapping or None -- None meaning the
+            # caller wires nothing, which is exactly what this loop reports.
+            supplied = set(passed) if passed is not None else set()
+            for name in sorted(declared.get(member, set()) - supplied):
+                errors.append(
+                    f"{path.name} job `{job}` calls {member}, which requires "
+                    f"secret `{name}`, but does not pass it -- GitHub refuses "
+                    "to start the call"
+                )
+            if passed is None:
+                continue
+            if member not in declared:
+                # Not our business here: `docs`/`cadence` cover missing members.
+                continue
+            for name in sorted(set(passed) - declared[member]):
+                errors.append(
+                    f"{path.name} job `{job}` passes secret `{name}` to "
+                    f"{member}, which does not declare it -- it is silently "
+                    "dropped at the call boundary"
+                )
+
+    total = sum(len(v) for v in declared.values())
+    return report(
+        "lint-ci-secrets",
+        errors,
+        f"{len(declared)} workflow_call member(s), {total} typed secret(s), no inherit",
+    )
+
+
 COMMANDS = {
     "runners": check_runners,
     "ports": check_ports,
     "docs": check_docs,
     "cadence": check_cadence,
+    "secrets": check_secrets,
 }
 
 
