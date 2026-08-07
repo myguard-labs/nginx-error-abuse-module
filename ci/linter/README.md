@@ -18,13 +18,14 @@ same convention, checker set adapted to this module's tree.
 | `lint-perl.sh` | `ci/t/*.t` | `perl -c` + perlcritic severity ≥4 |
 | `lint-yaml.sh` | `*.yml`, `*.yaml` | yamllint (errors block, warnings visible), actionlint + zizmor (`--persona=pedantic`) on `.github/workflows/` |
 | `lint-ci-runners.sh` | `.github/workflows/` | fork PRs never select the self-hosted pool; `pull_request_target` forbidden; every `runs-on` names labels that exist, including on workflows no pull request can reach |
-| `lint-ci-ports.sh` | `.github/workflows/` | every runtime-bearing job declares a distinct `TEST_BASE_PORT` band, binds it, and verifies it above the FIRST binding step |
+| `lint-ci-ports.sh` | `.github/workflows/` | every job that BINDS (the runtime driver, `prove`, or `coverage.sh`) declares a distinct `TEST_BASE_PORT` band, binds it, and verifies it above the FIRST binding step |
+| `lint-ci-cadence.sh` | `.github/workflows/` | a `workflow_call` member carries no `push:`/`pull_request:` of its own, so it cannot run twice per change (`schedule:` is allowed) |
 | `lint-docs-drift.sh` | `.github/workflows/`, `README.md` | every workflow documented, every documented workflow exists |
 | `lint-spelling.sh` | all tracked files | codespell over prose, comments and log strings; vendored/fuzz-corpus paths excluded via `lib.sh` |
 | `run-all.sh` | all of the above | runs every check, reports once |
 | `install-linters.sh` | — | apt-get → pipx → cpan → upstream binary |
 | `lib.sh` | — | sourced helpers (file selection, missing-tool failure) |
-| `workflow_policy.py` | — | the three repo-policy checks the `ci-*`/`docs-drift` wrappers call |
+| `workflow_policy.py` | — | the four repo-policy checks the `ci-*`/`docs-drift` wrappers call |
 | `selftest.sh` | — | negative controls for the gate itself; run before the linters in `lint.yml` |
 | `fixtures/policy/` | — | trees the policy checks must go RED on — the known bypasses, plus the runner-label and step-ordering cases; `clean/` and the `-ok` trees must stay GREEN |
 
@@ -91,15 +92,22 @@ Exit codes: `0` clean, `1` findings, `2` a linter is missing.
 
 ### Port bands (`lint-ci-ports.sh`)
 
-Three runtime-bearing jobs call `ci/tools/test_runtime.py`:
+Four jobs bind a port band. Three call `ci/tools/test_runtime.py`:
 `build-test.yml:runtime` (18880-18911), `asan.yml:asan` (18912-18943),
-`asan.yml:asan-reload` (18944-18975). Each declares `TEST_BASE_PORT`, verifies
-the band with `ci/tools/max-port.sh` before the first bind, and passes
-`--port "$TEST_BASE_PORT"` through to the driver. This closes the pre-existing
-gap where all three shared the driver's 18880 default on the same self-hosted
-runner with disjoint concurrency groups — see `memory/.../issues.md` "cp6
-CodeRabbit finding" for the original report and `memory/.../history.md` for
-this fix.
+`asan.yml:asan-reload` (18944-18975). The fourth,
+`build-test.yml:test-nginx` (18976-19007), binds via `prove` — Test::Nginx
+binds `TEST_NGINX_PORT`, so it is a binder even though it never starts the
+driver. Each declares `TEST_BASE_PORT`, verifies the band with
+`ci/tools/max-port.sh` before the first bind, and passes the band through to
+whatever binds it (`--port "$TEST_BASE_PORT"` for the driver,
+`TEST_NGINX_PORT` for `prove`).
+
+This closes the pre-existing gap where all three drivers shared the 18880
+default on the same self-hosted runner with disjoint concurrency groups — see
+`memory/.../issues.md` "cp6 CodeRabbit finding" for the original report and
+`memory/.../history.md` for this fix. `test-nginx` was missed by that pass
+because the checker keyed on the driver rather than on BINDERS, so it took
+Test::Nginx's 1984 default while `lint-ci-ports` reported all bands distinct.
 
 ## Verify before trusting
 
@@ -111,7 +119,7 @@ for the exact commands.
 ## In CI
 
 `.github/workflows/lint.yml` runs `install-linters.sh` then
-`LINT_ONLY="nginx sh python perl yaml spelling ci-runners ci-ports docs-drift" run-all.sh`
+`LINT_ONLY="nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence docs-drift" run-all.sh`
 — the same entry point as the hook, so a clone that never enabled
 `core.hooksPath` still cannot land a regression. **That string is duplicated
 here and in `lint.yml`, and nothing cross-checks the two**: a checker added to

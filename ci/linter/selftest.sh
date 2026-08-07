@@ -148,6 +148,41 @@ policy_ 1 overlapping-port-bands ports
 policy_ 1 schedule-only-runner-labels runners
 policy_ 0 schedule-only-runner-labels-ok runners
 
+# A workflow_call member carrying its own `push:` runs twice per change and BOTH
+# runs are green, so nothing else in the toolchain notices. Measured here on the
+# merge of PR #47: six standalone push runs fired on the merge commit after the
+# PR's CI had already passed the identical tree. These run as a PAIR: the -ok
+# fixture is the same file with `schedule:` (the intended shape, which codeql.yml
+# and ci-deep.yml both use), and without it the red above is equally consistent
+# with "any member carrying a second trigger is flagged", which is not the rule.
+policy_ 1 member-with-push cadence
+policy_ 0 member-with-push-ok cadence
+
+# Every glob-discovered checker is named in lint.yml's LINT_ONLY.
+#
+# run-all.sh picks checkers up by glob, but CI narrows the run to an explicit
+# allowlist, and nothing connected the two: a checker added to ci/linter/ ran
+# locally and in the pre-commit hook while being silently absent from every PR.
+# A gate that runs everywhere except the merge path is missing from the one
+# place it is load-bearing -- which is exactly what would have happened to
+# ci-cadence here had it been added without this control.
+missing=""
+only="$(sed -n 's/^ *LINT_ONLY: *//p' .github/workflows/lint.yml)"
+for s in ci/linter/lint-*.sh; do
+    n="${s#ci/linter/lint-}"; n="${n%.sh}"
+    # "c" is deliberately excluded in CI (see lint.yml's header): the src/
+    # scanners run in security-scanners.yml instead.
+    [ "$n" = "c" ] && continue
+    printf '%s\n' "$only" | tr ' ' '\n' | grep -qx "$n" || missing="$missing $n"
+done
+if [ -z "$missing" ]; then
+    echo "ok   every checker is named in lint.yml LINT_ONLY"
+else
+    echo "FAIL checkers absent from lint.yml LINT_ONLY:$missing" >&2
+    echo "       | they run locally and in the hook, but never on a PR" >&2
+    rc=1
+fi
+
 # WIRING CONTROLS. These assert that a checker is reachable at all, which is a
 # weaker claim than "it goes red on a defect" -- the red-direction probes need
 # real tools and live in each checker's header instead, so this file keeps its

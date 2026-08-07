@@ -10,8 +10,6 @@ env:
   # that claims to be the single source of truth was ignored.
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch: {}
   workflow_call: {}
 

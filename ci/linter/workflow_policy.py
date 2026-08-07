@@ -525,10 +525,56 @@ def check_docs() -> int:
     )
 
 
+# --------------------------------------------------------------------------
+# cadence
+
+
+def check_cadence() -> int:
+    """A `workflow_call` member carries no second entry point of its own.
+
+    `workflow_call` does not suppress a member's own triggers. A member reached
+    from ci.yml that ALSO carries `push:` runs twice per change: once on the PR,
+    once on the merge commit, against a tree identical to the PR head that
+    already passed. The two runs get different concurrency keys, so
+    `cancel-in-progress` does not collapse them, and BOTH are green -- the only
+    symptoms are the bill and a README that no longer describes what runs when.
+
+    Nothing else catches this. Measured here on the merge of PR #47: the PR ran
+    `CI` once at 01:04:36, then six standalone `push` runs fired at 01:10:39 on
+    the merge commit -- Build and Test, A/UBSan, Valgrind, Fuzzing, Security
+    scanners, CodeQL, all green, all redundant. Six self-hosted jobs per merge,
+    occupying slots other work needs. Correctness was asserted only by a comment
+    in each member file, and a comment does not survive the next workflow copied
+    in from a repo with a different topology.
+
+    `schedule:` is explicitly allowed: codeql.yml and ci-deep.yml are reachable
+    both from ci.yml and on their own cadence, which is the intended shape and
+    not a duplicate run of the same tree.
+    """
+    errors: list[str] = []
+    for path in workflows():
+        trigger = events(load(path))
+        if "workflow_call" not in trigger:
+            continue
+        for dupe in sorted(trigger & {"push", "pull_request"}):
+            errors.append(
+                f"{path.name} is a workflow_call member and also carries "
+                f"`{dupe}:` -- it would run twice per change, on two "
+                "concurrency keys that cannot cancel each other. Reach it "
+                "from ci.yml only (schedule: is allowed)"
+            )
+    return report(
+        "lint-ci-cadence",
+        errors,
+        "every workflow_call member has ci.yml as its only PR entry point",
+    )
+
+
 COMMANDS = {
     "runners": check_runners,
     "ports": check_ports,
     "docs": check_docs,
+    "cadence": check_cadence,
 }
 
 

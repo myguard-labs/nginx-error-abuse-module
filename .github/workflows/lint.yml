@@ -65,5 +65,5 @@ jobs:
         env:
           # Every checker except "c" -- adding a lint-*.sh without adding its
           # name here leaves it running locally and never in CI.
-          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports docs-drift
+          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence docs-drift
         run: ci/linter/run-all.sh
