@@ -112,6 +112,21 @@ policy_ 1 bypass-commented-job-key ports
 # build-test.yml sat in exactly this shape until 2026-08-02.
 policy_ 1 verify-after-bind ports
 
+# A job whose only binder is `prove` (not ci/tools/test_runtime.py) used to be
+# exempt from the "declare TEST_BASE_PORT" requirement, even though `prove` is
+# already a BINDERS member and the ordering check already treats it as one.
+# Live here as a failed negative control: build-test.yml's test-nginx job had no
+# band at all and `ports` still reported "3 runtime job(s), all with distinct
+# port bands".
+policy_ 1 prove-only-binder-exempt ports
+
+# ...and the other half of the same rule: a prove job that DOES declare a band
+# but never passes it to Test::Nginx as TEST_NGINX_PORT. Every earlier check
+# passes -- declared, distinct, width fits -- and it still binds 1984. Raised by
+# CodeRabbit on PR #48 against the commit that made prove a first-class binder:
+# widening what must declare a band did not widen what must pass it through.
+policy_ 1 prove-band-not-passed-through ports
+
 # A cleanup step that sweeps a literal port range covering a sibling's band.
 # Every band declaration in that fixture is correct, so the declaration,
 # uniqueness, width and overlap checks are all green -- the kill is the defect.
@@ -139,6 +154,41 @@ policy_ 1 overlapping-port-bands ports
 # consistent with "every non-PR-reachable workflow is now flagged".
 policy_ 1 schedule-only-runner-labels runners
 policy_ 0 schedule-only-runner-labels-ok runners
+
+# A workflow_call member carrying its own `push:` runs twice per change and BOTH
+# runs are green, so nothing else in the toolchain notices. Measured here on the
+# merge of PR #47: six standalone push runs fired on the merge commit after the
+# PR's CI had already passed the identical tree. These run as a PAIR: the -ok
+# fixture is the same file with `schedule:` (the intended shape, which codeql.yml
+# and ci-deep.yml both use), and without it the red above is equally consistent
+# with "any member carrying a second trigger is flagged", which is not the rule.
+policy_ 1 member-with-push cadence
+policy_ 0 member-with-push-ok cadence
+
+# Every glob-discovered checker is named in lint.yml's LINT_ONLY.
+#
+# run-all.sh picks checkers up by glob, but CI narrows the run to an explicit
+# allowlist, and nothing connected the two: a checker added to ci/linter/ ran
+# locally and in the pre-commit hook while being silently absent from every PR.
+# A gate that runs everywhere except the merge path is missing from the one
+# place it is load-bearing -- which is exactly what would have happened to
+# ci-cadence here had it been added without this control.
+missing=""
+only="$(sed -n 's/^ *LINT_ONLY: *//p' .github/workflows/lint.yml)"
+for s in ci/linter/lint-*.sh; do
+    n="${s#ci/linter/lint-}"; n="${n%.sh}"
+    # "c" is deliberately excluded in CI (see lint.yml's header): the src/
+    # scanners run in security-scanners.yml instead.
+    [ "$n" = "c" ] && continue
+    printf '%s\n' "$only" | tr ' ' '\n' | grep -qx "$n" || missing="$missing $n"
+done
+if [ -z "$missing" ]; then
+    echo "ok   every checker is named in lint.yml LINT_ONLY"
+else
+    echo "FAIL checkers absent from lint.yml LINT_ONLY:$missing" >&2
+    echo "       | they run locally and in the hook, but never on a PR" >&2
+    rc=1
+fi
 
 # WIRING CONTROLS. These assert that a checker is reachable at all, which is a
 # weaker claim than "it goes red on a defect" -- the red-direction probes need

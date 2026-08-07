@@ -13,6 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TEST_BASE_PORT: '19600'
+      # Test::Nginx reads this, not TEST_BASE_PORT, so a prove job that declares
+      # a band without wiring it here binds 1984 regardless -- see the
+      # prove-band-not-passed-through fixture for that red.
+      TEST_NGINX_PORT: '19600'
     steps:
       # One run block that verifies and then binds. Step indices cannot separate
       # these, so the check falls back to position within the text.

@@ -117,6 +117,9 @@ BINDERS = (
     re.escape("ci/tools/coverage.sh"),
 )
 BINDER_RE = re.compile("|".join(BINDERS))
+# `prove` alone, for the pass-through check: it is the one binder whose band
+# arrives through an env var (TEST_NGINX_PORT) rather than an argument.
+PROVE_RE = re.compile(r"(?<![\w./-])prove(?![\w./-])")
 
 
 def workflows() -> list[pathlib.Path]:
@@ -364,6 +367,7 @@ def check_ports() -> int:
             declared = re.search(r"(?m)^\s*TEST_BASE_PORT:\s*[\"']?(\d+)", body)
             width_m = re.search(r"(?m)^\s*TEST_PORT_WIDTH:\s*[\"']?(\d+)", body)
             starts_runtime = RUNTIME_DRIVER in body
+            binds_band = BINDER_RE.search(body) is not None
             where = f"{path.name}:{job}"
 
             # A port sweep must be scoped to the job's OWN band. A literal
@@ -395,11 +399,21 @@ def check_ports() -> int:
             # --port, and reintroduces exactly the cross-job collision the bands
             # exist to prevent: two jobs pinned to the same runner, disjoint
             # concurrency groups, nothing serialising them, both binding 18880.
-            if starts_runtime and not declared:
+            # Any BINDER owes this declaration, not just the runtime driver.
+            # Gating on `starts_runtime` exempted a job whose only binder is
+            # `prove` -- which still binds, via Test::Nginx's TEST_NGINX_PORT
+            # default of 1984. That was a live negative-control failure here:
+            # build-test.yml's test-nginx job carried no band at all and this
+            # check reported "3 runtime job(s), all with distinct port bands"
+            # and exited 0. The ordering check below already treated `prove` as
+            # a binder, so the two halves disagreed about what a binder is.
+            if binds_band and not declared:
                 errors.append(
-                    f"{where} starts {RUNTIME_DRIVER} without declaring "
-                    "TEST_BASE_PORT -- it would take the driver's default port "
-                    "and collide with any other runtime job on the same runner"
+                    f"{where} binds a port (via "
+                    f"{RUNTIME_DRIVER if starts_runtime else 'prove/coverage.sh'}) "
+                    "without declaring TEST_BASE_PORT -- it would take the "
+                    "default port and collide with any other binding job on "
+                    "the same runner"
                 )
                 continue
 
@@ -446,6 +460,32 @@ def check_ports() -> int:
                             "on the jobs whose bands sit closer than that"
                         )
             spans.append((first, last, where, bool(width_m)))
+
+            # The same requirement for a `prove` binder. Test::Nginx reads
+            # TEST_NGINX_PORT and knows nothing about TEST_BASE_PORT, so a job
+            # can declare a unique band, satisfy every check above, and still
+            # bind 1984. Distinct from the driver case only in which variable
+            # carries the value: there it is an argument, here an env var.
+            if PROVE_RE.search(body):
+                nginx_port = re.search(
+                    r"(?m)^\s*TEST_NGINX_PORT:\s*[\"']?([^\"'\n]+)", body
+                )
+                # Either spelling is correct: an expression referring to the
+                # band, or the literal band value. What matters is that the
+                # number prove binds is the one this job declared -- a
+                # TEST_NGINX_PORT naming some OTHER port is the same defect as
+                # not setting it at all.
+                wired = nginx_port is not None and (
+                    "TEST_BASE_PORT" in nginx_port.group(1)
+                    or nginx_port.group(1).strip() == port
+                )
+                if not wired:
+                    errors.append(
+                        f"{where} declares TEST_BASE_PORT but never passes it "
+                        "to prove as TEST_NGINX_PORT -- Test::Nginx does not "
+                        "read TEST_BASE_PORT, so it would bind its 1984 "
+                        "default anyway"
+                    )
 
             # A declared band that is not passed through is decoration: the
             # driver still binds its default.
@@ -514,10 +554,56 @@ def check_docs() -> int:
     )
 
 
+# --------------------------------------------------------------------------
+# cadence
+
+
+def check_cadence() -> int:
+    """A `workflow_call` member carries no second entry point of its own.
+
+    `workflow_call` does not suppress a member's own triggers. A member reached
+    from ci.yml that ALSO carries `push:` runs twice per change: once on the PR,
+    once on the merge commit, against a tree identical to the PR head that
+    already passed. The two runs get different concurrency keys, so
+    `cancel-in-progress` does not collapse them, and BOTH are green -- the only
+    symptoms are the bill and a README that no longer describes what runs when.
+
+    Nothing else catches this. Measured here on the merge of PR #47: the PR ran
+    `CI` once at 01:04:36, then six standalone `push` runs fired at 01:10:39 on
+    the merge commit -- Build and Test, A/UBSan, Valgrind, Fuzzing, Security
+    scanners, CodeQL, all green, all redundant. Six self-hosted jobs per merge,
+    occupying slots other work needs. Correctness was asserted only by a comment
+    in each member file, and a comment does not survive the next workflow copied
+    in from a repo with a different topology.
+
+    `schedule:` is explicitly allowed: codeql.yml and ci-deep.yml are reachable
+    both from ci.yml and on their own cadence, which is the intended shape and
+    not a duplicate run of the same tree.
+    """
+    errors: list[str] = []
+    for path in workflows():
+        trigger = events(load(path))
+        if "workflow_call" not in trigger:
+            continue
+        for dupe in sorted(trigger & {"push", "pull_request"}):
+            errors.append(
+                f"{path.name} is a workflow_call member and also carries "
+                f"`{dupe}:` -- it would run twice per change, on two "
+                "concurrency keys that cannot cancel each other. Reach it "
+                "from ci.yml only (schedule: is allowed)"
+            )
+    return report(
+        "lint-ci-cadence",
+        errors,
+        "every workflow_call member has ci.yml as its only PR entry point",
+    )
+
+
 COMMANDS = {
     "runners": check_runners,
     "ports": check_ports,
     "docs": check_docs,
+    "cadence": check_cadence,
 }
 
 

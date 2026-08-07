@@ -1,4 +1,3 @@
-# sync-sha: 51def1bacc2cfe80fea6aec3d0f5471e47aaa4521a38b422cee12761b9a92266
 name: Security scanners
 
 # Static/security scanners gate on every PR/push — flawfinder + clang-tidy
@@ -13,8 +12,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 on:
-  push:
-    branches: [master, main, dev]
   workflow_dispatch: {}
   workflow_call: {}
 
@@ -117,3 +114,4 @@ jobs:
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
+# sync-sha: f61140813e63cc10e7383a4cbcf8b3b5833bc12dd545cf17d1b5ce14b454a185

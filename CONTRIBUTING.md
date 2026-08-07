@@ -52,9 +52,15 @@ in seconds instead of minutes.
 
 ## How CI works here
 
-Every push and every PR runs through a single entry point, `ci.yml`, which
-calls seven member workflows. They exist to catch the classes of bugs that C
-code in a web server cannot afford:
+Every PR runs through a single entry point, `ci.yml`, which calls seven member
+workflows. The members carry no `push:` trigger of their own: `workflow_call`
+does not suppress a member's own triggers, so one that also listened on `push:`
+ran a second time on the merge commit, over a tree identical to the PR head that
+had just passed. Both runs were green, which is why the duplication was only
+visible in the runner bill. `ci/linter/lint-ci-cadence.sh` now gates that shape.
+
+They exist to catch the classes of bugs that C code in a web server cannot
+afford:
 
 - **Build & Test** — builds the module against current nginx (and, where
   applicable, Angie) and runs the unit tests under **ASan/UBSan**.

@@ -1,4 +1,4 @@
-# sync-sha: 869df63bf53124973627235494287dad848bc091eb7a1620680f0ebe8767c1cf
+# sync-sha: 1c4d26be94c1e555779dcd0b3ce55de175e9e6a424bfa3f7e59304bdf7a6eb1c
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -53,17 +53,16 @@ jobs:
         # no: a selector that matches nothing must exit 2, not report clean.
         run: ci/linter/selftest.sh
 
-      - name: Verify CI sync stamps are current
-        # Each stamped .github/ file carries a `# sync-sha:` of its own content,
-        # so a `--list` diff against nginx-skeleton-module names exactly which
-        # copies have drifted. The stamps are only worth reading if they cannot
-        # go stale, hence this gate: edit a workflow without running
-        # ci/tools/sync-stamp.sh and the PR goes red here.
-        run: ci/tools/sync-stamp.sh --check
-
+      # The sync-stamp gate used to live here as its own step, calling
+      # ci/tools/sync-stamp.sh --check directly. It now runs as `sync-stamp`
+      # inside run-all.sh below, via ci/linter/lint-sync-stamp.sh, so the same
+      # check fires locally and in .githooks/pre-commit instead of only on a
+      # PR. A CI-only gate is one you discover you tripped after pushing:
+      # editing seven workflows here without re-stamping passed a clean
+      # run-all.sh and a clean hook, then went red remotely.
       - name: Run linters
         env:
           # Every checker except "c" -- adding a lint-*.sh without adding its
           # name here leaves it running locally and never in CI.
-          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports docs-drift
+          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence sync-stamp docs-drift
         run: ci/linter/run-all.sh
