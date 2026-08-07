@@ -165,6 +165,18 @@ policy_ 0 schedule-only-runner-labels-ok runners
 policy_ 1 member-with-push cadence
 policy_ 0 member-with-push-ok cadence
 
+# A caller reaching a member with `secrets: inherit` instead of naming what the
+# member needs. `inherit` works -- the pipeline stays green and the member gets
+# its token -- so the only symptom is a blast radius that silently grows every
+# time an unrelated secret is added to the repo. Neither actionlint nor zizmor's
+# default posture objects to it on a repo with no secrets configured, which is
+# exactly this repo's live state until this PR. These run as a PAIR: the -ok
+# fixture is the same topology with the secret named explicitly at the call
+# site, and without it the red above is equally consistent with "any workflow
+# mentioning a secret is flagged", which is not the rule.
+policy_ 1 secrets-inherit secrets
+policy_ 0 secrets-typed-ok secrets
+
 # Every glob-discovered checker is named in lint.yml's LINT_ONLY.
 #
 # run-all.sh picks checkers up by glob, but CI narrows the run to an explicit
