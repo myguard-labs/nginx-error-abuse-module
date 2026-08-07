@@ -237,6 +237,56 @@ printf 'on: [pull_request\njobs: {\n' > "$badroot/.github/workflows/broken.yml"
 case_ 2 "policy runners: unparsable YAML is exit 2, not clean" \
     env "WORKFLOW_POLICY_ROOT=$badroot" python3 ci/linter/workflow_policy.py runners
 
+# ----------------------------------------------------------------------------
+# sync-stamp.sh -- the stamp must land on line 1 (or line 2 after a shebang),
+# not wherever awk's END block happens to fire.
+#
+# Regression: the awk program gated the "no existing stamp yet" branch on
+# `NR == 1`, but the PREVIOUS rule (`/^# sync-sha: /{next}`) already consumed
+# line 1 when that line WAS the stamp -- so on a file that already carried a
+# line-1 stamp, `done` was never set on the way through and only the END block
+# fired, re-emitting the stamp at EOF instead of restamping it in place. A file
+# with no stamp at all is written correctly on the first pass (there is nothing
+# on line 1 for the `next` rule to eat), which is why this only shows up on a
+# RESTAMP of an already-stamped file -- exactly PR #49's ci.yml/lint.yml churn.
+stampline() {  # stampline <file> -> 1-based line number of the sync-sha line, or 0
+    grep -n '^# sync-sha: ' -- "$1" | head -1 | cut -d: -f1
+}
+sync_stamp_dir="$(mktemp -d)"
+trap 'rm -rf "$badroot" "$sync_stamp_dir"' EXIT
+mkdir -p "$sync_stamp_dir/.github/workflows" "$sync_stamp_dir/.github/scripts" "$sync_stamp_dir/.github/actions"
+
+# Fixture 1: no shebang, existing stamp already on line 1 (a workflow YAML).
+printf '# sync-sha: 0000000000000000000000000000000000000000000000000000000000000000\nname: fixture\njobs: {}\n' \
+    > "$sync_stamp_dir/.github/workflows/noshebang.yml"
+# Fixture 2: shebang present, existing stamp already on line 2 (a script).
+printf '#!/usr/bin/env bash\n# sync-sha: 0000000000000000000000000000000000000000000000000000000000000000\necho hi\n' \
+    > "$sync_stamp_dir/.github/scripts/shebang.sh"
+chmod +x "$sync_stamp_dir/.github/scripts/shebang.sh"
+
+# sync-stamp.sh does `cd "$(git rev-parse --show-toplevel)"`, so the fixture
+# needs its own tiny repo rather than living under $ROOT.
+git -C "$sync_stamp_dir" init -q
+git -C "$sync_stamp_dir" -c user.email=x@x -c user.name=x add -A
+git -C "$sync_stamp_dir" -c user.email=x@x -c user.name=x commit -q -m fixture
+( cd "$sync_stamp_dir" && "$ROOT/ci/tools/sync-stamp.sh" ) >/dev/null
+
+got_line="$(stampline "$sync_stamp_dir/.github/workflows/noshebang.yml")"
+if [ "$got_line" = "1" ]; then
+    echo "ok   sync-stamp keeps a line-1 stamp on line 1 (no shebang)"
+else
+    echo "FAIL sync-stamp moved the no-shebang stamp to line $got_line, expected 1" >&2
+    rc=1
+fi
+
+got_line="$(stampline "$sync_stamp_dir/.github/scripts/shebang.sh")"
+if [ "$got_line" = "2" ]; then
+    echo "ok   sync-stamp keeps a line-2 stamp on line 2 (after shebang)"
+else
+    echo "FAIL sync-stamp moved the shebang-file stamp to line $got_line, expected 2" >&2
+    rc=1
+fi
+
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
 else
