@@ -112,6 +112,14 @@ policy_ 1 bypass-commented-job-key ports
 # build-test.yml sat in exactly this shape until 2026-08-02.
 policy_ 1 verify-after-bind ports
 
+# A job whose only binder is `prove` (not ci/tools/test_runtime.py) used to be
+# exempt from the "declare TEST_BASE_PORT" requirement, even though `prove` is
+# already a BINDERS member and the ordering check already treats it as one.
+# Live here as a failed negative control: build-test.yml's test-nginx job had no
+# band at all and `ports` still reported "3 runtime job(s), all with distinct
+# port bands".
+policy_ 1 prove-only-binder-exempt ports
+
 # A cleanup step that sweeps a literal port range covering a sibling's band.
 # Every band declaration in that fixture is correct, so the declaration,
 # uniqueness, width and overlap checks are all green -- the kill is the defect.

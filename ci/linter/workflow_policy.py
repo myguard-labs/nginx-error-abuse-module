@@ -364,6 +364,7 @@ def check_ports() -> int:
             declared = re.search(r"(?m)^\s*TEST_BASE_PORT:\s*[\"']?(\d+)", body)
             width_m = re.search(r"(?m)^\s*TEST_PORT_WIDTH:\s*[\"']?(\d+)", body)
             starts_runtime = RUNTIME_DRIVER in body
+            binds_band = BINDER_RE.search(body) is not None
             where = f"{path.name}:{job}"
 
             # A port sweep must be scoped to the job's OWN band. A literal
@@ -395,11 +396,21 @@ def check_ports() -> int:
             # --port, and reintroduces exactly the cross-job collision the bands
             # exist to prevent: two jobs pinned to the same runner, disjoint
             # concurrency groups, nothing serialising them, both binding 18880.
-            if starts_runtime and not declared:
+            # Any BINDER owes this declaration, not just the runtime driver.
+            # Gating on `starts_runtime` exempted a job whose only binder is
+            # `prove` -- which still binds, via Test::Nginx's TEST_NGINX_PORT
+            # default of 1984. That was a live negative-control failure here:
+            # build-test.yml's test-nginx job carried no band at all and this
+            # check reported "3 runtime job(s), all with distinct port bands"
+            # and exited 0. The ordering check below already treated `prove` as
+            # a binder, so the two halves disagreed about what a binder is.
+            if binds_band and not declared:
                 errors.append(
-                    f"{where} starts {RUNTIME_DRIVER} without declaring "
-                    "TEST_BASE_PORT -- it would take the driver's default port "
-                    "and collide with any other runtime job on the same runner"
+                    f"{where} binds a port (via "
+                    f"{RUNTIME_DRIVER if starts_runtime else 'prove/coverage.sh'}) "
+                    "without declaring TEST_BASE_PORT -- it would take the "
+                    "default port and collide with any other binding job on "
+                    "the same runner"
                 )
                 continue
 
