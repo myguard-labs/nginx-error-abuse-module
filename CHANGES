@@ -1,5 +1,25 @@
 Changes with ngx_http_error_abuse_module            18 Aug 2026
 
+    *) Change: completed the security, correctness, performance and format
+       hardening of the request and persistence paths. Client keys are stored
+       and logged as fixed SHA-256 identities, untrusted log and Redis detail
+       is redacted, configuration and Redis replies are validated, and bounded
+       eviction prevents memory pressure from displacing active bans.
+
+       Persistence now uses an explicitly little-endian, CRC32-checked format
+       with atomic no-follow writes; setting persist_secret additionally
+       authenticates snapshots with HMAC-SHA256. Snapshot I/O is kept off the
+       event loop when threads are available, while Redis uses nginx's
+       non-blocking event integration and bounded reconnect backoff.
+
+       The on_full=reject option fails closed when a zone has no reclaimable
+       entry (on_full=allow retains the historical one-response passthrough),
+       and origin enforcement survives error_page redirects. Module-generated
+       rejection responses include private no-store caching and Retry-After
+       headers where applicable, and failures to add those headers fail
+       closed. DNS resolution and status-list parsing are bounded and checked
+       at the appropriate boundary.
+
     *) Change: completed release-readiness alignment against
        nginx-skeleton-module 93b8ecc. CI now uses the repository POOL selector,
        current pinned JavaScript actions, an explicit CodeQL manual build, and
