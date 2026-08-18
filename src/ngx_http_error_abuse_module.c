@@ -187,10 +187,11 @@ typedef struct {
  * the named-location path) zeroes r->ctx wholesale but never touches
  * r->cleanup, and the request pool survives the hop. A durable cleanup
  * record, registered the first time the ctx is prepared, is the only anchor
- * that outlives the redirect: the header filter walks r->main->cleanup for
- * this magic tag and restores the ORIGIN ctx instead of preparing a fresh one
- * from the destination location's conf. The handler itself is a no-op --
- * the record exists only to carry the back-pointer, the pool owns the ctx. */
+ * that outlives the redirect: preaccess and the header filter call
+ * prepare_ctx(), which walks r->main->cleanup for this magic tag and restores
+ * the ORIGIN ctx instead of preparing a fresh one from the destination
+ * location's conf. The handler itself is a no-op -- the record exists only to
+ * carry the back-pointer, the pool owns the ctx. */
 #define NGX_HTTP_ERROR_ABUSE_ANCHOR_MAGIC  0x45414e43u  /* "EANC" */
 
 typedef struct {
