@@ -1,3 +1,12 @@
+Changes with ngx_http_error_abuse_module            18 Aug 2026
+
+    *) Change: completed release-readiness alignment against
+       nginx-skeleton-module 93b8ecc. CI now uses the repository POOL selector,
+       current pinned JavaScript actions, an explicit CodeQL manual build, and
+       four measured lanes that fit the six-runner pool without dropping a
+       gate. The README badge row and contributor-facing lint instructions now
+       match the workflows that actually run.
+
 Changes with ngx_http_error_abuse_module            04 Aug 2026
 
     *) Change: the CI harness was standardised against the
