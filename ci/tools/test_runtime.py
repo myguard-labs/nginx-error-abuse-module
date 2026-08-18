@@ -654,7 +654,8 @@ def test_redis_backoff_cap(
         nginx.stop()
         peer.stop()
 
-    print("OK: Redis reconnect backoff cap control")
+    test_redis_handshake_recovery(binary, fault_module, root, runner, port + 1)
+    print("OK: Redis reconnect backoff cap and handshake recovery controls")
 
 
 def nginx_config(
@@ -1183,6 +1184,141 @@ class HostileRedisServer:
         self._thread = None
 
 
+class HandshakeRecoveryRedisServer(HostileRedisServer):
+    """Trusted RESP2 peer that fails only the first SCRIPT LOAD."""
+
+    SCRIPT_ERROR = b"ERR temporary SCRIPT LOAD failure"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sessions: list[tuple[int, bytes]] = []
+        self.closed_sessions: set[int] = set()
+        self.connection_count = 0
+
+    def start(self) -> None:
+        parent = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                with parent._condition:
+                    parent.connection_count += 1
+                    session = parent.connection_count
+                    parent._condition.notify_all()
+                try:
+                    while True:
+                        command = parent._read_command(self.rfile)
+                        if command is None:
+                            return
+                        name = command[0].upper()
+                        with parent._condition:
+                            first_script = name == b"SCRIPT" and not any(
+                                seen == b"SCRIPT" for _, seen in parent.sessions
+                            )
+                        if first_script:
+                            response = b"-" + parent.SCRIPT_ERROR + b"\r\n"
+                        elif name == b"SCRIPT":
+                            response = b"$40\r\n" + b"0" * 40 + b"\r\n"
+                        elif name == b"GET":
+                            response = b"$-1\r\n"
+                        elif name == b"EVALSHA":
+                            response = b"*2\r\n:0\r\n:1\r\n"
+                        else:
+                            response = b"-UNEXPECTED-COMMAND\r\n"
+                        self.wfile.write(response)
+                        self.wfile.flush()
+                        with parent._condition:
+                            parent.sessions.append((session, name))
+                            parent._condition.notify_all()
+                finally:
+                    with parent._condition:
+                        parent.closed_sessions.add(session)
+                        parent._condition.notify_all()
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def wait_for_session_command(
+        self, session: int, command: bytes, timeout: float = 5.0
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while (session, command) not in self.sessions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        "Redis handshake recovery did not observe "
+                        f"session {session} {command!r}: {self.sessions!r}"
+                    )
+                self._condition.wait(remaining)
+
+    def wait_for_session_close(self, session: int, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while session not in self.closed_sessions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        "Redis handshake failure left session "
+                        f"{session} open: {self.sessions!r}"
+                    )
+                self._condition.wait(remaining)
+
+
+def test_redis_handshake_recovery(
+    binary: pathlib.Path,
+    module: pathlib.Path,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+) -> None:
+    """A command-level handshake error must reconnect before Redis is reused."""
+    redis = HandshakeRecoveryRedisServer()
+    nginx: Nginx | None = None
+    try:
+        redis.start()
+        nginx = Nginx(
+            binary,
+            module,
+            root / "handshake-recovery",
+            nginx_port,
+            runner,
+            True,
+            redis.port,
+            f"error-abuse-handshake-{os.getpid()}:",
+        )
+        nginx.start()
+
+        redis.wait_for_session_command(1, b"SCRIPT")
+        redis.wait_for_session_close(1)
+        redis.wait_for_session_command(2, b"SCRIPT")
+
+        error_log = nginx.root / "logs" / "error.log"
+        _wait_for_log(error_log, b"error_abuse test reconnect delay=")
+        backoffs = re.findall(
+            rb"error_abuse test reconnect delay=\d+ next=(\d+)",
+            error_log.read_bytes(),
+        )
+        if not backoffs or int(backoffs[0]) != 80:
+            raise AssertionError(
+                f"handshake recovery expected bounded 80ms backoff: {backoffs!r}"
+            )
+
+        expect(nginx.port, "/redis-error?client=recovered", 404)
+        redis.wait_for_session_command(2, b"GET")
+        redis.wait_for_session_command(2, b"EVALSHA")
+    finally:
+        if nginx is not None:
+            nginx.stop()
+        redis.stop()
+    if nginx is not None:
+        nginx.assert_clean_logs()
+
+
 class DeadlineRedisServer(HostileRedisServer):
     """Minimal RESP2 peer whose GET reply is an excessive block deadline."""
 
@@ -1507,7 +1643,9 @@ def _assert_handshake_log_safety(error_log: pathlib.Path) -> None:
         raise AssertionError("log safety: raw Redis handshake error reached error.log")
     if b"\x00" in data or b"\r" in data:
         raise AssertionError("log safety: control byte reached handshake error.log")
-    marker = b"Redis handshake (AUTH/SELECT) failed (type=6, detail_len=29)"
+    marker = (
+        b"Redis handshake (AUTH/SELECT) failed (type=6, detail_len=29); disconnecting"
+    )
     if data.count(marker) != 1:
         raise AssertionError(
             f"log safety: expected one Redis handshake record, got {data.count(marker)}"
