@@ -2086,13 +2086,13 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             host.data = value[i].data + 5;
             host.len = value[i].len - 5;
             /* optional tls:// (or rediss://) scheme enables TLS transport */
-            if (host.len > 6
+            if (host.len >= 6
                 && ngx_strncmp(host.data, "tls://", 6) == 0)
             {
                 tls = 1;
                 host.data += 6;
                 host.len -= 6;
-            } else if (host.len > 9
+            } else if (host.len >= 9
                        && ngx_strncmp(host.data, "rediss://", 9) == 0)
             {
                 tls = 1;

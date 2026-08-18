@@ -276,6 +276,7 @@ import atexit
 import concurrent.futures
 import hashlib
 import hmac
+import json
 import os
 import pathlib
 import re
@@ -341,6 +342,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")
     parser.add_argument("--log-safety-only", action="store_true")
+    parser.add_argument(
+        "--config-seeds-only",
+        action="store_true",
+        help="replay only the bounded malformed-configuration seed corpus",
+    )
     parser.add_argument("--mixed-eviction-only", action="store_true")
     parser.add_argument("--oversized-snapshot-only", action="store_true")
     parser.add_argument(
@@ -2611,6 +2617,7 @@ def expect_invalid_config(
     name: str,
     http_config: str,
     expected: str,
+    forbidden: tuple[str, ...] = (),
 ) -> None:
     bad = root / name
     (bad / "conf").mkdir(parents=True)
@@ -2644,6 +2651,10 @@ http {{
         timeout=20,
         check=False,
     )
+    if any(marker in result.stdout for marker in forbidden):
+        # Do not repeat stdout here: the point of this oracle is to ensure a
+        # secret canary never reaches CI output through an nginx diagnostic.
+        raise AssertionError(f"{name} config diagnostic exposed a secret canary")
     if result.returncode == 0 or expected not in result.stdout:
         raise AssertionError(
             f"{name} config was not rejected as expected:\n{result.stdout}"
@@ -2694,6 +2705,97 @@ http {{
         raise AssertionError(
             f"{name} config was rejected but should be valid:\n{result.stdout}"
         )
+
+
+def _validate_config_seed(seed: object, names: set[str]) -> dict[str, object]:
+    required = {"name", "category", "expect", "http_config"}
+    if not isinstance(seed, dict) or not required.issubset(seed):
+        raise TypeError("every config seed needs name/category/expect/http_config")
+    name = seed["name"]
+    category = seed["category"]
+    expectation = seed["expect"]
+    if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
+        raise TypeError(f"invalid config seed name: {name!r}")
+    if name in names:
+        raise AssertionError(f"duplicate config seed name: {name}")
+    if not isinstance(category, str):
+        raise TypeError(f"{name}: category must be a string")
+    if expectation not in ("accept", "reject"):
+        raise ValueError(f"{name}: expect must be accept or reject")
+    if not isinstance(seed["http_config"], str):
+        raise TypeError(f"{name}: http_config must be a string")
+    names.add(name)
+    return seed
+
+
+def _load_config_seeds() -> list[dict[str, object]]:
+    seed_file = pathlib.Path(__file__).resolve().parents[1] / "config-seeds/seeds.json"
+    document = json.loads(seed_file.read_text(encoding="ascii"))
+    if document.get("version") != 1 or not isinstance(document.get("seeds"), list):
+        raise TypeError("config seed manifest must have version 1 and a seed list")
+
+    raw_seeds = document["seeds"]
+    assert isinstance(raw_seeds, list)
+    names: set[str] = set()
+    seeds = [_validate_config_seed(seed, names) for seed in raw_seeds]
+    if not seeds or len(seeds) > 64:
+        raise AssertionError("config seed manifest must contain 1..64 bounded cases")
+
+    categories: set[str] = set()
+    for seed in seeds:
+        category = seed["category"]
+        assert isinstance(category, str)
+        categories.add(category)
+    missing = {"duplicate", "boundary", "tls", "secret", "dependency"} - categories
+    if missing:
+        raise AssertionError(
+            f"config seed categories missing: {', '.join(sorted(missing))}"
+        )
+    if not any(seed["expect"] == "accept" for seed in seeds):
+        raise AssertionError("config seeds need an accept control")
+    return seeds
+
+
+def test_config_seeds(
+    binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
+) -> None:
+    """Replay finite config seeds through nginx and the shipped module."""
+    seeds = _load_config_seeds()
+
+    # Accept controls run first. Without the dynamic module they fail on the
+    # unknown directive, so a replay cannot pass merely because every reject
+    # seed was rejected by nginx before reaching this module's parser.
+    for expectation in ("accept", "reject"):
+        for seed in seeds:
+            if seed["expect"] != expectation:
+                continue
+            name = seed["name"]
+            assert isinstance(name, str)
+            http_config = seed["http_config"]
+            assert isinstance(http_config, str)
+            config = http_config.replace("@ROOT@", str(root / name))
+            if expectation == "accept":
+                expect_valid_config(binary, module, root, runner, name, config)
+                continue
+
+            diagnostic = seed.get("diagnostic")
+            forbidden = seed.get("forbidden", [])
+            if not isinstance(diagnostic, str) or not diagnostic:
+                raise AssertionError(f"{name}: reject seed needs a diagnostic")
+            if not isinstance(forbidden, list) or not all(
+                isinstance(marker, str) and marker for marker in forbidden
+            ):
+                raise AssertionError(f"{name}: forbidden must be non-empty strings")
+            expect_invalid_config(
+                binary,
+                module,
+                root,
+                runner,
+                name,
+                config,
+                diagnostic,
+                tuple(forbidden),
+            )
 
 
 def test_valid_configs(
@@ -2925,6 +3027,10 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
         root = pathlib.Path(tmp)
+        if args.config_seeds_only:
+            test_config_seeds(binary, module, root, args.runner)
+            print("OK: bounded configuration parser seeds")
+            return 0
         if args.reject_header_fault:
             if module is None:
                 raise ValueError("--reject-header-fault requires --module")
@@ -3005,6 +3111,7 @@ def main() -> int:
                 pathlib.Path(args.redis_server).absolute(),
             )
             return 0
+        test_config_seeds(binary, module, root, args.runner)
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
         test_log_safety(binary, module, root, args.runner, args.port + 10)

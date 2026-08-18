@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "seeds": [
+    {
+      "name": "control-minimal",
+      "category": "control",
+      "expect": "accept",
+      "http_config": "    error_abuse_zone zone=control:1m;\n    error_abuse zone=control;"
+    },
+    {
+      "name": "control-boundary-maxima",
+      "category": "boundary",
+      "expect": "accept",
+      "http_config": "    error_abuse_zone zone=bounds:1m threshold=1024;\n    error_abuse zone=bounds status=400;\n    error_abuse_redis host=127.0.0.1 port=65535 db=65535 timeout=1ms;"
+    },
+    {
+      "name": "control-tls-numeric-host",
+      "category": "tls",
+      "expect": "accept",
+      "http_config": "    error_abuse_redis host=tls://127.0.0.1;\n    error_abuse_zone zone=tlscontrol:1m redis=on;"
+    },
+    {
+      "name": "duplicate-zone-option",
+      "category": "duplicate",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m threshold=2 threshold=3;",
+      "diagnostic": "duplicate error_abuse_zone parameter"
+    },
+    {
+      "name": "duplicate-enable-option",
+      "category": "duplicate",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m;\n    error_abuse zone=bad status=429 status=403;",
+      "diagnostic": "duplicate error_abuse parameter"
+    },
+    {
+      "name": "duplicate-redis-option",
+      "category": "duplicate",
+      "expect": "reject",
+      "http_config": "    error_abuse_redis host=127.0.0.1 port=6379 port=6380;",
+      "diagnostic": "duplicate error_abuse_redis parameter"
+    },
+    {
+      "name": "boundary-zone-threshold-zero",
+      "category": "boundary",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m threshold=0;",
+      "diagnostic": "invalid error_abuse_zone parameter"
+    },
+    {
+      "name": "boundary-zone-threshold-over-max",
+      "category": "boundary",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m threshold=1025;",
+      "diagnostic": "invalid error_abuse_zone parameter"
+    },
+    {
+      "name": "boundary-enable-status-under-min",
+      "category": "boundary",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m;\n    error_abuse zone=bad status=399;",
+      "diagnostic": "invalid error_abuse parameter"
+    },
+    {
+      "name": "boundary-enable-status-over-max",
+      "category": "boundary",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m;\n    error_abuse zone=bad status=600;",
+      "diagnostic": "invalid error_abuse parameter"
+    },
+    {
+      "name": "boundary-redis-port-zero",
+      "category": "boundary",
+      "expect": "reject",
+      "http_config": "    error_abuse_redis host=127.0.0.1 port=0;",
+      "diagnostic": "invalid error_abuse_redis parameter"
+    },
+    {
+      "name": "boundary-redis-port-over-max",
+      "category": "boundary",
+      "expect": "reject",
+      "http_config": "    error_abuse_redis host=127.0.0.1 port=65536;",
+      "diagnostic": "invalid error_abuse_redis parameter"
+    },
+    {
+      "name": "tls-empty-host",
+      "category": "tls",
+      "expect": "reject",
+      "http_config": "    error_abuse_redis host=tls://;",
+      "diagnostic": "invalid error_abuse_redis parameter"
+    },
+    {
+      "name": "rediss-empty-host",
+      "category": "tls",
+      "expect": "reject",
+      "http_config": "    error_abuse_redis host=rediss://;",
+      "diagnostic": "invalid error_abuse_redis parameter"
+    },
+    {
+      "name": "secret-zone-invalid-hex",
+      "category": "secret",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m persist=@ROOT@.state persist_secret=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz;",
+      "diagnostic": "persist_secret=<redacted>",
+      "forbidden": ["zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"]
+    },
+    {
+      "name": "secret-redis-duplicate-password",
+      "category": "secret",
+      "expect": "reject",
+      "http_config": "    error_abuse_redis host=127.0.0.1 password=redis-secret-first password=redis-secret-second;",
+      "diagnostic": "password=<redacted>",
+      "forbidden": ["redis-secret-first", "redis-secret-second"]
+    },
+    {
+      "name": "dependency-zone-redis-backend",
+      "category": "dependency",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m redis=on;",
+      "diagnostic": "requires error_abuse_redis"
+    },
+    {
+      "name": "dependency-redis-user-password",
+      "category": "dependency",
+      "expect": "reject",
+      "http_config": "    error_abuse_redis host=127.0.0.1 user=operator;",
+      "diagnostic": "user= requires password="
+    },
+    {
+      "name": "dependency-persist-interval",
+      "category": "dependency",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m persist_interval=100ms;",
+      "diagnostic": "persist_interval requires persist"
+    },
+    {
+      "name": "dependency-persist-secret",
+      "category": "dependency",
+      "expect": "reject",
+      "http_config": "    error_abuse_zone zone=bad:1m persist_secret=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;",
+      "diagnostic": "persist_secret requires persist"
+    }
+  ]
+}
