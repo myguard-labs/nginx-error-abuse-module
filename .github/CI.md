@@ -2,19 +2,29 @@
 
 The CI pipeline is intentionally split by failure class:
 
-PR/push gates:
+Pull-request gate:
 
 | Workflow | Check | Coverage |
 |---|---|---|
+| `ci.yml` | Orchestrator | The only `pull_request` entry point; calls the seven reusable members below. |
 | `build-test.yml` | `Validation` | workflow lint, shellcheck, Python syntax, cppcheck |
 | `build-test.yml` | `Build` | pinned nginx mainline, strict compile |
 | `build-test.yml` | `Runtime` | multi-worker behavior, two-host Redis aggregation, snapshots and restart restore |
 | `build-test.yml` | `ASan and UBSan` | memory safety and undefined behavior |
+| `asan.yml` | `ASan and UBSan` | static module build plus single-process and multi-worker request-storm/reload lanes |
 | `fuzzing.yml` | `Fuzz regression (120s/target)` | short libFuzzer regression run of the parse targets, with corpus and dictionary |
 | `valgrind.yml` | `Memcheck lite (60s soak)` | uninitialized reads, invalid memory access, and definite/indirect leaks (`--errors-for-leak-kinds=definite,indirect`) |
 | `security-scanners.yml` | `Security scanners` | flawfinder (high-severity gate), clang-tidy (`cert-*`, `bugprone-*`, `clang-analyzer-security.*`), Semgrep (`p/c`, `p/security-audit`) |
+| `codeql.yml` | `CodeQL` | CodeQL analysis over the module translation unit |
+| `lint.yml` | `Lint` | shell, Python, Perl, YAML/workflow, spelling, runner, port, cadence, secret, sync-stamp and docs-drift checks |
 
-Deep pass (`ci-deep.yml`, monthly cron on the 1st + `workflow_dispatch`):
+The seven reusable members are called by `ci.yml` in four runner lanes. `build-test`
+precedes `asan`; `codeql` precedes `security-scanners`; `valgrind` precedes
+`lint`; `fuzzing` runs independently. Members carry `workflow_call` and do not
+have their own pull-request or push trigger, so each change enters the lane once.
+
+Deep pass (`ci-deep.yml`, monthly cron on the 1st + `workflow_dispatch`, not a
+PR-lane member):
 
 | Job | Coverage |
 |---|---|
@@ -24,34 +34,18 @@ Deep pass (`ci-deep.yml`, monthly cron on the 1st + `workflow_dispatch`):
 | `Security scanners` | same scanner set as the PR gate |
 
 All third-party actions are pinned to immutable commit SHAs. Workflows use
-read-only repository permissions.
+read-only repository permissions. Every job loads `.github/versions.env` via
+`.github/scripts/load-versions.sh` before using a toolchain or source pin.
 
-## Divergence from the skeleton reference (checkpoint 4b, rule 2)
+## Default versions
 
-This repo's workflow set differs from `nginx-skeleton-module`'s in both
-directions. Per-item keep-or-fold call, with evidence:
-
-- **`ci-deep.yml` — KEPT.** Schedule-only (`cron` on the 1st +
-  `workflow_dispatch`), not a `pull_request` member. Runs the long fuzz +
-  full memcheck + helgrind sweep that the PR-lane `fuzzing.yml`/`valgrind.yml`
-  intentionally keep short. Gates something the PR lane does not: see
-  `ci-deep.yml` job list above. Matches the reference's own `ci-deep.yml`
-  pattern — same role, not a duplicate.
-- **`asan.yml` — ABSENT, due checkpoint 6.** ASan/UBSan currently runs as a
-  job inside `build-test.yml` (see the `Build&Test` row above and the
-  `ASan and UBSan` local command). The reference splits it into its own
-  workflow for an independent request-storm soak; this repo has not split it
-  out yet. No badge added for it now — see the `<!-- A/UBSan badge -->`
-  placeholder comment in README.md.
-- **`lint.yml` — ABSENT, due checkpoint 7.** The reference's `ci/linter/`
-  gate has not been ported to this module yet; `build-test.yml`'s
-  `Validation` job (workflow lint, shellcheck, Python syntax, cppcheck, see
-  above) covers a subset in the meantime.
-- **`bump.yml` — ABSENT.** Version pins are maintained manually in
-  `.github/versions.env`. Workflows load that file and `ci-build.sh` accepts
-  only its pinned nginx and Angie versions. Every restored or downloaded source
-  archive is SHA-256 verified before extraction; `NO_CACHE=1` forces a fresh
-  download but does not bypass verification.
+`.github/versions.env` is the single source of truth. `NGINX_VERSION` is the
+default for every single-version PR job and currently tracks mainline
+(`NGINX_MAINLINE`); `NGINX_STABLE` and `ANGIE_VERSION` are used only by the
+deep-pass matrix. Each version has an adjacent SHA-256 pin, and
+`load-versions.sh` validates and exports the file into `$GITHUB_ENV`.
+There is no automatic bump workflow: update the file with
+`compute-versions.sh`, verify the digest, and run the linter.
 
 ## Local commands
 

@@ -2,8 +2,8 @@
 # Copyright (C) 2026 Thijs Eilander
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# ci/linter/lint-docs-drift.sh -- README.md and .github/workflows/ describe the
-# same pipeline.
+# ci/linter/lint-docs-drift.sh -- README.md, .github/CI.md and
+# .github/workflows/ describe the same pipeline.
 #
 # The rule and the reasoning live in ci/linter/workflow_policy.py (subcommand
 # `docs`); this wrapper exists so run-all.sh picks the check up by glob and
@@ -27,7 +27,7 @@
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 
-mapfile -t FILES < <(lint_files '^(\.github/workflows/.*\.ya?ml|README\.md)$' "$@")
+mapfile -t FILES < <(lint_files '^(\.github/workflows/.*\.ya?ml|\.github/CI\.md|README\.md)$' "$@")
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-docs-drift: no workflow or README changes"; exit 0; }
 
 need python3 "apt-get install python3"
