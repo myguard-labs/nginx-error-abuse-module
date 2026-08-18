@@ -305,7 +305,8 @@ def _order_finding(where: str, node: dict) -> str | None:
     # Index order cannot separate those, so fall back to position within the text.
     if first_bind == verify:
         run = runs[verify]
-        if run.index(BAND_VERIFIER) < BINDER_RE.search(run).start():
+        binder = BINDER_RE.search(run)
+        if binder is not None and run.index(BAND_VERIFIER) < binder.start():
             return None
         return (
             f"{where} binds the band earlier in the same step than it runs "
