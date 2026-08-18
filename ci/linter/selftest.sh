@@ -67,6 +67,14 @@ fi
 # real run so this stays independent of which linters are installed.
 case_ 0 "--list works" ci/linter/run-all.sh --list
 
+# The actionlint archive must fail closed for a valid-but-wrong archive. This
+# is hermetic: it exercises the trusted verifier without downloading anything.
+wrong_archive="$(mktemp "${TMPDIR:-/tmp}/actionlint-wrong.XXXXXX")"
+printf 'not the pinned actionlint archive\n' >"$wrong_archive"
+case_ 1 "actionlint wrong archive is rejected" \
+    ci/linter/actionlint-archive.sh verify "$wrong_archive"
+rm -f "$wrong_archive"
+
 # ----------------------------------------------------------------------------
 # workflow_policy.py -- the red path of each policy check.
 #

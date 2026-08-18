@@ -1,4 +1,4 @@
-# sync-sha: 918aee47260a269d318250de4c31d5a0dcec2e7f667a4d061adbe394b956f730
+# sync-sha: 62ee9084900e74145faae0706990f186fcbfd72872195745dbbf15269a582994
 name: Build and Test
 
 env:
@@ -68,13 +68,11 @@ jobs:
           version=1.7.7
           base="https://github.com/rhysd/actionlint/releases/download/v${version}"
           tarball="actionlint_${version}_linux_amd64.tar.gz"
-          # CI-8: verify the tarball against the checksums file published in the
-          # same signed release before executing it, so a tampered asset fails.
+          # CI-8: use the same trusted digest as the local installer; a checksum
+          # file fetched from the asset's release origin is not independent.
+          . ci/linter/actionlint-archive.sh
           curl -fsSL -o /tmp/actionlint.tgz "${base}/${tarball}"
-          curl -fsSL -o /tmp/actionlint.checksums \
-            "${base}/actionlint_${version}_checksums.txt"
-          ( cd /tmp && grep " ${tarball}\$" actionlint.checksums \
-              | sed 's#'"${tarball}"'#actionlint.tgz#' | sha256sum -c - )
+          verify_actionlint_archive /tmp/actionlint.tgz
           tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
           /tmp/actionlint -color .github/workflows/*.yml
 

@@ -23,6 +23,10 @@
 
 set -uo pipefail
 
+# Keep the CI download and local installer on the same trusted archive pin.
+# shellcheck source=ci/linter/actionlint-archive.sh
+. "$(dirname "$0")/actionlint-archive.sh"
+
 CHECK=0 FORCE=0
 case "${1:-}" in
     --check) CHECK=1 ;;
@@ -171,14 +175,13 @@ install_actionlint() {
     # does it: a version must not be able to move while its digest stays behind.
     # From the upstream release's actionlint_<ver>_checksums.txt.
     local ver="1.7.7"
-    local sha="023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
     local tmp
     tmp="$(mktemp -d)"
     curl -fsSL -o "$tmp/al.tgz" \
         "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz" || return 1
-    if ! printf '%s  %s\n' "$sha" "$tmp/al.tgz" | sha256sum -c - >/dev/null 2>&1; then
+    if ! verify_actionlint_archive "$tmp/al.tgz"; then
         echo "actionlint ${ver}: sha256 mismatch" >&2
-        echo "  expected: $sha" >&2
+        echo "  expected: $(actionlint_archive_sha)" >&2
         echo "  got:      $(sha256sum < "$tmp/al.tgz" | cut -d' ' -f1)" >&2
         rm -rf "$tmp"
         return 1
