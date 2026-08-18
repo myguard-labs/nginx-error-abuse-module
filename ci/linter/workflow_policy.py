@@ -494,6 +494,8 @@ def check_docs() -> int:
         print("lint-docs-drift: no README.md", file=sys.stderr)
         return 2
     text = readme.read_text(encoding="utf-8")
+    ci_doc = ROOT / ".github" / "CI.md"
+    ci_text = ci_doc.read_text(encoding="utf-8") if ci_doc.is_file() else None
 
     names = {p.name for p in workflows()}
     for name in sorted(names):
@@ -502,6 +504,29 @@ def check_docs() -> int:
                 f"{name} exists under .github/workflows/ but is not mentioned "
                 "in README.md -- an undocumented gate"
             )
+        if ci_text is not None and name not in ci_text:
+            errors.append(
+                f"{name} exists under .github/workflows/ but is not mentioned "
+                "in .github/CI.md -- the pipeline topology is undocumented"
+            )
+
+        # A workflow that exists cannot be described as ABSENT. This catches
+        # the old checkpoint prose even when the rest of the document still
+        # happens to mention the filename elsewhere.
+        if ci_text is not None and re.search(
+            rf"`{re.escape(name)}`\s*[—-]\s*ABSENT\b", ci_text, re.IGNORECASE
+        ):
+            errors.append(
+                f".github/CI.md describes existing {name} as ABSENT -- "
+                "refresh the gate/topology documentation"
+            )
+    if ci_text is not None and re.search(
+        r"has not been (?:ported|split|implemented)\b", ci_text, re.IGNORECASE
+    ):
+        errors.append(
+            ".github/CI.md contains an inert adoption claim (has not been "
+            "ported/split/implemented) -- refresh the current topology"
+        )
     # Only PATH-QUALIFIED references. A bare "ci.yml" in prose could mean any
     # file; ".github/workflows/ci.yml" is unambiguously a claim that this repo
     # has that workflow, which is the claim worth checking.
@@ -514,7 +539,7 @@ def check_docs() -> int:
     return report(
         "lint-docs-drift",
         errors,
-        f"{len(names)} workflow(s), all documented in README.md",
+        f"{len(names)} workflow(s), all documented in README.md and .github/CI.md",
     )
 
 
