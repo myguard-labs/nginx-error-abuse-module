@@ -207,6 +207,29 @@ places an active LRU-tail ban before exactly one reclaimable entry. Changing
 `eviction capacity exceeded bounded fixture (300 nodes)`, because active bans
 were evicted instead of preserving a full zone; restoring the predicate returned
 `OK: mixed blocked/unblocked eviction control`.
+
+RA-5 deadline clamp controls (2026-08-18) -- each fixture starts from a real
+serialized or RESP2-supplied ban and is runnable in isolation. Replacing the
+snapshot clamp assignment with `ean->blocked_until = (time_t) rec_blocked`,
+then rebuilding, produced a module with mtime
+`2026-08-18 23:05:30.354159092 +0200` and size 923112 bytes. These commands:
+
+    python3 ci/tools/test_runtime.py --port 19240 --nginx-binary "$PWD/.build/nginx-1.31.3-debug/objs/nginx" --module "$PWD/.build/nginx-1.31.3-debug/objs/ngx_http_error_abuse_module.so" --deadline-clamp snapshot-crc
+    python3 ci/tools/test_runtime.py --port 19240 --nginx-binary "$PWD/.build/nginx-1.31.3-debug/objs/nginx" --module "$PWD/.build/nginx-1.31.3-debug/objs/ngx_http_error_abuse_module.so" --deadline-clamp snapshot-hmac
+
+failed respectively with `snapshot-crc: Retry-After 86400 exceeds block=10`
+and `snapshot-hmac: Retry-After 86400 exceeds block=30`. Restoring the clamp
+and rebuilding produced a 923208-byte module at
+`2026-08-18 23:06:12.167139238 +0200`; both exact commands returned their
+`OK:` verdicts. Deleting the whole Redis clamp block and rebuilding produced a
+923144-byte module at `2026-08-18 23:06:31.158090298 +0200`. This command:
+
+    python3 ci/tools/test_runtime.py --port 19240 --nginx-binary "$PWD/.build/nginx-1.31.3-debug/objs/nginx" --module "$PWD/.build/nginx-1.31.3-debug/objs/ngx_http_error_abuse_module.so" --deadline-clamp redis
+
+failed with `redis: Retry-After 86400 exceeds block=10`. Restoring the Redis
+clamp and rebuilding produced a 923208-byte module at
+`2026-08-18 23:06:54.218775821 +0200`; the same command returned
+`OK: redis deadline clamp control`.
 """
 
 from __future__ import annotations
@@ -215,6 +238,7 @@ import argparse
 import atexit
 import concurrent.futures
 import hashlib
+import hmac
 import os
 import pathlib
 import re
@@ -268,6 +292,8 @@ SANITIZER_MARKERS = (
     "ERROR SUMMARY:",
 )
 
+PERSIST_SECRET = bytes(range(0, 256, 17))
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -280,6 +306,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-safety-only", action="store_true")
     parser.add_argument("--mixed-eviction-only", action="store_true")
     parser.add_argument("--oversized-snapshot-only", action="store_true")
+    parser.add_argument(
+        "--deadline-clamp",
+        choices=("snapshot-crc", "snapshot-hmac", "redis"),
+        help="run only one snapshot/Redis deadline clamp control",
+    )
     parser.add_argument(
         "--reject-header-fault",
         choices=("cache-control", "retry-after"),
@@ -658,7 +689,7 @@ http {{
     error_abuse_zone zone=secret:1m key=$binary_remote_addr
                      statuses=404 interval=30s threshold=2 block=30s
                      persist={root}/secret.state persist_interval=100ms
-                     persist_secret=00112233445566778899aabbccddeeff;
+                     persist_secret={PERSIST_SECRET.hex()};
 
     server {{
         listen 127.0.0.1:{port};
@@ -1070,6 +1101,181 @@ class HostileRedisServer:
             self._thread.join(timeout=5)
         self._server = None
         self._thread = None
+
+
+class DeadlineRedisServer(HostileRedisServer):
+    """Minimal RESP2 peer whose GET reply is an excessive block deadline."""
+
+    def __init__(self, deadline: int) -> None:
+        super().__init__()
+        self.deadline = str(deadline).encode("ascii")
+
+    def _response(self, command: list[bytes]) -> bytes:
+        if command[0].upper() == b"GET":
+            return (
+                b"$"
+                + str(len(self.deadline)).encode("ascii")
+                + b"\r\n"
+                + self.deadline
+                + b"\r\n"
+            )
+        return super()._response(command)
+
+
+def _assert_bounded_retry_after(
+    label: str,
+    status: int,
+    headers: dict[str, str],
+    maximum: int,
+) -> None:
+    if status != 429:
+        raise AssertionError(f"{label}: expected restored block, got {status}")
+    raw_retry_after = headers.get("retry-after")
+    if raw_retry_after is None:
+        raise AssertionError(f"{label}: missing Retry-After")
+    try:
+        retry_after = int(raw_retry_after)
+    except ValueError as exc:
+        raise AssertionError(
+            f"{label}: non-integer Retry-After {raw_retry_after!r}"
+        ) from exc
+    if not 1 <= retry_after <= maximum:
+        raise AssertionError(
+            f"{label}: Retry-After {retry_after} exceeds block={maximum}"
+        )
+
+
+def _set_snapshot_deadline(
+    state: pathlib.Path,
+    deadline: int,
+    secret: bytes | None,
+) -> None:
+    header_len = 24
+    mac_len = hashlib.sha256().digest_size if secret is not None else 0
+    data = bytearray(state.read_bytes())
+    payload_end = len(data) - mac_len
+    blocked_until_off = header_len + 4
+
+    if payload_end < blocked_until_off + 8:
+        raise AssertionError("deadline snapshot fixture is truncated")
+    if struct.unpack_from("<I", data, 16)[0] != 1:
+        raise AssertionError("deadline snapshot fixture must contain one record")
+    if struct.unpack_from("<H", data, header_len)[0] != hashlib.sha256().digest_size:
+        raise AssertionError("deadline snapshot fixture has an unexpected key length")
+
+    struct.pack_into("<q", data, blocked_until_off, deadline)
+    struct.pack_into("<I", data, 20, zlib.crc32(data[header_len:payload_end]))
+    if secret is not None:
+        data[payload_end:] = hmac.new(
+            secret, data[:payload_end], hashlib.sha256
+        ).digest()
+
+    state.write_bytes(data)
+    os.chmod(state, 0o600)
+
+    written = state.read_bytes()
+    if struct.unpack_from("<q", written, blocked_until_off)[0] != deadline:
+        raise AssertionError("deadline snapshot fixture did not retain its deadline")
+    if struct.unpack_from("<I", written, 20)[0] != zlib.crc32(
+        written[header_len:payload_end]
+    ):
+        raise AssertionError("deadline snapshot fixture CRC32 is invalid")
+    if secret is not None and not hmac.compare_digest(
+        written[payload_end:],
+        hmac.new(secret, written[:payload_end], hashlib.sha256).digest(),
+    ):
+        raise AssertionError("deadline snapshot fixture HMAC is invalid")
+
+
+def test_snapshot_deadline_clamp(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+    authenticated: bool,
+) -> None:
+    """A valid excessive snapshot deadline is restored only up to block."""
+    label = "snapshot-hmac" if authenticated else "snapshot-crc"
+    zone = "secret" if authenticated else "persist"
+    threshold = 2 if authenticated else 3
+    maximum = 30 if authenticated else 10
+    state_name = "secret.state" if authenticated else "persisted.state"
+    server = Nginx(binary, module, root / label, port, runner, True)
+
+    try:
+        server.start()
+        for _ in range(threshold):
+            expect(port, f"/{zone}-error", 404)
+        expect(port, f"/{zone}-ok", 429)
+    finally:
+        server.stop()
+
+    state = server.root / state_name
+    excessive_deadline = int(time.time()) + 86_400
+    _set_snapshot_deadline(
+        state,
+        excessive_deadline,
+        PERSIST_SECRET if authenticated else None,
+    )
+
+    try:
+        server.start()
+        status, headers = fetch(port, f"/{zone}-ok")
+        _assert_bounded_retry_after(label, status, headers, maximum)
+    finally:
+        server.stop()
+    server.assert_clean_logs()
+
+
+def test_redis_deadline_clamp(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> None:
+    """An excessive Redis block value cannot produce an excessive header."""
+    redis = DeadlineRedisServer(int(time.time()) + 86_400)
+    server: Nginx | None = None
+    try:
+        redis.start()
+        server = Nginx(
+            binary,
+            module,
+            root / "redis-deadline",
+            port,
+            runner,
+            True,
+            redis.port,
+            f"error-abuse-deadline-{os.getpid()}:",
+        )
+        server.start()
+
+        ready_deadline = time.monotonic() + 5.0
+        attempt = 0
+        while True:
+            status, headers = fetch(port, f"/redis-ok?client=deadline-{attempt}")
+            if status == 429:
+                break
+            if status != 200:
+                raise AssertionError(
+                    f"redis: expected readiness pass or restored block, got {status}"
+                )
+            remaining = ready_deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("Redis deadline fixture was never consulted")
+            attempt += 1
+            time.sleep(min(0.02, remaining))
+
+        redis.wait_for(b"GET")
+        _assert_bounded_retry_after("redis", status, headers, 10)
+    finally:
+        if server is not None:
+            server.stop()
+        redis.stop()
+    if server is not None:
+        server.assert_clean_logs()
 
 
 def _wait_for_log(error_log: pathlib.Path, marker: bytes, timeout: float = 5.0) -> None:
@@ -2467,12 +2673,33 @@ def main() -> int:
                 args.port,
             )
             return 0
+        if args.deadline_clamp:
+            if args.deadline_clamp == "redis":
+                test_redis_deadline_clamp(binary, module, root, args.runner, args.port)
+            else:
+                test_snapshot_deadline_clamp(
+                    binary,
+                    module,
+                    root,
+                    args.runner,
+                    args.port,
+                    authenticated=args.deadline_clamp == "snapshot-hmac",
+                )
+            print(f"OK: {args.deadline_clamp} deadline clamp control")
+            return 0
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
         test_log_safety(binary, module, root, args.runner, args.port + 10)
         if args.log_safety_only:
             print("OK: log safety controls")
             return 0
+        test_snapshot_deadline_clamp(
+            binary, module, root, args.runner, args.port + 12, False
+        )
+        test_snapshot_deadline_clamp(
+            binary, module, root, args.runner, args.port + 12, True
+        )
+        test_redis_deadline_clamp(binary, module, root, args.runner, args.port + 12)
         test_on_full_policy(
             binary,
             module,
