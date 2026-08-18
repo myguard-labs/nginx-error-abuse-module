@@ -1,4 +1,4 @@
-# sync-sha: 9b18811cfb4244f54ad13cac8d197c9e58a9cbe1dfcb0eb43cab7d0b817809cc
+# sync-sha: 82a5f31a8bee0d7e2a449c45ea201ab604e12b66639bd166a5534ffb98588b34
 name: Build and Test
 
 env:
@@ -162,10 +162,14 @@ jobs:
             done
           )
 
-      - name: Build rejection-header fault modules
+      - name: Build deterministic fault-control modules
         run: |
           bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-list-push
           bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-retry-buffer
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-persist-short-read
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-persist-short-write
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-persist-fsync
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-redis-backoff
 
       - name: Stage artifact
         if: matrix.primary
@@ -177,6 +181,14 @@ jobs:
             artifact/ngx_http_error_abuse_fault_list_push_module.so
           cp ".build/nginx-${NGINX_VERSION}-fault-retry-buffer/objs/ngx_http_error_abuse_module.so" \
             artifact/ngx_http_error_abuse_fault_retry_buffer_module.so
+          cp ".build/nginx-${NGINX_VERSION}-fault-persist-short-read/objs/ngx_http_error_abuse_module.so" \
+            artifact/ngx_http_error_abuse_fault_persist_short_read_module.so
+          cp ".build/nginx-${NGINX_VERSION}-fault-persist-short-write/objs/ngx_http_error_abuse_module.so" \
+            artifact/ngx_http_error_abuse_fault_persist_short_write_module.so
+          cp ".build/nginx-${NGINX_VERSION}-fault-persist-fsync/objs/ngx_http_error_abuse_module.so" \
+            artifact/ngx_http_error_abuse_fault_persist_fsync_module.so
+          cp ".build/nginx-${NGINX_VERSION}-fault-redis-backoff/objs/ngx_http_error_abuse_module.so" \
+            artifact/ngx_http_error_abuse_fault_redis_backoff_module.so
 
       - name: Upload nginx artifact
         if: matrix.primary
@@ -258,6 +270,23 @@ jobs:
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_retry_buffer_module.so" \
             --reject-header-fault retry-after
+
+      - name: Run persistence I/O and Redis backoff controls
+        run: |
+          for fault in short-read short-write fsync; do
+            module_name="${fault//-/_}"
+            python3 ci/tools/test_runtime.py \
+              --port "$((TEST_BASE_PORT + 24))" \
+              --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+              --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module.so" \
+              --fault-module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_persist_${module_name}_module.so" \
+              --persistence-io-fault "$fault"
+          done
+          python3 ci/tools/test_runtime.py \
+            --port "$((TEST_BASE_PORT + 25))" \
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+            --fault-module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_redis_backoff_module.so" \
+            --redis-backoff-cap
 
   coverage:
     name: Coverage report

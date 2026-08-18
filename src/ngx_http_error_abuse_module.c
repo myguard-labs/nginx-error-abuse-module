@@ -55,8 +55,15 @@
 #define NGX_HTTP_ERROR_ABUSE_DEFAULT_BLOCK     3600
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC    "NGEAB01"
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN 8
+/* Test builds may shorten this sequence; production keeps the documented
+ * one-second base and 30-second cap.  Keeping the cap arithmetic identical
+ * lets the runtime control prove it without a half-minute outage. */
+#ifndef NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT
 #define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT 1000
+#endif
+#ifndef NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX
 #define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX 30000
+#endif
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD 5
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION 30
 
@@ -3159,6 +3166,14 @@ ngx_http_error_abuse_redis_arm_reconnect(void)
         return;
     }
 
+#if (NGX_HTTP_ERROR_ABUSE_TEST_REDIS_BACKOFF_CAP)
+    /* Reach the production cap on the first disconnected test-peer session,
+     * instead of waiting through 1+2+4+8+16 seconds of real backoff. */
+    if (w->reconnect_backoff == 0) {
+        w->reconnect_backoff = NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX;
+    }
+#endif
+
     base = w->reconnect_backoff ? w->reconnect_backoff
                                 : NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT;
 
@@ -3170,6 +3185,12 @@ ngx_http_error_abuse_redis_arm_reconnect(void)
         (base * 2 > NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX)
             ? NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX
             : base * 2;
+
+#if (NGX_HTTP_ERROR_ABUSE_TEST_REDIS_BACKOFF_TRACE)
+    ngx_log_error(NGX_LOG_NOTICE, w->log, 0,
+                  "error_abuse test reconnect delay=%M next=%M", delay,
+                  w->reconnect_backoff);
+#endif
 
     ngx_add_timer(&w->reconnect, delay);
 }
@@ -3408,7 +3429,11 @@ ngx_http_error_abuse_write_all(ngx_fd_t fd, u_char *data, size_t len)
     ssize_t  n;
 
     while (len != 0) {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_SHORT_WRITE)
+        n = ngx_write_fd(fd, data, len > 1 ? 1 : len);
+#else
         n = ngx_write_fd(fd, data, len);
+#endif
         if (n > 0) {
             data += n;
             len -= (size_t) n;
@@ -3431,7 +3456,11 @@ ngx_http_error_abuse_read_all(ngx_fd_t fd, u_char *data, size_t len)
     ssize_t  n;
 
     while (len != 0) {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_SHORT_READ)
+        n = ngx_read_fd(fd, data, len > 1 ? 1 : len);
+#else
         n = ngx_read_fd(fd, data, len);
+#endif
         if (n > 0) {
             data += n;
             len -= (size_t) n;
@@ -3641,7 +3670,12 @@ ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
 
     /* STAB-2: flush data before the rename so a crash cannot leave an empty
      * renamed snapshot. */
+#if (NGX_HTTP_ERROR_ABUSE_TEST_FAIL_PERSIST_FSYNC)
+    ngx_errno = EIO;
+    if (1) {
+#else
     if (fsync(fd) == -1) {
+#endif
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       "fsync() \"%s\" failed", tmp);
         (void) ngx_close_file(fd);
