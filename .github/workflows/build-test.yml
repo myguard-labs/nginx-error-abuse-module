@@ -1,4 +1,4 @@
-# sync-sha: ff30e8d602e6b2161fdcda0a2696946046e21e84eca6c80f99f0d337bc31ac7b
+# sync-sha: 918aee47260a269d318250de4c31d5a0dcec2e7f667a4d061adbe394b956f730
 name: Build and Test
 
 env:
@@ -164,12 +164,21 @@ jobs:
             done
           )
 
+      - name: Build rejection-header fault modules
+        run: |
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-list-push
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-retry-buffer
+
       - name: Stage artifact
         if: matrix.primary
         run: |
           mkdir artifact
           cp ".build/nginx-${NGINX_VERSION}-debug/objs/nginx" artifact/
           cp ".build/nginx-${NGINX_VERSION}-debug/objs/ngx_http_error_abuse_module.so" artifact/
+          cp ".build/nginx-${NGINX_VERSION}-fault-list-push/objs/ngx_http_error_abuse_module.so" \
+            artifact/ngx_http_error_abuse_fault_list_push_module.so
+          cp ".build/nginx-${NGINX_VERSION}-fault-retry-buffer/objs/ngx_http_error_abuse_module.so" \
+            artifact/ngx_http_error_abuse_fault_retry_buffer_module.so
 
       - name: Upload nginx artifact
         if: matrix.primary
@@ -238,6 +247,19 @@ jobs:
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module.so" \
             --redis-server /usr/bin/redis-server
+
+      - name: Run rejection-header allocation fault controls
+        run: |
+          python3 ci/tools/test_runtime.py \
+            --port "$((TEST_BASE_PORT + 28))" \
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+            --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_list_push_module.so" \
+            --reject-header-fault cache-control
+          python3 ci/tools/test_runtime.py \
+            --port "$((TEST_BASE_PORT + 29))" \
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+            --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_retry_buffer_module.so" \
+            --reject-header-fault retry-after
 
   test-nginx:
     name: Test::Nginx

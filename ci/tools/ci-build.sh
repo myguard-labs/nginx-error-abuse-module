@@ -8,18 +8,21 @@
 #     mode   : debug (default, dynamic .so) | asan (static, sanitizers)
 #              | module (dynamic .so only, nginx core NOT compiled)
 #              | coverage (dynamic .so, gcov-instrumented, -O0)
+#              | fault-list-push | fault-retry-buffer
+#                (test-only dynamic .so; nginx core NOT compiled)
 #
 # The built tree lives under ./.build, ONE TREE PER MODE:
 #   .build/<dir>-<mode>/objs/nginx                          (server binary)
-#   .build/<dir>-<mode>/objs/ngx_http_error_abuse_module.so (debug/module mode)
+#   .build/<dir>-<mode>/objs/ngx_http_error_abuse_module.so (dynamic modes)
 #
 # ---------------------------------------------------------------------------
 # CACHING -- and the one trap that makes it dangerous
 #
-# debug/asan/coverage/module compile the SAME sources with INCOMPATIBLE
-# flags (asan adds -fsanitize=address; coverage adds --coverage; debug does
-# neither). Sharing one tree across modes and relying on `./configure`
-# rewriting objs/Makefile every run is what made that safe WITHOUT caching.
+# All modes compile the SAME sources with INCOMPATIBLE flags (asan adds
+# -fsanitize=address; coverage adds --coverage; fault modes add their test
+# seam; debug does none of those). Sharing one tree across modes and relying
+# on `./configure` to rewrite objs/Makefile every run is what made that safe
+# WITHOUT caching.
 # The moment the build tree itself is cached, that accident becomes a bug: a
 # cached debug objs/ restored into an asan job links non-instrumented
 # objects and the sanitizer job goes green while checking nothing.
@@ -193,6 +196,10 @@ elif [ "$MODE" = "coverage" ]; then
     CC_OPT="--coverage -g -O0 -fno-omit-frame-pointer"
     LD_OPT="--coverage"
     ADD_MODULE="--add-module=$MODULE_DIR"
+elif [ "$MODE" = "fault-list-push" ]; then
+    CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_TEST_FAIL_REJECT_HEADER_PUSH=1"
+elif [ "$MODE" = "fault-retry-buffer" ]; then
+    CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_TEST_FAIL_RETRY_AFTER_ALLOC=1"
 fi
 
 # --- ccache -------------------------------------------------------------
@@ -266,7 +273,8 @@ if [ "$MODE" != "asan" ] && [ "$MODE" != "coverage" ]; then
     make -j"$(nproc)" modules
 fi
 
-if [ "$MODE" != "module" ]; then
+if [ "$MODE" != "module" ] && [ "$MODE" != "fault-list-push" ] \
+   && [ "$MODE" != "fault-retry-buffer" ]; then
     make -j"$(nproc)"
     printf 'binary=%s\n' "$ROOT/$DIR/objs/$BINARY"
 fi
