@@ -135,7 +135,10 @@ HMAC-SHA256. The key must be at least 16 bytes (32 hex characters); 32 bytes
 
 Client identities are stored as a fixed 32-byte SHA-256 digest of the `key`, so
 a large key variable (`$request_uri`, `$http_*`) costs the same memory and Redis
-traffic as a small one — there is no per-key amplification.
+traffic as a small one — there is no per-key amplification. Log records use the
+64-character lowercase digest as `client_sha256`; raw identity bytes are never
+written to the log. Redis and hiredis failures retain numeric status, reply type
+and detail length for diagnosis, but omit backend-provided error text.
 
 **Good news:** almost everything has a sensible default. The shortest config
 that actually works is just:

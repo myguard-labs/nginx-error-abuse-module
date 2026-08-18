@@ -21,8 +21,8 @@
 /* SEC-3: the identity stored in shared memory, Redis and snapshots is a fixed
  * 32-byte SHA-256 digest of the configured key, regardless of how large the raw
  * key variable is. This bounds per-identity memory and Redis traffic so an
- * attacker cannot amplify them with a large $request_uri/$http_* key. The raw
- * key is kept (capped) only for human-readable logging.
+ * attacker cannot amplify them with a large $request_uri/$http_* key. Logs use
+ * the lowercase hexadecimal digest, never the raw identity bytes.
  *
  * NGX_HTTP_ERROR_ABUSE_DIGEST_LEN itself lives in the scan header, spelled as a
  * literal so that TU needs no OpenSSL headers. Check the two agree here, where
@@ -38,7 +38,7 @@
 #error "scan header DIGEST_LEN disagrees with OpenSSL SHA256_DIGEST_LENGTH"
 #endif
 #endif
-#define NGX_HTTP_ERROR_ABUSE_RAW_LOG_MAX  256
+#define NGX_HTTP_ERROR_ABUSE_LOG_KEY_LEN  (NGX_HTTP_ERROR_ABUSE_DIGEST_LEN * 2)
 
 #define NGX_HTTP_ERROR_ABUSE_VERSION       2  /* RFC-3: portable LE format */
 #define NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN  24 /* magic8+ver4+thr4+rec4+crc4 */
@@ -159,7 +159,7 @@ typedef enum {
 typedef struct {
     ngx_http_error_abuse_zone_t  *zone;
     ngx_str_t                     key;            /* 32-byte SHA-256 identity */
-    ngx_str_t                     raw_key;        /* capped, for logging only */
+    ngx_str_t                     log_key;        /* lowercase hex of key */
     ngx_str_t                     redis_events;   /* PERF-3: built once */
     ngx_str_t                     redis_block;
     ngx_uint_t                    count;
@@ -784,9 +784,9 @@ ngx_http_error_abuse_log_decision(ngx_http_request_t *r,
     const char *action)
 {
     ngx_log_error(conf->log_level, r->connection->log, 0,
-                  "error_abuse %s: client \"%V\" in zone \"%V\" %s "
+                  "error_abuse %s: client_sha256=\"%V\" in zone \"%V\" %s "
                   "(count=%ui, until=%T)",
-                  source, &ctx->raw_key, &ctx->zone->name, action,
+                  source, &ctx->log_key, &ctx->zone->name, action,
                   ctx->count, ctx->blocked_until);
 }
 
@@ -898,9 +898,9 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     }
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "error_abuse: preaccess check for client \"%V\" "
+                   "error_abuse: preaccess check for client_sha256=\"%V\" "
                    "in zone \"%V\"",
-                   &ctx->raw_key, &ctx->zone->name);
+                   &ctx->log_key, &ctx->zone->name);
 
     if (ctx->zone->redis && !ctx->redis_checked) {
         rc = ngx_http_error_abuse_redis_check(r, ctx);
@@ -933,9 +933,9 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
                                          &ctx->blocked_until);
     if (rc == NGX_OK) {
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: client \"%V\" in zone \"%V\" "
+                       "error_abuse: client_sha256=\"%V\" in zone \"%V\" "
                        "currently blocked",
-                       &ctx->raw_key, &ctx->zone->name);
+                       &ctx->log_key, &ctx->zone->name);
         if (ngx_http_error_abuse_effective_dry_run(ctx, conf)) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
             ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
@@ -953,9 +953,9 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     }
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "error_abuse: client \"%V\" in zone \"%V\" passed, "
+                   "error_abuse: client_sha256=\"%V\" in zone \"%V\" passed, "
                    "count=%ui",
-                   &ctx->raw_key, &ctx->zone->name, ctx->count);
+                   &ctx->log_key, &ctx->zone->name, ctx->count);
     return NGX_DECLINED;
 }
 
@@ -1023,8 +1023,8 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
     {
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: status %ui not tracked in zone \"%V\" "
-                       "for client \"%V\"",
-                       r->headers_out.status, &ctx->zone->name, &ctx->raw_key);
+                       "for client_sha256=\"%V\"",
+                       r->headers_out.status, &ctx->zone->name, &ctx->log_key);
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
@@ -1046,9 +1046,10 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
                                               "(threshold reached)");
         } else {
             ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "error_abuse: dry-run status %ui for client \"%V\" "
+                           "error_abuse: dry-run status %ui for "
+                           "client_sha256=\"%V\" "
                            "in zone \"%V\", count=%ui",
-                           r->headers_out.status, &ctx->raw_key,
+                           r->headers_out.status, &ctx->log_key,
                            &ctx->zone->name, ctx->count);
         }
         return ngx_http_error_abuse_next_header_filter(r);
@@ -1084,9 +1085,10 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
                                           "threshold reached");
     } else {
         ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: status %ui counted for client \"%V\" "
+                       "error_abuse: status %ui counted for "
+                       "client_sha256=\"%V\" "
                        "in zone \"%V\", count=%ui",
-                       r->headers_out.status, &ctx->raw_key,
+                       r->headers_out.status, &ctx->log_key,
                        &ctx->zone->name, ctx->count);
         ctx->state = NGX_HTTP_ERROR_ABUSE_COUNTED;
     }
@@ -1220,8 +1222,8 @@ ngx_http_error_abuse_prepare_ctx(ngx_http_request_t *r,
     }
 
     /* SEC-3: hash the (arbitrary-length) raw key to a fixed 32-byte identity.
-     * No length limit is needed — memory and Redis traffic are bounded by the
-     * digest, not the raw key. Keep a capped copy of the raw key for logs. */
+     * No length limit is needed — memory, Redis traffic and the printable log
+     * representation are all bounded by the digest, not the raw key. */
     ctx->key.data = ngx_pnalloc(r->pool, NGX_HTTP_ERROR_ABUSE_DIGEST_LEN);
     if (ctx->key.data == NULL) {
         return NULL;
@@ -1229,12 +1231,12 @@ ngx_http_error_abuse_prepare_ctx(ngx_http_request_t *r,
     SHA256(key.data, key.len, ctx->key.data);
     ctx->key.len = NGX_HTTP_ERROR_ABUSE_DIGEST_LEN;
 
-    ctx->raw_key.len = ngx_min(key.len, NGX_HTTP_ERROR_ABUSE_RAW_LOG_MAX);
-    ctx->raw_key.data = ngx_pnalloc(r->pool, ctx->raw_key.len);
-    if (ctx->raw_key.data == NULL) {
+    ctx->log_key.len = NGX_HTTP_ERROR_ABUSE_LOG_KEY_LEN;
+    ctx->log_key.data = ngx_pnalloc(r->pool, ctx->log_key.len);
+    if (ctx->log_key.data == NULL) {
         return NULL;
     }
-    ngx_memcpy(ctx->raw_key.data, key.data, ctx->raw_key.len);
+    ngx_hex_dump(ctx->log_key.data, ctx->key.data, ctx->key.len);
 
     ctx->zone = conf->zone;
     ctx->state = NGX_HTTP_ERROR_ABUSE_PASSED;
@@ -2463,8 +2465,8 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "error_abuse: checking Redis block key \"%V\" "
-                   "for client \"%V\"",
-                   &block, &ctx->raw_key);
+                   "for client_sha256=\"%V\"",
+                   &block, &ctx->log_key);
 
     argv[0] = "GET";
     argvlen[0] = 3;
@@ -2538,16 +2540,16 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
         ctx->count = ctx->zone->threshold;
         ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: Redis check for client \"%V\" "
+                       "error_abuse: Redis check for client_sha256=\"%V\" "
                        "returned BLOCKED until %T",
-                       &ctx->raw_key, ctx->blocked_until);
+                       &ctx->log_key, ctx->blocked_until);
 
     } else if (reply->type == REDIS_REPLY_NIL) {
         /* not blocked: a valid, successful answer — reset the breaker. */
         ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: Redis check for client \"%V\" "
-                       "returned not blocked", &ctx->raw_key);
+                       "error_abuse: Redis check for client_sha256=\"%V\" "
+                       "returned not blocked", &ctx->log_key);
 
     } else {
         /* COR-5: REDIS_REPLY_ERROR (NOAUTH, WRONGTYPE, ...) or an unexpected
@@ -2555,11 +2557,9 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
         ngx_http_error_abuse_redis_record_failure(ngx_time());
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "error_abuse: Redis check returned unexpected reply "
-                      "type %d%s%s", reply->type,
+                      "(type=%d, detail_len=%uz)", reply->type,
                       reply->type == REDIS_REPLY_ERROR && reply->str
-                          ? ": " : "",
-                      reply->type == REDIS_REPLY_ERROR && reply->str
-                          ? reply->str : "");
+                          ? reply->len : 0);
     }
 
     /* F-3: a phase/filter downstream of preaccess (on_full=reject's
@@ -2626,11 +2626,10 @@ ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
 
     ngx_http_error_abuse_redis_record_failure(ngx_time());
     ngx_log_error(NGX_LOG_WARN, ngx_http_error_abuse_redis_worker.log, 0,
-                  "error_abuse: Redis EVAL returned unexpected reply (type %d)"
-                  "%s%s", reply->type,
-                  reply->type == REDIS_REPLY_ERROR && reply->str ? ": " : "",
+                  "error_abuse: Redis EVAL returned unexpected reply "
+                  "(type=%d, detail_len=%uz)", reply->type,
                   reply->type == REDIS_REPLY_ERROR && reply->str
-                      ? reply->str : "");
+                      ? reply->len : 0);
 }
 
 static void
@@ -2660,9 +2659,10 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     }
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "error_abuse: recording event to Redis for client \"%V\", "
+                   "error_abuse: recording event to Redis for "
+                   "client_sha256=\"%V\", "
                    "events_key=\"%V\", block_key=\"%V\"",
-                   &ctx->raw_key, &events, &block);
+                   &ctx->log_key, &events, &block);
 
 #define NGX_ERROR_ABUSE_REDIS_NUMBER(buf, value)                              \
     (size_t) (ngx_snprintf((u_char *) (buf), sizeof(buf), "%L",               \
@@ -2951,8 +2951,9 @@ ngx_http_error_abuse_redis_handshake_callback(redisAsyncContext *ac,
     if (reply->type == REDIS_REPLY_ERROR) {
         worker->ready = 0;
         ngx_log_error(NGX_LOG_ERR, worker->log, 0,
-                      "error_abuse: Redis handshake (AUTH/SELECT) failed: %s",
-                      reply->str ? reply->str : "(unknown)");
+                      "error_abuse: Redis handshake (AUTH/SELECT) failed "
+                      "(type=%d, detail_len=%uz)", reply->type,
+                      reply->str ? reply->len : 0);
     }
 }
 
@@ -3019,7 +3020,8 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
     } else {
         worker->ready = 0;
         ngx_log_error(NGX_LOG_WARN, worker->log, 0,
-                      "error_abuse Redis connection failed: %s", ac->errstr);
+                      "error_abuse Redis connection failed "
+                      "(status=%d, error=%d)", status, ac->err);
     }
 }
 
@@ -3066,16 +3068,16 @@ ngx_http_error_abuse_redis_connect(void)
                 (char *) worker->conf->sni.data, &ssl_err);
             if (worker->ssl == NULL) {
                 ngx_log_error(NGX_LOG_ERR, worker->log, 0,
-                    "error_abuse: Redis TLS context init failed: %s",
-                    redisSSLContextGetError(ssl_err));
+                    "error_abuse: Redis TLS context init failed (error=%d)",
+                    (int) ssl_err);
                 redisAsyncFree(ac);
                 return NGX_ERROR;
             }
         }
         if (redisInitiateSSLWithContext(&ac->c, worker->ssl) != REDIS_OK) {
             ngx_log_error(NGX_LOG_ERR, worker->log, 0,
-                "error_abuse: Redis TLS handshake init failed: %s",
-                ac->c.errstr);
+                "error_abuse: Redis TLS handshake init failed (error=%d)",
+                ac->c.err);
             redisAsyncFree(ac);
             return NGX_ERROR;
         }
