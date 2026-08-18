@@ -208,6 +208,17 @@ places an active LRU-tail ban before exactly one reclaimable entry. Changing
 were evicted instead of preserving a full zone; restoring the predicate returned
 `OK: mixed blocked/unblocked eviction control`.
 
+SP-2 scan-budget control (2026-08-19) -- rebuild the fault module with
+`bash ci/tools/ci-build.sh nginx 1.31.3 fault-evict-scan-budget`, which keeps
+the production eviction path but sets `NGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT=1`.
+Replacing the one-node cap with an unbounded loop made the first pressure
+request reach the reclaimable node too early and fail with
+`/err?client=fresh-first expected 503, got 404`. Restoring the cap, then
+deleting the blocked-node progress update, made the second pressure request
+keep revisiting the protected ban and fail with
+`/err?client=fresh-second expected 404, got 503`. Restoring both returned
+`OK: LRU eviction scan budget/progress control`.
+
 RA-5 deadline clamp controls (2026-08-18) -- each fixture starts from a real
 serialized or RESP2-supplied ban and is runnable in isolation. Replacing the
 snapshot clamp assignment with `ean->blocked_until = (time_t) rec_blocked`,
@@ -348,6 +359,7 @@ def parse_args() -> argparse.Namespace:
         help="replay only the bounded malformed-configuration seed corpus",
     )
     parser.add_argument("--mixed-eviction-only", action="store_true")
+    parser.add_argument("--evict-scan-budget-only", action="store_true")
     parser.add_argument("--oversized-snapshot-only", action="store_true")
     parser.add_argument(
         "--deadline-clamp",
@@ -2261,6 +2273,50 @@ def test_mixed_eviction(
         _on_full_stop(proc)
 
 
+def test_evict_scan_budget(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+) -> None:
+    """The full-zone eviction walk must be capped and still make progress."""
+    capacity = _calibrate_eviction_capacity(
+        binary, module, root / "evict-budget-capacity", runner, nginx_port
+    )
+    proc = _on_full_start(
+        binary,
+        module,
+        root / "evict-budget",
+        runner,
+        nginx_port + 1,
+        "reject",
+        threshold=2,
+    )
+    try:
+        # With NGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT=1 this puts one protected
+        # active ban at the LRU tail, followed by one reclaimable identity.
+        # The first pressure request may scan only the protected ban and must
+        # reject; rotating that ban to the head is the progress signal that
+        # lets the second pressure request reach and reclaim the next node.
+        expect(nginx_port + 1, "/err?client=protected", 404)
+        expect(nginx_port + 1, "/err?client=protected", 404)
+        expect(nginx_port + 1, "/err?client=reclaim", 404)
+        for i in range(capacity - 2):
+            client = f"blocked-{i}"
+            expect(nginx_port + 1, f"/err?client={client}", 404)
+            expect(nginx_port + 1, f"/err?client={client}", 404)
+
+        expect(nginx_port + 1, "/err?client=fresh-first", 503)
+        expect(nginx_port + 1, "/err?client=fresh-second", 404)
+        expect(nginx_port + 1, "/err?client=fresh-second", 404)
+        expect(nginx_port + 1, "/ok?client=fresh-second", 503)
+        expect(nginx_port + 1, "/ok?client=protected", 503)
+        expect(nginx_port + 1, "/ok?client=reclaim", 200)
+    finally:
+        _on_full_stop(proc)
+
+
 def test_oversized_snapshot_rejected(
     binary: pathlib.Path,
     module: pathlib.Path | None,
@@ -3199,14 +3255,22 @@ def main() -> int:
                 args.reject_header_fault,
             )
             return 0
-        if args.mixed_eviction_only or args.oversized_snapshot_only:
+        single_runtime_controls = (
+            args.mixed_eviction_only,
+            args.evict_scan_budget_only,
+            args.oversized_snapshot_only,
+        )
+        if any(single_runtime_controls):
             if module is None:
                 raise ValueError("runtime control requires --module")
-            if args.mixed_eviction_only and args.oversized_snapshot_only:
+            if sum(1 for enabled in single_runtime_controls if enabled) != 1:
                 raise ValueError("select only one runtime control")
             if args.mixed_eviction_only:
                 test_mixed_eviction(binary, module, root, args.runner, args.port)
                 print("OK: mixed blocked/unblocked eviction control")
+            elif args.evict_scan_budget_only:
+                test_evict_scan_budget(binary, module, root, args.runner, args.port)
+                print("OK: LRU eviction scan budget/progress control")
             else:
                 test_oversized_snapshot_rejected(
                     binary, module, root, args.runner, args.port
