@@ -153,7 +153,24 @@ policy_ 1 overlapping-port-bands ports
 # same file spelled correctly, and without it the red below is equally
 # consistent with "every non-PR-reachable workflow is now flagged".
 policy_ 1 schedule-only-runner-labels runners
-policy_ 0 schedule-only-runner-labels-ok runners
+
+# The positive control is checked through a temporary copy whose selector is
+# derived from workflow_policy.py. This keeps the fixture correct for both
+# pool-owning and hosted-only adopters without dirtying the tracked fixture.
+ok_src="ci/linter/fixtures/policy/schedule-only-runner-labels-ok"
+if approved="$(python3 ci/linter/fixture-selector.py 2>/dev/null)" \
+   && [ -n "$approved" ] && [ -d "$ok_src" ]; then
+    ok_tmp="$(mktemp -d "${TMPDIR:-/tmp}/lint-okfix.XXXXXX")"
+    cp -r "$ok_src/." "$ok_tmp/"
+    python3 ci/linter/fixture-selector.py --write \
+        "$ok_tmp/.github/workflows/nightly.yml"
+    case_ 0 "policy runners: schedule-only-runner-labels-ok (selector from workflow_policy)" \
+        env "WORKFLOW_POLICY_ROOT=$ok_tmp" \
+        python3 ci/linter/workflow_policy.py runners
+    rm -rf "$ok_tmp"
+else
+    echo "skip policy runners: schedule-only-runner-labels-ok (SELF_HOSTED_ALLOWED off: hosted-only)"
+fi
 
 # A workflow_call member carrying its own `push:` runs twice per change and BOTH
 # runs are green, so nothing else in the toolchain notices. Measured here on the

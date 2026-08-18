@@ -1,3 +1,4 @@
+# sync-sha: 886a3ef96cefda7bb24afd72f956cce27f52d51bcdf44a924e3db7bab46f77af
 name: Security scanners
 
 # Static/security scanners gate on every PR/push — flawfinder + clang-tidy
@@ -25,7 +26,7 @@ permissions:
 jobs:
   scanners:
     name: Security scanners
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
@@ -114,4 +115,3 @@ jobs:
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
-# sync-sha: f61140813e63cc10e7383a4cbcf8b3b5833bc12dd545cf17d1b5ce14b454a185

@@ -1,3 +1,4 @@
+# sync-sha: 767e2782c74e00a0d8f3e1df76437a8f3d646c6f0890db1c5dfbb7f7c28fb3a6
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -44,7 +45,7 @@ permissions:
 jobs:
   fuzz:
     name: Fuzz (all targets, long)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 600
     steps:
       - name: Checkout module
@@ -182,7 +183,7 @@ jobs:
 
   memcheck:
     name: Valgrind Memcheck soak
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -239,7 +240,7 @@ jobs:
 
   helgrind:
     name: Valgrind Helgrind soak
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -296,7 +297,7 @@ jobs:
 
   scanners:
     name: Security scanners
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
@@ -384,4 +385,3 @@ jobs:
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
-# sync-sha: 06f0a816aa7af7368ad4fe68cf747d6b44ac95818c6388c87641a160259329d0

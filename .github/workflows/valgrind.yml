@@ -1,3 +1,4 @@
+# sync-sha: d5e50855918dfb198d3f7eebf96c318166cd6787d90c25784832724f7b569944
 name: Valgrind
 
 # Valgrind memcheck lite soak on every PR/push — 60s soak so PR feedback stays
@@ -25,7 +26,7 @@ permissions:
 jobs:
   memcheck-lite:
     name: Memcheck lite (60s soak)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 45
     steps:
       - name: Checkout module
@@ -76,4 +77,3 @@ jobs:
         run: |
           bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" 60 4
-# sync-sha: c11c03ed7d56cc18ac88af315f9ff43c78b58d7da231108052568e62f74185cb
