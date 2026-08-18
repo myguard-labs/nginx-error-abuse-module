@@ -11,11 +11,13 @@
 #      (--add-module) nginx binary, in its OWN .build/nginx-<ver>-coverage
 #      tree. The .gcno files land under objs/addon/src/.
 #   2. ci/tests/unit/run.sh with COVERAGE=1  -> the scan core's boundary cases.
-#   3. prove ci/t/ against that instrumented server -> the request-path cases.
+#   3. test_runtime.py against that server -> the module lifecycle, request,
+#      Redis, reload, persistence and corruption paths in module.c.
+#   4. prove ci/t/ against that instrumented server -> the request-path cases.
 #      nginx flushes .gcda on a graceful exit, which is how the worker's arcs
-#      reach disk; Test::Nginx stops the server between blocks, so this needs
-#      no special handling, but a test that KILLs nginx contributes nothing.
-#   4. gcovr over the module's own src/ only.
+#      reach disk; both drivers stop the server cleanly, so this needs no
+#      special handling, but a test that KILLs nginx contributes nothing.
+#   5. gcovr over the module's own src/ only.
 #
 # Env:
 #   COVERAGE_FAIL_UNDER   if set, gcovr exits non-zero below this line %.
@@ -26,6 +28,8 @@
 #                         number is to write tests that move it without
 #                         asserting anything.
 #   COVERAGE_OUT          output directory (default .build/coverage).
+#   REDIS_SERVER          runtime-suite Redis binary (default
+#                         /usr/bin/redis-server).
 #
 # Exit: 0 on success (or a below-threshold report when COVERAGE_FAIL_UNDER is
 # unset), non-zero if a build/test step failed or the threshold was set and
@@ -106,6 +110,17 @@ echo "==> Unit tests (instrumented)"
 COVERAGE=1 NGINX_VERSION="$VERSION" NGX_BUILD_SUFFIX="-coverage" \
     bash ci/tests/unit/run.sh
 
+echo "==> Runtime suite against the instrumented server"
+# The coverage build is static, so omit --module: test_runtime.py accepts that
+# shape and its generated configurations must exercise the compiled-in module.
+# This is deliberately the normal bounded runtime suite, not a reduced smoke
+# mode: module.c's lifecycle, Redis, reload and persistence paths otherwise do
+# not contribute to this report at all.
+python3 ci/tools/test_runtime.py \
+    --port "${TEST_BASE_PORT:-18890}" \
+    --nginx-binary "$BUILD/objs/nginx" \
+    --redis-server "${REDIS_SERVER:-/usr/bin/redis-server}"
+
 echo "==> Test::Nginx suite against the instrumented server"
 # Static build (--add-module): the module is compiled INTO objs/nginx, so
 # there is no TEST_NGINX_LOAD_MODULES .so to point at here, unlike the
@@ -126,19 +141,18 @@ GCOVR_ARGS=(
     # Only the module's own sources. See the header for why an unfiltered run
     # is worse than useless here.
     --filter "$ROOT/src/"
-    --branches
+    --txt-metric branch
     --print-summary
     --html-details "$OUT/index.html"
     --txt "$OUT/summary.txt"
-    # gcov (14.x, this host) resolves the #include headers nginx's core TUs
-    # pull in (ngx_event_timer.h, ngx_string.h, ...) relative to gcov's own
-    # cwd rather than the compile-time -I path baked into the .gcno, and
-    # gcovr 7.x treats "cannot open a header referenced by the source" as a
-    # hard error even though none of those headers are in --filter and their
-    # coverage is never reported. The nginx CORE objects (not this module's)
-    # are the ones that hit this; harmless to ignore since --filter already
-    # excludes them from the report gcovr produces.
+    --json-summary "$OUT/summary.json"
+    # Work from the nginx build root, where gcov can resolve nginx's relative
+    # headers. The module's source path is absolute, so gcovr still reports it
+    # relative to --root. GCC can emit a few negative branch deltas for a
+    # multi-worker process; gcovr records that warning and keeps the remaining
+    # counters rather than silently dropping module.c from the report.
     --gcov-ignore-errors=no_working_dir_found
+    --gcov-ignore-parse-errors=negative_hits.warn
 )
 if [ -n "${COVERAGE_FAIL_UNDER:-}" ]; then
     GCOVR_ARGS+=(--fail-under-line "$COVERAGE_FAIL_UNDER")
@@ -152,8 +166,34 @@ fi
 # failure, not a warning. Both spellings work on 7.x; this stays the more
 # portable one.
 gcovr "${GCOVR_ARGS[@]}" \
-    --object-directory "$OBJDIR" \
+    --object-directory "$BUILD" \
     "$OBJDIR" "$ROOT/ci/tests/unit"
+
+# This is a control, not a percentage threshold. Before the runtime driver was
+# part of this wrapper, the report listed only scan.c: unit tests and
+# Test::Nginx did not drive module.c's runtime paths. Refuse to publish an
+# apparently-successful report that omits either production translation unit.
+python3 - "$OUT/summary.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+files = {entry["filename"]: entry for entry in report["files"]}
+required = (
+    "src/ngx_http_error_abuse_module.c",
+    "src/ngx_http_error_abuse_scan.c",
+)
+for name in required:
+    entry = files.get(name)
+    if entry is None:
+        raise SystemExit(f"FAIL: coverage report omitted {name}")
+    if entry["line_covered"] == 0:
+        raise SystemExit(f"FAIL: coverage report has no executed lines for {name}")
+    print(
+        f"coverage: {name} lines {entry['line_covered']}/{entry['line_total']}; "
+        f"branches {entry['branch_covered']}/{entry['branch_total']}"
+    )
+PY
 
 echo
 echo "HTML report: $OUT/index.html"

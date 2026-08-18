@@ -10,6 +10,7 @@ Pull-request gate:
 | `build-test.yml` | `Validation` | workflow lint, shellcheck, Python syntax, cppcheck |
 | `build-test.yml` | `Build` | pinned nginx mainline, strict compile |
 | `build-test.yml` | `Runtime` | multi-worker behavior, two-host Redis aggregation, snapshots and restart restore |
+| `build-test.yml` | `Coverage report` | bounded runtime and parser coverage for both module translation units; report artifact only, no percentage threshold |
 | `build-test.yml` | `ASan and UBSan` | memory safety and undefined behavior |
 | `asan.yml` | `ASan and UBSan` | static module build plus single-process and multi-worker request-storm/reload lanes |
 | `fuzzing.yml` | `Fuzz regression (120s/target)` | short libFuzzer regression run of the parse targets, with corpus and dictionary |
@@ -60,6 +61,10 @@ python3 ci/tools/test_runtime.py \
   --nginx-binary "$build/nginx" \
   --module "$build/ngx_http_error_abuse_module.so" \
   --redis-server /usr/bin/redis-server
+
+# Generate HTML, text and JSON coverage reports under .build/coverage/.
+# This runs the bounded runtime suite against the static coverage build.
+ci/tools/coverage.sh "$NGINX_VERSION"
 
 # ASan and UBSan.
 bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
