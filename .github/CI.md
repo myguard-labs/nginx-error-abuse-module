@@ -11,7 +11,6 @@ Pull-request gate:
 | `build-test.yml` | `Build` | pinned nginx mainline, strict compile |
 | `build-test.yml` | `Runtime` | multi-worker behavior, two-host Redis aggregation, snapshots and restart restore |
 | `build-test.yml` | `Coverage report` | bounded runtime and parser coverage for both module translation units; report artifact only, no percentage threshold |
-| `build-test.yml` | `ASan and UBSan` | memory safety and undefined behavior |
 | `asan.yml` | `ASan and UBSan` | static module build plus single-process and multi-worker request-storm/reload lanes |
 | `fuzzing.yml` | `Fuzz regression (120s/target)` | short libFuzzer regression run of the parse targets, with corpus and dictionary |
 | `valgrind.yml` | `Memcheck lite (60s soak)` | uninitialized reads, invalid memory access, and definite/indirect leaks (`--errors-for-leak-kinds=definite,indirect`) |
@@ -24,7 +23,7 @@ precedes `asan`; `codeql` precedes `security-scanners`; `valgrind` precedes
 `lint`; `fuzzing` runs independently. Members carry `workflow_call` and do not
 have their own pull-request or push trigger, so each change enters the lane once.
 
-Deep pass (`ci-deep.yml`, monthly cron on the 1st + `workflow_dispatch`, not a
+Deep pass (`ci-deep.yml`, monthly cron on the 4th + `workflow_dispatch`, not a
 PR-lane member):
 
 | Job | Coverage |

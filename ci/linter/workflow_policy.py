@@ -528,6 +528,81 @@ def check_docs() -> int:
             ".github/CI.md contains an inert adoption claim (has not been "
             "ported/split/implemented) -- refresh the current topology"
         )
+    # The fuzz README is nested below the repository root, so a one-dot-up
+    # workflow link resolves to ci/.github (the old, dead link). Keep this
+    # check structural: validate the target and the event/topology contract,
+    # not prose or job counts.
+    fuzz_readme = ROOT / "ci" / "fuzz" / "README.md"
+    fuzz_workflow = ROOT / ".github" / "workflows" / "fuzzing.yml"
+    deep_workflow = ROOT / ".github" / "workflows" / "ci-deep.yml"
+    ci_workflow = ROOT / ".github" / "workflows" / "ci.yml"
+    if fuzz_readme.is_file():
+        fuzz_text = fuzz_readme.read_text(encoding="utf-8")
+        fuzz_links = re.findall(r"\]\(([^)]+)\)", fuzz_text)
+        expected_fuzz_link = "../../.github/workflows/fuzzing.yml"
+        if expected_fuzz_link not in fuzz_links:
+            errors.append(
+                "ci/fuzz/README.md must link to ../../.github/workflows/fuzzing.yml"
+            )
+        for link in fuzz_links:
+            if "workflow" not in link or link.startswith(("http:", "https:", "#")):
+                continue
+            target = (fuzz_readme.parent / link).resolve()
+            if not target.is_file():
+                errors.append(
+                    f"ci/fuzz/README.md links to missing workflow target {link}"
+                )
+    if all(path.is_file() for path in (fuzz_workflow, deep_workflow, ci_workflow)):
+        ci_data = load(ci_workflow)
+        fuzz_data = load(fuzz_workflow)
+        deep_data = load(deep_workflow)
+        ci_jobs = ci_data.get("jobs") or {}
+        fuzz_job = ci_jobs.get("fuzzing") if isinstance(ci_jobs, dict) else None
+        ci_events = events(ci_data)
+        if "pull_request" not in ci_events:
+            errors.append("ci.yml must retain the pull_request entry point")
+        if "pull_request" in ci_events and not (
+            isinstance(fuzz_job, dict)
+            and fuzz_job.get("uses") == "./.github/workflows/fuzzing.yml"
+        ):
+            errors.append("ci.yml must call fuzzing.yml from its pull-request gate")
+        fuzz_events = events(fuzz_data)
+        if "workflow_call" not in fuzz_events or fuzz_events & {
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "repository_dispatch",
+        }:
+            errors.append(
+                "fuzzing.yml must be a reusable workflow without its own change trigger"
+            )
+        deep_events = events(deep_data)
+        deep_jobs = deep_data.get("jobs") or {}
+        deep_schedule = deep_data.get("on", deep_data.get(True))
+        schedules = (
+            deep_schedule.get("schedule", []) if isinstance(deep_schedule, dict) else []
+        )
+        cron_values = [
+            str(item.get("cron"))
+            for item in schedules
+            if isinstance(item, dict) and "cron" in item
+        ]
+        if "schedule" not in deep_events or not (
+            isinstance(deep_jobs, dict) and "fuzz" in deep_jobs
+        ):
+            errors.append(
+                "ci-deep.yml must own the scheduled long fuzz campaign (fuzz job)"
+            )
+        if not any(re.search(r"\S+\s+\S+\s+4\s+\*\s+\*", cron) for cron in cron_values):
+            errors.append(
+                "ci-deep.yml must schedule the monthly fuzz campaign on day 4"
+            )
+        if ci_text is not None and not re.search(
+            r"monthly cron on the 4th\b", ci_text, re.IGNORECASE
+        ):
+            errors.append(
+                ".github/CI.md must document ci-deep's monthly cron on the 4th"
+            )
     # Only PATH-QUALIFIED references. A bare "ci.yml" in prose could mean any
     # file; ".github/workflows/ci.yml" is unambiguously a claim that this repo
     # has that workflow, which is the claim worth checking.

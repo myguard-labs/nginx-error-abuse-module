@@ -105,13 +105,30 @@ policy_ 0 clean docs
 # checkpoint prose must fail even though the filename still appears elsewhere;
 # restoring the claim must return the control to green.
 docs_tmp="$(mktemp -d "${TMPDIR:-/tmp}/lint-docs.XXXXXX")"
-cp -r .github README.md "$docs_tmp/"
+cp -r .github README.md ci "$docs_tmp/"
 sed -i 's/`asan\.yml` |/`asan.yml` — ABSENT |/' "$docs_tmp/.github/CI.md"
 case_ 1 "policy docs: existing workflow cannot be ABSENT" \
     env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
     python3 ci/linter/workflow_policy.py docs
 cp .github/CI.md "$docs_tmp/.github/CI.md"
 case_ 0 "policy docs: restored CI.md is green" \
+    env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
+    python3 ci/linter/workflow_policy.py docs
+sed -i 's/monthly cron on the 4th/monthly cron on the 1st/' \
+    "$docs_tmp/.github/CI.md"
+case_ 1 "policy docs: cadence prose matches deep schedule" \
+    env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
+    python3 ci/linter/workflow_policy.py docs
+cp .github/CI.md "$docs_tmp/.github/CI.md"
+sed -i 's#../../\.github/workflows/fuzzing\.yml#../.github/workflows/fuzzing.yml#' \
+    "$docs_tmp/ci/fuzz/README.md"
+case_ 1 "policy docs: nested fuzz README rejects dead workflow link" \
+    env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
+    python3 ci/linter/workflow_policy.py docs
+cp ci/fuzz/README.md "$docs_tmp/ci/fuzz/README.md"
+sed -i 's#uses: ./\.github/workflows/fuzzing\.yml#uses: ./\.github/workflows/missing.yml#' \
+    "$docs_tmp/.github/workflows/ci.yml"
+case_ 1 "policy docs: PR gate must call reusable fuzz workflow" \
     env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
     python3 ci/linter/workflow_policy.py docs
 rm -rf "$docs_tmp"

@@ -98,13 +98,14 @@ A crash drops a `crash-*` reproducer. Replay it with:
 
 ## CI
 
-[`.github/workflows/fuzzing.yml`](../.github/workflows/fuzzing.yml), kept
-separate from the build/test pipeline so it never slows PR feedback:
+[`.github/workflows/fuzzing.yml`](../../.github/workflows/fuzzing.yml) is the
+reusable PR member called by `ci.yml`; the long campaign belongs to
+[`ci-deep.yml`](../../.github/workflows/ci-deep.yml):
 
-- **Monthly** — 15-min discovery run, merges + uploads the grown corpus
-- **PR** — 2-min bounded regression run, *only* when the source, `fuzz/`, or
-  the workflow changes (`paths:` filter)
-- **Manual** — `workflow_dispatch` with a custom duration
+- **PR** — 2-min bounded regression run on every pull request through `ci.yml`
+- **Deep monthly** — long discovery run on the 4th, with corpus upload
+- **Manual** — `workflow_dispatch` on either workflow (the deep workflow accepts
+  a custom duration)
 
 ASAN+UBSAN are compiled in, so memory and undefined-behaviour bugs abort the
 run and fail the job. The harness also traps if the validator ever returns a
