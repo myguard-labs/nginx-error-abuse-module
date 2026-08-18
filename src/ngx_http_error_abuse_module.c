@@ -2433,7 +2433,7 @@ ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
                                              ctx->zone->name.data,
                                              ctx->zone->name.len,
                                              ctx->key.data, ctx->key.len);
-    p = ngx_cpymem(p, ":events", sizeof(":events") - 1);
+    (void) ngx_cpymem(p, ":events", sizeof(":events") - 1);
 
     ngx_memcpy(block->data, events->data, base_len);
     ngx_memcpy(block->data + base_len, ":block", sizeof(":block") - 1);
@@ -3569,7 +3569,7 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
     h = ngx_http_error_abuse_put_u32(h, NGX_HTTP_ERROR_ABUSE_VERSION);
     h = ngx_http_error_abuse_put_u32(h, (uint32_t) zone->threshold);
     h = ngx_http_error_abuse_put_u32(h, records);
-    h = ngx_http_error_abuse_put_u32(h, crc);
+    (void) ngx_http_error_abuse_put_u32(h, crc);
 
     total = (size_t) (p - buffer);
 
