@@ -230,6 +230,43 @@ failed with `redis: Retry-After 86400 exceeds block=10`. Restoring the Redis
 clamp and rebuilding produced a 923208-byte module at
 `2026-08-18 23:06:54.218775821 +0200`; the same command returned
 `OK: redis deadline clamp control`.
+
+RA-7 Redis state controls (2026-08-18) -- each row rebuilt with
+`bash ci/tools/ci-build.sh nginx 1.31.3 fault-redis-state`, recorded the module
+with `stat -c '%y %s %n' .build/nginx-1.31.3-fault-redis-state/objs/ngx_http_error_abuse_module.so`,
+then set PORT to the row's value and ran `timeout 15s python3
+ci/tools/test_runtime.py --port "$PORT"
+--nginx-binary $PWD/.build/nginx-1.31.3-debug/objs/nginx --module
+$PWD/.build/nginx-1.31.3-fault-redis-state/objs/ngx_http_error_abuse_module.so
+--redis-server $(command -v redis-server) --redis-state-controls` (the NOSCRIPT
+row used a 20-second shell timeout). Every mutation was reverted before the
+next row:
+
+  * EVAL unexpected-reply failure recording removed, PORT=19130, module mtime
+    23:24:30 +0200 / 985992 bytes -> `Redis state control expected 1
+    b'Redis circuit breaker triggered' records, got 0`.
+  * GET unexpected-reply failure recording removed, PORT=19140, module mtime
+    23:24:56 +0200 / 985992 bytes -> the same breaker-record assertion failed.
+  * The whole threshold/open block disabled, PORT=19150, module mtime 23:25:21
+    +0200 / 985736 bytes -> the same breaker-record assertion failed.
+  * The open-breaker predicate removed from `redis_available()`, PORT=19160,
+    module mtime 23:25:50 +0200 / 985960 bytes ->
+    `/redis-ok?client=breaker-open: expected 200, got 429`.
+  * Timed recovery disabled after opening, PORT=19170, module mtime 23:26:13
+    +0200 / 985992 bytes -> `/redis-ok?client=breaker-recovery: expected
+    eventual 429, got 200`.
+  * NIL-success reset removed, PORT=19180, module mtime 23:26:44 +0200 /
+    985992 bytes -> `/redis-ok?client=reset-proof-nil: expected 429, got 200`.
+  * String-success reset removed, PORT=19190, module mtime 23:27:12 +0200 /
+    985992 bytes -> `/redis-ok?client=reset-proof-string: expected 429, got
+    200`.
+  * The NOSCRIPT `SCRIPT LOAD` call compiled out, PORT=19210, module mtime
+    23:28:17 +0200 / 985928 bytes -> `Redis state control expected 9 SCRIPT
+    LOAD calls, got 8`.
+
+The restored source rebuilt to 985992 bytes at 23:28:40 +0200 and the same
+focused command at PORT=19220 returned `OK: Redis breaker, reset,
+unexpected-reply and NOSCRIPT controls`.
 """
 
 from __future__ import annotations
@@ -329,6 +366,11 @@ def parse_args() -> argparse.Namespace:
         "--redis-backoff-cap",
         action="store_true",
         help="run only the reduced-time Redis reconnect cap control",
+    )
+    parser.add_argument(
+        "--redis-state-controls",
+        action="store_true",
+        help="run only the reduced-time Redis breaker and script controls",
     )
     return parser.parse_args()
 
@@ -993,6 +1035,38 @@ class RedisServer:
             stderr=subprocess.DEVNULL,
         )
 
+    def command(self, *args: str) -> str:
+        cmd = ["redis-cli", "--raw", "-h", "127.0.0.1", "-p", str(self.port)]
+        env = os.environ.copy()
+        if self.requirepass:
+            env["REDISCLI_AUTH"] = self.requirepass
+        result = subprocess.run(
+            cmd + list(args),
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            env=env,
+        )
+        if result.returncode != 0:
+            operation = args[0] if args else "command"
+            raise RuntimeError(
+                f"redis-cli {operation} failed with {result.returncode}: "
+                f"{result.stderr.strip()}"
+            )
+        return result.stdout.strip()
+
+    def script_load_calls(self) -> int:
+        stats = self.command("INFO", "commandstats")
+        for pattern in (
+            r"^cmdstat_script\|load:calls=(\d+)",
+            r"^cmdstat_script:calls=(\d+)",
+        ):
+            match = re.search(pattern, stats, flags=re.MULTILINE)
+            if match is not None:
+                return int(match.group(1))
+        return 0
+
     def stop(self) -> None:
         if self.process is None:
             return
@@ -1285,6 +1359,80 @@ def _wait_for_log(error_log: pathlib.Path, marker: bytes, timeout: float = 5.0) 
             return
         time.sleep(0.02)
     raise AssertionError(f"log safety: marker did not reach error.log: {marker!r}")
+
+
+def _wait_for_log_count(
+    error_log: pathlib.Path, marker: bytes, expected: int, timeout: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    actual = 0
+    while time.monotonic() < deadline:
+        if error_log.exists():
+            actual = error_log.read_bytes().count(marker)
+            if actual >= expected:
+                return
+        time.sleep(0.02)
+    raise AssertionError(
+        f"Redis state control expected {expected} {marker!r} records, got {actual}"
+    )
+
+
+def _wait_for_script_loads(
+    redis: RedisServer, expected: int, timeout: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    actual = redis.script_load_calls()
+    while actual < expected and time.monotonic() < deadline:
+        time.sleep(0.02)
+        actual = redis.script_load_calls()
+    if actual < expected:
+        raise AssertionError(
+            f"Redis state control expected {expected} SCRIPT LOAD calls, got {actual}"
+        )
+
+
+def _wait_for_status(port: int, path: str, expected: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    actual = request(port, path)
+    while actual != expected and time.monotonic() < deadline:
+        time.sleep(0.05)
+        actual = request(port, path)
+    if actual != expected:
+        raise AssertionError(f"{path}: expected eventual {expected}, got {actual}")
+
+
+def _wait_for_redis_value(
+    redis: RedisServer, expected: str, *args: str, timeout: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    actual = redis.command(*args)
+    while actual != expected and time.monotonic() < deadline:
+        time.sleep(0.02)
+        actual = redis.command(*args)
+    if actual != expected:
+        raise AssertionError(
+            f"Redis {' '.join(args)} expected {expected!r}, got {actual!r}"
+        )
+
+
+def _redis_state_key(prefix: str, client: str, suffix: str) -> str:
+    digest = hashlib.sha256(client.encode("ascii")).hexdigest()
+    return f"{prefix}{{cluster:{digest}}}:{suffix}"
+
+
+def _redis_set_block(redis: RedisServer, prefix: str, client: str) -> None:
+    deadline = int(time.time()) + 30
+    redis.command("SET", _redis_state_key(prefix, client, "block"), str(deadline))
+
+
+def _redis_set_wrong_get(redis: RedisServer, prefix: str, client: str) -> None:
+    key = _redis_state_key(prefix, client, "block")
+    redis.command("DEL", key)
+    redis.command("LPUSH", key, "wrong-type")
+
+
+def _redis_set_wrong_eval(redis: RedisServer, prefix: str, client: str) -> None:
+    redis.command("SET", _redis_state_key(prefix, client, "events"), "wrong-type")
 
 
 def _assert_log_safety(error_log: pathlib.Path) -> None:
@@ -1584,6 +1732,162 @@ def test_redis_auth(
         server.stop()
         second.stop()
         redis.stop()
+
+
+def test_redis_state_controls(
+    binary: pathlib.Path,
+    module: pathlib.Path,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+    redis_binary: pathlib.Path,
+) -> None:
+    """Exercise each Redis worker transition without a 30-second live outage."""
+    redis = RedisServer(redis_binary, root / "redis-state", nginx_port + 2)
+
+    def start_nodes(label: str) -> tuple[Nginx, Nginx, str]:
+        redis.command("FLUSHALL")
+        prior_loads = redis.script_load_calls()
+        prefix = f"error-abuse-state-{label}-{os.getpid()}:"
+        first = Nginx(
+            binary,
+            module,
+            root / f"redis-state-{label}-a",
+            nginx_port,
+            runner,
+            True,
+            redis.port,
+            prefix,
+        )
+        second = Nginx(
+            binary,
+            module,
+            root / f"redis-state-{label}-b",
+            nginx_port + 1,
+            runner,
+            True,
+            redis.port,
+            prefix,
+        )
+        try:
+            first.start()
+            second.start()
+            _wait_for_script_loads(redis, prior_loads + 2)
+        except Exception:
+            try:
+                first.stop()
+            finally:
+                second.stop()
+            raise
+        return first, second, prefix
+
+    def stop_nodes(first: Nginx, second: Nginx) -> None:
+        try:
+            first.stop()
+        finally:
+            second.stop()
+        first.assert_clean_logs()
+        second.assert_clean_logs()
+
+    redis.start()
+    try:
+        # An unexpected EVAL reply contributes the first failure and a WRONGTYPE
+        # GET contributes the second. The reduced-threshold module must open the
+        # breaker, skip a known Redis block locally, then retry after two seconds.
+        first, second, prefix = start_nodes("breaker")
+        try:
+            first_log = first.root / "logs" / "error.log"
+            _redis_set_wrong_eval(redis, prefix, "eval-trip")
+            expect(first.port, "/redis-error?client=eval-trip", 404)
+            _wait_for_log_count(first_log, b"Redis EVAL returned unexpected reply", 1)
+
+            _redis_set_wrong_get(redis, prefix, "get-trip")
+            expect(first.port, "/redis-ok?client=get-trip", 200)
+            _wait_for_log_count(first_log, b"Redis check returned unexpected reply", 1)
+            _wait_for_log_count(first_log, b"Redis circuit breaker triggered", 1)
+
+            _redis_set_block(redis, prefix, "breaker-open")
+            expect(second.port, "/redis-ok?client=breaker-open", 429)
+            expect(first.port, "/redis-ok?client=breaker-open", 200)
+
+            _redis_set_block(redis, prefix, "breaker-recovery")
+            expect(second.port, "/redis-ok?client=breaker-recovery", 429)
+            _wait_for_status(
+                first.port, "/redis-ok?client=breaker-recovery", 429, timeout=5
+            )
+        finally:
+            stop_nodes(first, second)
+
+        # Both successful GET shapes reset a partial failure streak. Without
+        # either reset, the following WRONGTYPE GET opens the breaker and the
+        # first node misses a block that the independent second node can see.
+        for reply_kind in ("nil", "string"):
+            first, second, prefix = start_nodes(f"reset-{reply_kind}")
+            try:
+                first_log = first.root / "logs" / "error.log"
+                _redis_set_wrong_eval(redis, prefix, f"eval-before-{reply_kind}")
+                expect(
+                    first.port,
+                    f"/redis-error?client=eval-before-{reply_kind}",
+                    404,
+                )
+                _wait_for_log_count(
+                    first_log, b"Redis EVAL returned unexpected reply", 1
+                )
+
+                if reply_kind == "string":
+                    _redis_set_block(redis, prefix, "reset-success")
+                    expect(second.port, "/redis-ok?client=reset-success", 429)
+                    expect(first.port, "/redis-ok?client=reset-success", 429)
+                else:
+                    expect(first.port, "/redis-ok?client=reset-success", 200)
+
+                _redis_set_wrong_get(redis, prefix, f"get-after-{reply_kind}")
+                expect(first.port, f"/redis-ok?client=get-after-{reply_kind}", 200)
+                _wait_for_log_count(
+                    first_log, b"Redis check returned unexpected reply", 1
+                )
+
+                _redis_set_block(redis, prefix, f"reset-proof-{reply_kind}")
+                expect(
+                    second.port,
+                    f"/redis-ok?client=reset-proof-{reply_kind}",
+                    429,
+                )
+                expect(
+                    first.port,
+                    f"/redis-ok?client=reset-proof-{reply_kind}",
+                    429,
+                )
+            finally:
+                stop_nodes(first, second)
+
+        # Both workers prime before the flush. The first post-flush record must
+        # see NOSCRIPT, reload the script, and let later records build a shared
+        # block that the second node observes without a local fallback ban.
+        first, second, prefix = start_nodes("noscript")
+        try:
+            first_log = first.root / "logs" / "error.log"
+            redis.command("SCRIPT", "FLUSH")
+            loads_after_flush = redis.script_load_calls()
+
+            expect(first.port, "/redis-error?client=noscript", 404)
+            _wait_for_log_count(first_log, b"Redis script cache miss", 1)
+            _wait_for_script_loads(redis, loads_after_flush + 1)
+
+            events_key = _redis_state_key(prefix, "noscript", "events")
+            expect(first.port, "/redis-error?client=noscript", 404)
+            _wait_for_redis_value(redis, "1", "ZCARD", events_key)
+            expect(first.port, "/redis-error?client=noscript", 404)
+            _wait_for_redis_value(redis, "2", "ZCARD", events_key)
+            expect(second.port, "/redis-error?client=noscript", 404)
+            _wait_for_status(second.port, "/redis-ok?client=noscript", 429)
+        finally:
+            stop_nodes(first, second)
+    finally:
+        redis.stop()
+
+    print("OK: Redis breaker, reset, unexpected-reply and NOSCRIPT controls")
 
 
 # ngx_http_error_abuse_zone() rejects anything under 8 * ngx_pagesize, so the
@@ -2686,6 +2990,20 @@ def main() -> int:
                     authenticated=args.deadline_clamp == "snapshot-hmac",
                 )
             print(f"OK: {args.deadline_clamp} deadline clamp control")
+            return 0
+        if args.redis_state_controls:
+            if module is None or not args.redis_server:
+                raise ValueError(
+                    "Redis state controls require --module and --redis-server"
+                )
+            test_redis_state_controls(
+                binary,
+                module,
+                root,
+                args.runner,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
+            )
             return 0
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
