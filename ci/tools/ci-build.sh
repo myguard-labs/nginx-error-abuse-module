@@ -4,7 +4,7 @@
 #
 #   ci/tools/ci-build.sh [flavor] [version] [mode]
 #     flavor : nginx (default) | angie
-#     version: source version, e.g. 1.31.1
+#     version: pinned source version, e.g. 1.31.3
 #     mode   : debug (default, dynamic .so) | asan (static, sanitizers)
 #              | module (dynamic .so only, nginx core NOT compiled)
 #              | coverage (dynamic .so, gcov-instrumented, -O0)
@@ -56,26 +56,65 @@
 #                        poisoned or corrupted cache entry is caught, not
 #                        silently built.
 #
-# Everything is opt-out via NO_CACHE=1, so a job can force a from-scratch
-# build without editing this script.
+# Compilation caches are opt-out via NO_CACHE=1, so a job can force a
+# from-scratch build without editing this script. Source verification is never
+# disabled: both cache hits and fresh downloads must match versions.env.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
 
-FLAVOR="${1:-nginx}"
-VERSION="${2:-1.31.1}"
-MODE="${3:-debug}"
 ROOT="${BUILD_ROOT:-$PWD/.build}"
 MODULE_DIR="$PWD"
 NO_CACHE="${NO_CACHE:-0}"
+VERSIONS_FILE="$MODULE_DIR/.github/versions.env"
+
+if [[ ! -f "$VERSIONS_FILE" ]]; then
+    echo "version pin file not found: $VERSIONS_FILE" >&2
+    exit 2
+fi
+# Path is rooted at the required repository cwd.
+# shellcheck disable=SC1090,SC1091
+source "$VERSIONS_FILE"
+
+FLAVOR="${1:-nginx}"
+VERSION="${2:-$NGINX_VERSION}"
+MODE="${3:-debug}"
+EXPECTED_SHA256=""
+
+add_matching_pin() {
+    local name="$1"
+    local pinned_version="$2"
+    local pinned_sha256="$3"
+
+    if [[ "$VERSION" != "$pinned_version" ]]; then
+        return
+    fi
+    if [[ -n "$EXPECTED_SHA256" && "$EXPECTED_SHA256" != "$pinned_sha256" ]]; then
+        echo "conflicting SHA-256 pins for $FLAVOR $VERSION ($name)" >&2
+        exit 2
+    fi
+    EXPECTED_SHA256="$pinned_sha256"
+}
 
 case "$FLAVOR" in
     nginx)
+        add_matching_pin NGINX_MAINLINE \
+            "${NGINX_MAINLINE:?missing NGINX_MAINLINE in $VERSIONS_FILE}" \
+            "${NGINX_MAINLINE_SHA256:?missing NGINX_MAINLINE_SHA256 in $VERSIONS_FILE}"
+        add_matching_pin NGINX_STABLE \
+            "${NGINX_STABLE:?missing NGINX_STABLE in $VERSIONS_FILE}" \
+            "${NGINX_STABLE_SHA256:?missing NGINX_STABLE_SHA256 in $VERSIONS_FILE}"
+        add_matching_pin NGINX_VERSION \
+            "${NGINX_VERSION:?missing NGINX_VERSION in $VERSIONS_FILE}" \
+            "${NGINX_VERSION_SHA256:?missing NGINX_VERSION_SHA256 in $VERSIONS_FILE}"
         URL="https://nginx.org/download/nginx-${VERSION}.tar.gz"
         TARBALL_DIR="nginx-${VERSION}"
         BINARY="nginx"
         ;;
     angie)
+        add_matching_pin ANGIE_VERSION \
+            "${ANGIE_VERSION:?missing ANGIE_VERSION in $VERSIONS_FILE}" \
+            "${ANGIE_SHA256:?missing ANGIE_SHA256 in $VERSIONS_FILE}"
         URL="https://download.angie.software/files/angie-${VERSION}.tar.gz"
         TARBALL_DIR="angie-${VERSION}"
         BINARY="angie"
@@ -86,6 +125,15 @@ case "$FLAVOR" in
         ;;
 esac
 
+if [[ -z "$EXPECTED_SHA256" ]]; then
+    echo "no SHA-256 pin for $FLAVOR $VERSION in $VERSIONS_FILE" >&2
+    exit 2
+fi
+if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "invalid SHA-256 pin for $FLAVOR $VERSION in $VERSIONS_FILE" >&2
+    exit 2
+fi
+
 # The mode is in the tree path -- see the CACHING block above. Sharing one
 # tree across modes is what lets a cached debug objs/ silently disarm the
 # asan/coverage job, so every mode (not just coverage) gets its own dir.
@@ -94,30 +142,19 @@ DIR="${TARBALL_DIR}-${MODE}"
 mkdir -p "$ROOT"
 
 # --- source tarball, sha256-verified after restore --------------------------
-# No upstream sha256sum file is fetched here (the target has no versions.env
-# consumer wired into ci-build.sh yet -- see .github/versions.env, currently
-# unused by any workflow). Integrity therefore rests on HTTPS-to-nginx.org
-# plus re-download-on-corruption below: a tarball that fails to extract is
-# deleted and re-fetched, so a truncated/poisoned cache entry cannot silently
-# feed a stale-looking build.
+# Verification is outside the NO_CACHE condition on purpose. fetch-verify.sh
+# checks a restored archive before accepting a cache hit and checks a fresh
+# download before returning, so neither path can reach tar with unpinned bytes.
 if [ "$NO_CACHE" = "1" ]; then
     rm -f "$ROOT/${TARBALL_DIR}.tar.gz"
 fi
-if [ ! -f "$ROOT/${TARBALL_DIR}.tar.gz" ]; then
-    curl -fsSL "$URL" -o "$ROOT/${TARBALL_DIR}.tar.gz"
-fi
+bash "$MODULE_DIR/.github/scripts/fetch-verify.sh" \
+    "$URL" "$EXPECTED_SHA256" "$ROOT/${TARBALL_DIR}.tar.gz"
 
 if [ "$NO_CACHE" = "1" ]; then
     rm -rf "${ROOT:?}/${DIR:?}"
 fi
 if [ ! -d "$ROOT/$DIR" ]; then
-    if ! tar -tzf "$ROOT/${TARBALL_DIR}.tar.gz" >/dev/null 2>&1; then
-        # A corrupt cache restore must not silently extract garbage --
-        # delete and re-fetch once rather than failing opaquely mid-tar.
-        echo "warning: ${TARBALL_DIR}.tar.gz failed integrity check, re-fetching" >&2
-        rm -f "$ROOT/${TARBALL_DIR}.tar.gz"
-        curl -fsSL "$URL" -o "$ROOT/${TARBALL_DIR}.tar.gz"
-    fi
     tar -xzf "$ROOT/${TARBALL_DIR}.tar.gz" -C "$ROOT" --transform "s/^${TARBALL_DIR}/${DIR}/"
 fi
 

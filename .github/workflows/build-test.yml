@@ -1,4 +1,4 @@
-# sync-sha: b6224df3566d8dba3e059339e93a025a73fb5f05732d4c9a104047aec1773999
+# sync-sha: ff30e8d602e6b2161fdcda0a2696946046e21e84eca6c80f99f0d337bc31ac7b
 name: Build and Test
 
 env:
@@ -39,7 +39,9 @@ jobs:
       - name: Validate scripts and source
         run: |
           bash -n ci/tools/ci-build.sh
-          shellcheck ci/tools/ci-build.sh
+          bash -n ci/tools/test-ci-build-source.sh
+          shellcheck ci/tools/ci-build.sh ci/tools/test-ci-build-source.sh
+          bash ci/tools/test-ci-build-source.sh
           # The runtime driver's path is assembled from two variables rather
           # than written as one contiguous string anywhere in this step
           # (command text OR comments): ANY appearance of that path substring

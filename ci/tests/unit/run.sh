@@ -13,8 +13,8 @@
 #   CC                 compiler (default cc). Takes a full driver line, so
 #                      CC="gcc -m32" runs the suite as a 32-bit binary.
 #   NGINX_VERSION       version directory under .build/ to take headers and
-#                        ngx_string.c from (default 1.31.1, matching
-#                        ci/tools/ci-build.sh's own default).
+#                        ngx_string.c from (default from .github/versions.env,
+#                        matching ci/tools/ci-build.sh's own default).
 #   NGX_BUILD_SUFFIX     appended to the nginx-<ver> dir name, e.g. "-coverage"
 #                         so this can be pointed at ci-build.sh's distinct
 #                         coverage tree without touching the debug one.
@@ -132,7 +132,12 @@ if [ "${1:-}" = "clean" ]; then
     exit 0
 fi
 
-VERSION="${NGINX_VERSION:-1.31.1}"
+# Standalone runs follow the same central source pin as ci-build.sh.
+REQUESTED_NGINX_VERSION="${NGINX_VERSION:-}"
+# Path is rooted at REPO_ROOT above.
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/.github/versions.env"
+VERSION="${REQUESTED_NGINX_VERSION:-${NGINX_VERSION:?missing NGINX_VERSION in .github/versions.env}}"
 NGX_SRC="$ROOT/.build/nginx-${VERSION}${NGX_BUILD_SUFFIX:--debug}"
 
 if [ ! -f "$NGX_SRC/objs/ngx_auto_config.h" ]; then

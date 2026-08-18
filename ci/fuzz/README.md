@@ -80,9 +80,9 @@ seam, not the stub.
 The targets need a configured nginx tree for its headers and `ngx_string.c`:
 
 ```bash
-bash tools/ci-build.sh nginx 1.31.1   # once; provides .build/nginx-*/
-bash fuzz/build.sh                    # needs clang with libFuzzer
-cd fuzz
+bash ci/tools/ci-build.sh             # once; uses the central nginx pin
+bash ci/fuzz/build.sh                 # needs clang with libFuzzer
+cd ci/fuzz
 ./fuzz_snapshot -max_total_time=60 corpus/
 ./fuzz_statuses -max_total_time=60 -dict=fuzz.dict corpus_statuses/
 ```

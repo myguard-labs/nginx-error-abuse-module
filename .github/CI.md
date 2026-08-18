@@ -7,7 +7,7 @@ PR/push gates:
 | Workflow | Check | Coverage |
 |---|---|---|
 | `build-test.yml` | `Validation` | workflow lint, shellcheck, Python syntax, cppcheck |
-| `build-test.yml` | `Build` | nginx 1.31.1, strict warnings-as-errors compile |
+| `build-test.yml` | `Build` | pinned nginx mainline, strict compile |
 | `build-test.yml` | `Runtime` | multi-worker behavior, two-host Redis aggregation, snapshots and restart restore |
 | `build-test.yml` | `ASan and UBSan` | memory safety and undefined behavior |
 | `fuzzing.yml` | `Fuzz regression (120s/target)` | short libFuzzer regression run of the parse targets, with corpus and dictionary |
@@ -47,48 +47,38 @@ directions. Per-item keep-or-fold call, with evidence:
   gate has not been ported to this module yet; `build-test.yml`'s
   `Validation` job (workflow lint, shellcheck, Python syntax, cppcheck, see
   above) covers a subset in the meantime.
-- **`bump.yml` — ABSENT, decision: port at checkpoint 4b follow-up /
-  whenever `versions.env` needs its first live bump.** This checkpoint ports
-  the version-pin *machinery* (`versions.env`, `load-versions.sh`,
-  `compute-versions.sh`, `fetch-verify.sh`) but explicitly does not wire it
-  into the existing workflows or add the weekly bump workflow — that is a
-  separate, later checkpoint per the cp4b task scope. Until `bump.yml` lands,
-  `versions.env` in this repo is inert (present, not yet consumed) and pins
-  must be advanced by hand.
-
-**Known pin discrepancy:** the ported `.github/versions.env` is an unmodified
-copy of the skeleton's, which pins `NGINX_VERSION=1.31.3`. This repo's actual
-build/CI version is `1.31.1` (see `ci/tools/ci-build.sh nginx 1.31.1` in the
-local commands below and in `build-test.yml`). Per task scope, the skeleton's
-sha256 digests were kept as-is rather than fabricated for 1.31.1 — the file
-is landed inert (see `bump.yml` note above) and does not yet drive any build
-step, so the mismatch does not affect current CI. Reconcile when `bump.yml`
-and the workflow rewiring land.
+- **`bump.yml` — ABSENT.** Version pins are maintained manually in
+  `.github/versions.env`. Workflows load that file and `ci-build.sh` accepts
+  only its pinned nginx and Angie versions. Every restored or downloaded source
+  archive is SHA-256 verified before extraction; `NO_CACHE=1` forces a fresh
+  download but does not bypass verification.
 
 ## Local commands
 
 ```bash
 # Build nginx mainline and the dynamic module.
-bash ci/tools/ci-build.sh nginx 1.31.1
+source .github/versions.env
+bash ci/tools/ci-build.sh nginx "$NGINX_VERSION"
+build=".build/nginx-${NGINX_VERSION}-debug/objs"
 
 # Native multi-worker runtime suite.
 python3 ci/tools/test_runtime.py \
-  --nginx-binary .build/nginx-1.31.1/objs/nginx \
-  --module .build/nginx-1.31.1/objs/ngx_http_error_abuse_module.so \
+  --nginx-binary "$build/nginx" \
+  --module "$build/ngx_http_error_abuse_module.so" \
   --redis-server /usr/bin/redis-server
 
 # ASan and UBSan.
-bash ci/tools/ci-build.sh nginx 1.31.1 asan
+bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
 ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 python3 ci/tools/test_runtime.py --single-process \
   --redis-server /usr/bin/redis-server \
-  --nginx-binary .build/nginx-1.31.1/objs/nginx
+  --nginx-binary ".build/nginx-${NGINX_VERSION}-asan/objs/nginx"
 
 # Valgrind.
 python3 ci/tools/test_runtime.py --single-process \
   --runner "valgrind --tool=memcheck --track-origins=yes --error-exitcode=99" \
   --redis-server /usr/bin/redis-server \
-  --nginx-binary .build/nginx-1.31.1/objs/nginx \
-  --module .build/nginx-1.31.1/objs/ngx_http_error_abuse_module.so
+  --nginx-binary "$build/nginx" \
+  --module "$build/ngx_http_error_abuse_module.so"
 ```
