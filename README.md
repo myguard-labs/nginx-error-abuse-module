@@ -1,14 +1,13 @@
 # nginx-error-abuse-module
 
-[![CI](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci.yml)
 [![Build&Test](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/build-test.yml)
 [![Security Scanners](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/security-scanners.yml)
 [![Fuzzing](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/fuzzing.yml)
 [![Valgrind](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml)
 [![A/UBSan](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml)
-[![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
 [![Lint](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/lint.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/lint.yml)
+[![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
 
 ## CI
 

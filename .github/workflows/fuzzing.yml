@@ -1,4 +1,4 @@
-# sync-sha: df6e63f1bcb53d14a93db3ac144fbd9fc349d0393a50656cb7fa84b44fcdc58e
+# sync-sha: b37fa5b67fa9d81a6342f24a0e87e1f6ec970f23d465c76fcc9f62ce2d18078d
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on the status-list
@@ -6,8 +6,8 @@ name: Fuzzing
 # fuzz (hours/target) lives in ci-deep.yml (monthly cron + workflow_dispatch).
 #
 # Action pins (keep in sync with build-test.yml header):
-# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
-# actions/upload-artifact@v5 -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+# actions/checkout@v7.0.1        -> 3d3c42e5aac5ba805825da76410c181273ba90b1
+# actions/upload-artifact@v7.0.1 -> 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -35,7 +35,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -128,7 +128,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-fast-crashes
           path: ${{ github.workspace }}/ci/fuzz/crash-*
