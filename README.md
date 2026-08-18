@@ -112,7 +112,7 @@ http {
 
     server {
         location / {
-            error_abuse zone=client_errors;   # turn it on here
+            error_abuse zone=client_errors log_level=notice; # turn it on here
         }
     }
 }
@@ -195,9 +195,11 @@ when the destination has `error_abuse off`, is bound to a different zone, or
 serves a custom rejection page. The destination's `dry_run=` is ignored in
 that case — the origin's `dry_run` wins for the whole request.
 
-### `error_abuse_redis host=[tls://]name [port] [user] [password] [db] [prefix] [timeout]` — context: `http`
+### `error_abuse_redis host=name|tls://name|rediss://name [port=number] [user=name] [password=value] [db=number] [prefix=value] [timeout=time]` — context: `http`
 
-Points the module at one Redis server (see below).
+Points the module at one Redis server (see below). `host=` is required; every
+other option is optional and must use the `key=value` form shown above. The
+`tls://` and `rediss://` host schemes both enable TLS.
 
 `host=` is resolved to a numeric address **once, at config load**, so the worker
 event loop never blocks on `getaddrinfo()` when (re)connecting. Two consequences:
@@ -227,7 +229,8 @@ Redis never freezes a request — the module just falls back to its own local
 counters (fail-open), and a circuit breaker pauses Redis for 30s after repeated
 failures so your logs don't fill up. You can lock it down with AUTH
 (`user=`/`password=`), pick a database (`db=N`), and encrypt with TLS by
-prefixing the host: `host=tls://redis.internal`. **Treat Redis as a trust
+prefixing the host: `host=tls://redis.internal` (or
+`host=rediss://redis.internal`). **Treat Redis as a trust
 boundary** — a compromised Redis could inject fake bans, so keep it on a private
 network.
 
