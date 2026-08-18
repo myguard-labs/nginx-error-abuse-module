@@ -17,6 +17,7 @@
 #endif
 
 #include "ngx_http_error_abuse_scan.h"
+#include "ngx_http_error_abuse_time.h"
 
 /* SEC-3: the identity stored in shared memory, Redis and snapshots is a fixed
  * 32-byte SHA-256 digest of the configured key, regardless of how large the raw
@@ -512,7 +513,8 @@ ngx_http_error_abuse_expire(ngx_http_error_abuse_zone_t *zone, time_t now,
         ean = ngx_queue_data(q, ngx_http_error_abuse_node_t, queue);
 
         if (ean->blocked_until > now
-            || ean->last_seen + zone->inactive > now)
+            || ngx_http_error_abuse_time_add_saturate(ean->last_seen,
+                                                      zone->inactive) > now)
         {
             return;
         }
@@ -681,7 +683,8 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
     ean->event_count++;
 
     if (ean->event_count >= zone->threshold) {
-        ean->blocked_until = now + zone->block;
+        ean->blocked_until = ngx_http_error_abuse_time_add_saturate(
+            now, zone->block);
         ean->event_head = 0;
         ean->event_count = 0;
     }
@@ -756,7 +759,10 @@ ngx_http_error_abuse_peek(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
     ean = ngx_http_error_abuse_lookup(zone, hash, key);
     if (ean == NULL) {
         *count = (zone->threshold <= 1) ? zone->threshold : 1;
-        *blocked_until = (zone->threshold <= 1) ? now + zone->block : 0;
+        *blocked_until = (zone->threshold <= 1)
+                         ? ngx_http_error_abuse_time_add_saturate(
+                               now, zone->block)
+                         : 0;
         *would_block = (zone->threshold <= 1);
         ngx_shmtx_unlock(&zone->shpool->mutex);
         return;
@@ -781,7 +787,10 @@ ngx_http_error_abuse_peek(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
 
     *count = valid + 1;
     *would_block = (*count >= zone->threshold);
-    *blocked_until = *would_block ? now + zone->block : 0;
+    *blocked_until = *would_block
+                     ? ngx_http_error_abuse_time_add_saturate(now,
+                                                              zone->block)
+                     : 0;
 
     ngx_shmtx_unlock(&zone->shpool->mutex);
 }
@@ -2482,8 +2491,8 @@ ngx_http_error_abuse_redis_record_failure(time_t now)
     if (++worker->consecutive_failures
         >= NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD)
     {
-        worker->circuit_breaker_until =
-            now + NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION;
+        worker->circuit_breaker_until = ngx_http_error_abuse_time_add_saturate(
+            now, NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION);
         worker->consecutive_failures = 0;
         ngx_log_error(NGX_LOG_ERR, worker->log, 0,
                       "error_abuse: Redis circuit breaker triggered, "
@@ -2586,16 +2595,22 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
 
     } else if (reply->type == REDIS_REPLY_STRING) {
         /* COR-4: the block value is the absolute Unix deadline. */
-        time_t    now = ngx_time();
-        ngx_int_t deadline = ngx_atoi((u_char *) reply->str, reply->len);
+        time_t    max_deadline, now;
+        ngx_int_t deadline;
+
+        now = ngx_time();
+        max_deadline = ngx_http_error_abuse_time_add_saturate(
+            now, ctx->zone->block);
+        deadline = ngx_atoi((u_char *) reply->str, reply->len);
         ctx->redis_blocked = 1;
-        ctx->blocked_until = (deadline > 0) ? (time_t) deadline
-                                            : now + ctx->zone->block;
+        ctx->blocked_until = (deadline > 0)
+                             ? (time_t) deadline
+                             : max_deadline;
         /* Clamp a Redis-provided deadline to now+block (mirrors the snapshot
          * SNAP-CLAMP on load) so a rogue or corrupt block value cannot drive a
          * multi-decade Retry-After or local deadline. */
-        if (ctx->blocked_until > now + ctx->zone->block) {
-            ctx->blocked_until = now + ctx->zone->block;
+        if (ctx->blocked_until > max_deadline) {
+            ctx->blocked_until = max_deadline;
         }
         ctx->count = ctx->zone->threshold;
         ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
@@ -3918,7 +3933,8 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
          * snapshot cannot install a ban decades in the future (and the
          * (time_t) cast cannot truncate on 32-bit) — mirrors STAB-1. */
         if (rec_blocked > (int64_t) now) {
-            int64_t max_deadline = (int64_t) now + (int64_t) zone->block;
+            time_t  max_deadline = ngx_http_error_abuse_time_add_saturate(
+                now, zone->block);
             ean->blocked_until = (time_t) (rec_blocked < max_deadline
                                            ? rec_blocked : max_deadline);
         } else {

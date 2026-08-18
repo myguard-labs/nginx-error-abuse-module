@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Thijs Eilander
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# ci/tests/unit/run.sh -- build and run the scan-core unit tests.
+# ci/tests/unit/run.sh -- build and run the C unit tests.
 #
 #   ci/tests/unit/run.sh                  # build with warnings-as-errors, run
 #   ci/tests/unit/run.sh clean            # remove the built binary
@@ -124,12 +124,13 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/../../.." && pwd)"
-BIN="$DIR/test_scan"
+SCAN_BIN="$DIR/test_scan"
+TIME_BIN="$DIR/test_time"
 
 if [ "${1:-}" = "clean" ]; then
-    rm -f "$BIN" "$DIR"/*.o "$DIR"/*.gcda "$DIR"/*.gcno
-    echo "unit test binary removed"
-    exit 0
+  rm -f "$SCAN_BIN" "$TIME_BIN" "$DIR"/*.o "$DIR"/*.gcda "$DIR"/*.gcno
+  echo "unit test binaries removed"
+  exit 0
 fi
 
 # Standalone runs follow the same central source pin as ci-build.sh.
@@ -141,7 +142,7 @@ VERSION="${REQUESTED_NGINX_VERSION:-${NGINX_VERSION:?missing NGINX_VERSION in .g
 NGX_SRC="$ROOT/.build/nginx-${VERSION}${NGX_BUILD_SUFFIX:--debug}"
 
 if [ ! -f "$NGX_SRC/objs/ngx_auto_config.h" ]; then
-    cat >&2 <<EOF
+  cat >&2 <<EOF
 ERROR: no configured nginx tree at $NGX_SRC
 
 The unit tests link nginx's real src/core/ngx_string.c and need
@@ -149,20 +150,20 @@ objs/ngx_auto_config.h, which only exists after nginx is configured.
 
 Run first:  bash ci/tools/ci-build.sh nginx ${VERSION}
 EOF
-    exit 1
+  exit 1
 fi
 echo "Using nginx source: $NGX_SRC"
 
 CC="${CC:-cc}"
 
 NGX_INCS=(
-    -I"$NGX_SRC/src/core"
-    -I"$NGX_SRC/src/event"
-    -I"$NGX_SRC/src/event/modules"
-    -I"$NGX_SRC/src/os/unix"
-    -I"$NGX_SRC/objs"
-    -I"$NGX_SRC/src/http"
-    -I"$NGX_SRC/src/http/modules"
+  -I"$NGX_SRC/src/core"
+  -I"$NGX_SRC/src/event"
+  -I"$NGX_SRC/src/event/modules"
+  -I"$NGX_SRC/src/os/unix"
+  -I"$NGX_SRC/objs"
+  -I"$NGX_SRC/src/http"
+  -I"$NGX_SRC/src/http/modules"
 )
 
 # Our code: the full warning wall.
@@ -171,35 +172,52 @@ OWN_CFLAGS=(-g -O1 -Wall -Wextra -Wshadow -Wstrict-prototypes -Werror)
 NGX_CFLAGS=(-g -O1 -Wall)
 
 if [ "${COVERAGE:-0}" = 1 ]; then
-    OWN_CFLAGS+=(--coverage)
-    NGX_CFLAGS+=(--coverage)
-    LINK_EXTRA=(--coverage)
+  OWN_CFLAGS+=(--coverage)
+  NGX_CFLAGS+=(--coverage)
+  LINK_EXTRA=(--coverage)
 else
-    LINK_EXTRA=()
+  LINK_EXTRA=()
 fi
 
 # ci/fuzz/ngx_stubs.c is reused, not copied: it already resolves the
 # allocator/log symbols ngx_string.c drags in, and aborts if the scan path ever
 # reaches one. A second copy here would be a second thing to keep in sync with
 # the scan core's no-allocate contract.
-echo "==> Building $BIN with ${CC}"
+echo "==> Building $SCAN_BIN with ${CC}"
 # shellcheck disable=SC2086  # $CC may legitimately carry flags (e.g. "gcc -m32")
 $CC "${OWN_CFLAGS[@]}" "${NGX_INCS[@]}" -I"$ROOT/src" -c "$DIR/test_scan.c" \
-    -o "$DIR/test_scan.o"
+  -o "$DIR/test_scan.o"
 # shellcheck disable=SC2086
 $CC "${OWN_CFLAGS[@]}" "${NGX_INCS[@]}" -I"$ROOT/src" \
-    -c "$ROOT/src/ngx_http_error_abuse_scan.c" \
-    -o "$DIR/ngx_http_error_abuse_scan.o"
+  -c "$ROOT/src/ngx_http_error_abuse_scan.c" \
+  -o "$DIR/ngx_http_error_abuse_scan.o"
 # shellcheck disable=SC2086
 $CC "${OWN_CFLAGS[@]}" "${NGX_INCS[@]}" -c "$ROOT/ci/fuzz/ngx_stubs.c" \
-    -o "$DIR/ngx_stubs.o"
+  -o "$DIR/ngx_stubs.o"
 # shellcheck disable=SC2086
 $CC "${NGX_CFLAGS[@]}" "${NGX_INCS[@]}" -c "$NGX_SRC/src/core/ngx_string.c" \
-    -o "$DIR/ngx_string.o"
+  -o "$DIR/ngx_string.o"
 # shellcheck disable=SC2086
-$CC "${LINK_EXTRA[@]}" -o "$BIN" \
-    "$DIR/test_scan.o" "$DIR/ngx_http_error_abuse_scan.o" "$DIR/ngx_stubs.o" \
-    "$DIR/ngx_string.o"
+$CC "${LINK_EXTRA[@]}" -o "$SCAN_BIN" \
+  "$DIR/test_scan.o" "$DIR/ngx_http_error_abuse_scan.o" "$DIR/ngx_stubs.o" \
+  "$DIR/ngx_string.o"
 
 echo "==> Running"
-"$BIN"
+"$SCAN_BIN"
+
+echo "==> Building $TIME_BIN with ${CC}"
+# shellcheck disable=SC2086
+$CC "${OWN_CFLAGS[@]}" -I"$ROOT/src" -c "$DIR/test_time.c" \
+  -o "$DIR/test_time.o"
+# shellcheck disable=SC2086
+$CC "${LINK_EXTRA[@]}" -o "$TIME_BIN" "$DIR/test_time.o"
+
+echo "==> Running"
+"$TIME_BIN"
+
+deadline_add_re='([[:alnum:]_.>-]+|\([^)]*\))[[:space:]]*\+[[:space:]]*(zone->block|ctx->zone->block|zone->inactive|NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION)'
+if grep -nE "$deadline_add_re" "$ROOT/src/ngx_http_error_abuse_module.c"; then
+  echo "FAIL: deadline additions in module.c must use ngx_http_error_abuse_time_add_saturate" >&2
+  exit 1
+fi
+echo "OK: production deadline call sites use saturating time helper"
