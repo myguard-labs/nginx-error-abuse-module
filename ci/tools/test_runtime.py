@@ -2341,7 +2341,15 @@ def test_on_full_policy(
         # F-3 opt-in: the zone is full, so the fresh identity's error
         # response is rejected with the location's configured status instead
         # of passing through untracked.
-        expect(nginx_port + 11, "/err?client=fresh-reject", 503)
+        status, headers = fetch(nginx_port + 11, "/err?client=fresh-reject")
+        if status != 503:
+            raise AssertionError(f"/err?client=fresh-reject expected 503, got {status}")
+        cache_control = headers.get("cache-control", "")
+        if cache_control != "private, no-store":
+            raise AssertionError(
+                "on_full=reject response Cache-Control must be private, no-store: "
+                f"{cache_control!r}"
+            )
         # Serve one more request afterwards: the filter_finalize path unwinds
         # after the 503 is already on the wire, so a crash there is invisible
         # to the assertion above but kills the next request.
@@ -2403,7 +2411,17 @@ def test_on_full_policy(
         )
         try:
             _fill_zone(nginx_port + 13, "rejectredis")
-            expect(nginx_port + 13, "/err?client=fresh-reject-redis", 503)
+            status, headers = fetch(nginx_port + 13, "/err?client=fresh-reject-redis")
+            if status != 503:
+                raise AssertionError(
+                    f"/err?client=fresh-reject-redis expected 503, got {status}"
+                )
+            cache_control = headers.get("cache-control", "")
+            if cache_control != "private, no-store":
+                raise AssertionError(
+                    "Redis on_full=reject response Cache-Control must be "
+                    f"private, no-store: {cache_control!r}"
+                )
             # This is the leg that actually segfaulted before the callback
             # ordering fix: the reject unwinds inside the phase chain resumed
             # by the Redis callback. A second request proves the worker

@@ -1129,6 +1129,11 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
                       &ctx->zone->name);
         if (ctx->zone->on_full_reject) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
+            ctx->own_rejection = 1;
+            /* ngx_http_filter_finalize_request() clears headers before
+             * rendering the synthetic response. Let the header filter run
+             * once more so the own-rejection headers are attached to it. */
+            ctx->response_seen = 0;
             ngx_http_error_abuse_log_decision(r, conf, ctx, "blocked",
                                               "rejected (zone full)");
             return ngx_http_filter_finalize_request(r,
