@@ -250,6 +250,12 @@ real_ip_header X-Forwarded-For;
 real_ip_recursive on;
 ```
 
+## Requirements
+
+Build against an nginx or Angie source tree with a C compiler and the usual
+PCRE2 and zlib development headers. The module also links against hiredis with
+TLS support and OpenSSL (`libhiredis-dev` and `libssl-dev` on Debian/Ubuntu).
+
 ## Building from source
 
 ```bash
@@ -263,6 +269,14 @@ make modules
 Copy `objs/ngx_http_error_abuse_module.so` into your NGINX module directory and
 `load_module` it. The full CI/sanitizer matrix lives in
 [`.github/CI.md`](.github/CI.md).
+
+## Linting
+
+Enable the repository hook once with
+`git config core.hooksPath .githooks`, then stage the files you want checked.
+Run `bash ci/linter/run-all.sh` for a full-tree pass. The checker inventory,
+requirements, and selective-run syntax are documented in
+[`ci/linter/README.md`](ci/linter/README.md).
 
 ## See also
 
