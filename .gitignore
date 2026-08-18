@@ -19,4 +19,6 @@ ci/tests/unit/test_scan
 # inputs (descriptively named, e.g. ci/fuzz/corpus/one_record.bin) stay tracked,
 # while these wildcards keep newly discovered hash-named inputs out of git.
 ci/fuzz/corpus/*
+!ci/fuzz/corpus/*.bin
 ci/fuzz/corpus_statuses/*
+!ci/fuzz/corpus_statuses/*[!0-9a-f]*
