@@ -1,4 +1,4 @@
-# sync-sha: 62ee9084900e74145faae0706990f186fcbfd72872195745dbbf15269a582994
+# sync-sha: 9b18811cfb4244f54ad13cac8d197c9e58a9cbe1dfcb0eb43cab7d0b817809cc
 name: Build and Test
 
 env:
@@ -258,6 +258,56 @@ jobs:
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_retry_buffer_module.so" \
             --reject-header-fault retry-after
+
+  coverage:
+    name: Coverage report
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    env:
+      # The runtime driver uses this base plus offsets through +20. Keep its
+      # 32-port band disjoint from runtime (18880), ASan (18912/18944), and
+      # Test::Nginx (18976), which may share a persistent runner.
+      TEST_BASE_PORT: "19008"
+      TEST_PORT_WIDTH: "32"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
+      - name: Install coverage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cpanminus gcovr libhiredis-dev libio-socket-ssl-perl \
+            libpcre2-dev redis-server zlib1g-dev
+          # libtest-nginx-perl is unavailable on ubuntu-24.04 runners.
+          sudo cpanm --notest --quiet Test::Nginx
+
+      - name: Restore coverage build cache
+        uses: ./.github/actions/build-cache
+        with:
+          mode: coverage
+          nginx-version: ${{ env.NGINX_VERSION }}
+
+      - name: Verify coverage port band is free
+        run: bash ci/tools/max-port.sh "$TEST_BASE_PORT" "$TEST_PORT_WIDTH"
+
+      - name: Generate coverage report
+        # No COVERAGE_FAIL_UNDER: this job publishes measured coverage, not a
+        # gamed percentage gate. Build and runtime failures still fail it.
+        run: ci/tools/coverage.sh "$NGINX_VERSION"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: .build/coverage/
+          retention-days: 14
 
   test-nginx:
     name: Test::Nginx
