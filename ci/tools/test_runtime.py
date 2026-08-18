@@ -184,6 +184,16 @@ $error_abuse_count variable, the persistence CRC32 corruption check once
 isolated with an in-place byte flip), 1 SURVIVED (test_redis_auth's AUTH
 handshake -- masked by same-node local fallback). Every mutation above was
 reverted; `git diff src/` is empty at the end of this ledger's construction.
+
+RA-2 log-safety negative control (2026-08-18) -- run with
+`--log-safety-only`. Revert only the production change in
+src/ngx_http_error_abuse_module.c, rebuild the module, and leave this test
+unchanged. The default `$binary_remote_addr` identity then puts its embedded
+NUL bytes back into error.log and the named control fails with
+"log safety: NUL byte reached error.log". Restoring the production change,
+rebuilding, and rerunning returns "OK: log safety controls". The same control
+also drives LF/CR identities plus NUL-bearing Redis GET, EVALSHA and SCRIPT
+error replies, asserting fixed-format one-line records and no raw backend text.
 """
 
 from __future__ import annotations
@@ -191,15 +201,19 @@ from __future__ import annotations
 import argparse
 import atexit
 import concurrent.futures
+import hashlib
 import os
 import pathlib
+import re
 import shlex
 import signal
 import socket
+import socketserver
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -248,6 +262,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--single-process", action="store_true")
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")
+    parser.add_argument("--log-safety-only", action="store_true")
     return parser.parse_args()
 
 
@@ -342,12 +357,20 @@ events {{
 http {{
     access_log off;
 
+    map $arg_log_key $log_identity {{
+        default $binary_remote_addr;
+        lf "line-break-secret\\nforged";
+        cr "carriage-return-secret\\rforged";
+    }}
+
     # Exercise the three exposed variables end-to-end at the log phase, where
     # the request ctx state is fully settled.
     log_format eavars '$uri $error_abuse_status $error_abuse_count '
                       '$error_abuse_blocked_until';
 
 {redis}{redis_zone}
+    error_abuse_zone zone=logsafe:1m key=$log_identity
+                     statuses=404 interval=30s threshold=1 block=10s;
     error_abuse_zone zone=vars:1m key=$binary_remote_addr
                      statuses=404 interval=30s threshold=2 block=30s;
     error_abuse_zone zone=basic:1m key=$binary_remote_addr
@@ -390,6 +413,11 @@ http {{
         location = /ok {{
             error_abuse zone=basic status=429;
             empty_gif;
+        }}
+
+        location = /log-error {{
+            error_abuse zone=logsafe status=429 log_level=notice;
+            root {root}/empty;
         }}
 
         location = /key-error {{
@@ -678,6 +706,258 @@ class RedisServer:
             output = self.process.stdout.read() if self.process.stdout else ""
             raise RuntimeError(f"redis-server failed:\n{output}")
         self.process = None
+
+
+class HostileRedisServer:
+    """Minimal RESP2 peer that returns binary error replies to hiredis."""
+
+    CHECK_ERROR = b"CHECK-HOSTILE-SECRET\x00tail"
+    EVAL_ERROR = b"EVAL-HOSTILE-SECRET\x00tail"
+    HANDSHAKE_ERROR = b"HANDSHAKE-HOSTILE-SECRET\x00tail"
+
+    def __init__(self, handshake_error: bool = False) -> None:
+        self.handshake_error = handshake_error
+        self.commands: list[bytes] = []
+        self._condition = threading.Condition()
+        self._server: socketserver.ThreadingTCPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def _read_command(stream) -> list[bytes] | None:
+        line = stream.readline()
+        if not line:
+            return None
+        if not line.startswith(b"*") or not line.endswith(b"\r\n"):
+            raise ValueError(f"invalid RESP array header: {line!r}")
+        count = int(line[1:-2])
+        command = []
+        for _ in range(count):
+            length_line = stream.readline()
+            if not length_line.startswith(b"$") or not length_line.endswith(b"\r\n"):
+                raise ValueError(f"invalid RESP bulk header: {length_line!r}")
+            length = int(length_line[1:-2])
+            value = stream.read(length)
+            if len(value) != length or stream.read(2) != b"\r\n":
+                raise ValueError("truncated RESP bulk string")
+            command.append(value)
+        return command
+
+    def _response(self, command: list[bytes]) -> bytes:
+        name = command[0].upper()
+        if name == b"SCRIPT":
+            if self.handshake_error:
+                return b"-" + self.HANDSHAKE_ERROR + b"\r\n"
+            digest = b"0" * 40
+            return b"$40\r\n" + digest + b"\r\n"
+        if name == b"GET":
+            return b"-" + self.CHECK_ERROR + b"\r\n"
+        if name == b"EVALSHA":
+            return b"-" + self.EVAL_ERROR + b"\r\n"
+        return b"-UNEXPECTED-COMMAND\r\n"
+
+    def start(self) -> None:
+        parent = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                while True:
+                    command = parent._read_command(self.rfile)
+                    if command is None:
+                        return
+                    with parent._condition:
+                        parent.commands.append(command[0].upper())
+                        parent._condition.notify_all()
+                    self.wfile.write(parent._response(command))
+                    self.wfile.flush()
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        if self._server is None:
+            raise RuntimeError("hostile Redis server is not running")
+        return int(self._server.server_address[1])
+
+    def wait_for(self, command: bytes, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while command not in self.commands:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"hostile Redis did not receive {command!r}: {self.commands!r}"
+                    )
+                self._condition.wait(remaining)
+
+    def stop(self) -> None:
+        if self._server is None:
+            return
+        self._server.shutdown()
+        self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self._server = None
+        self._thread = None
+
+
+def _wait_for_log(error_log: pathlib.Path, marker: bytes, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if error_log.exists() and marker in error_log.read_bytes():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"log safety: marker did not reach error.log: {marker!r}")
+
+
+def _assert_log_safety(error_log: pathlib.Path) -> None:
+    data = error_log.read_bytes()
+    if b"\x00" in data:
+        raise AssertionError("log safety: NUL byte reached error.log")
+    if b"\r" in data:
+        raise AssertionError("log safety: CR byte reached error.log")
+
+    decision_lines = [
+        line
+        for line in data.split(b"\n")
+        if b'error_abuse blocked: client_sha256="' in line
+        and b'in zone "logsafe" threshold reached' in line
+    ]
+    if len(decision_lines) != 3:
+        raise AssertionError(
+            f"log safety: expected 3 one-line identity records, got {decision_lines!r}"
+        )
+
+    expected_keys = {
+        hashlib.sha256(socket.inet_aton("127.0.0.1")).hexdigest().encode(),
+        hashlib.sha256(b"line-break-secret\nforged").hexdigest().encode(),
+        hashlib.sha256(b"carriage-return-secret\rforged").hexdigest().encode(),
+    }
+    actual_keys = set()
+    for line in decision_lines:
+        match = re.search(rb'client_sha256="([0-9a-f]{64})"', line)
+        if match is None:
+            raise AssertionError(f"log safety: malformed identity record: {line!r}")
+        actual_keys.add(match.group(1))
+        if any(byte < 0x20 or byte > 0x7E for byte in line):
+            raise AssertionError(f"log safety: non-printable identity record: {line!r}")
+    if actual_keys != expected_keys:
+        raise AssertionError(
+            f"log safety: identity digests differ: {actual_keys!r} != {expected_keys!r}"
+        )
+
+    for secret in (
+        b"line-break-secret",
+        b"carriage-return-secret",
+        HostileRedisServer.CHECK_ERROR.split(b"\x00", 1)[0],
+        HostileRedisServer.EVAL_ERROR.split(b"\x00", 1)[0],
+    ):
+        if secret in data:
+            raise AssertionError(
+                f"log safety: raw secret reached error.log: {secret!r}"
+            )
+
+    expected_redis = (
+        b"Redis check returned unexpected reply (type=6, detail_len=25)",
+        b"Redis EVAL returned unexpected reply (type=6, detail_len=24)",
+    )
+    for marker in expected_redis:
+        if data.count(marker) != 1:
+            raise AssertionError(
+                f"log safety: expected one Redis record {marker!r}, "
+                f"got {data.count(marker)}"
+            )
+
+
+def _assert_handshake_log_safety(error_log: pathlib.Path) -> None:
+    data = error_log.read_bytes()
+    secret = HostileRedisServer.HANDSHAKE_ERROR.split(b"\x00", 1)[0]
+    if secret in data:
+        raise AssertionError("log safety: raw Redis handshake error reached error.log")
+    if b"\x00" in data or b"\r" in data:
+        raise AssertionError("log safety: control byte reached handshake error.log")
+    marker = b"Redis handshake (AUTH/SELECT) failed (type=6, detail_len=29)"
+    if data.count(marker) != 1:
+        raise AssertionError(
+            f"log safety: expected one Redis handshake record, got {data.count(marker)}"
+        )
+
+
+def test_log_safety(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+) -> None:
+    redis = HostileRedisServer()
+    nginx: Nginx | None = None
+    try:
+        redis.start()
+        nginx = Nginx(
+            binary,
+            module,
+            root / "log-safety",
+            nginx_port,
+            runner,
+            True,
+            redis.port,
+            f"error-abuse-log-{os.getpid()}:",
+        )
+        nginx.start()
+        redis.wait_for(b"SCRIPT")
+
+        expect(nginx.port, "/log-error?log_key=default", 404)
+        expect(nginx.port, "/log-error?log_key=lf", 404)
+        expect(nginx.port, "/log-error?log_key=cr", 404)
+        expect(nginx.port, "/redis-error?client=hostile", 404)
+        redis.wait_for(b"GET")
+        redis.wait_for(b"EVALSHA")
+        _wait_for_log(
+            nginx.root / "logs" / "error.log",
+            b"Redis EVAL returned unexpected reply",
+        )
+
+        nginx.stop()
+        _assert_log_safety(nginx.root / "logs" / "error.log")
+        nginx.assert_clean_logs()
+    finally:
+        if nginx is not None:
+            nginx.stop()
+        redis.stop()
+
+    handshake_redis = HostileRedisServer(handshake_error=True)
+    handshake_nginx: Nginx | None = None
+    try:
+        handshake_redis.start()
+        handshake_nginx = Nginx(
+            binary,
+            module,
+            root / "log-safety-handshake",
+            nginx_port + 1,
+            runner,
+            True,
+            handshake_redis.port,
+            f"error-abuse-log-handshake-{os.getpid()}:",
+        )
+        handshake_nginx.start()
+        handshake_redis.wait_for(b"SCRIPT")
+        _wait_for_log(
+            handshake_nginx.root / "logs" / "error.log",
+            b"Redis handshake (AUTH/SELECT) failed",
+        )
+        handshake_nginx.stop()
+        _assert_handshake_log_safety(handshake_nginx.root / "logs" / "error.log")
+        handshake_nginx.assert_clean_logs()
+    finally:
+        if handshake_nginx is not None:
+            handshake_nginx.stop()
+        handshake_redis.stop()
 
 
 def test_redis_multi_host(
@@ -1748,6 +2028,10 @@ def main() -> int:
         root = pathlib.Path(tmp)
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
+        test_log_safety(binary, module, root, args.runner, args.port + 10)
+        if args.log_safety_only:
+            print("OK: log safety controls")
+            return 0
         test_on_full_policy(
             binary,
             module,
