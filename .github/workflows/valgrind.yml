@@ -1,4 +1,4 @@
-# sync-sha: d5e50855918dfb198d3f7eebf96c318166cd6787d90c25784832724f7b569944
+# sync-sha: e3ef1d6ae694bfe5477c80693e2e15e67b7a6082248bd984cf9254452037b4c1
 name: Valgrind
 
 # Valgrind memcheck lite soak on every PR/push — 60s soak so PR feedback stays
@@ -6,7 +6,7 @@ name: Valgrind
 # (monthly cron + workflow_dispatch).
 #
 # Action pins (keep in sync with build-test.yml header):
-# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/checkout@v7.0.1        -> 3d3c42e5aac5ba805825da76410c181273ba90b1
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

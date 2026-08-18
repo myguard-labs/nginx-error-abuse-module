@@ -1,4 +1,4 @@
-# sync-sha: a74d80884a192c6a6c666ad4378c0aba0b4a103407b82420e6e01e1a09727f90
+# sync-sha: c24c034a5033c178a6d596e69e30e3109f1bc9c5cac43d9fa671545a1cf692da
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml
@@ -11,7 +11,7 @@ name: A/UBSan
 # evidence this soak actually drives the handler, not a default GET.
 #
 # Action pins (keep in sync with build-test.yml header):
-# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/checkout@v7.0.1        -> 3d3c42e5aac5ba805825da76410c181273ba90b1
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -51,7 +51,7 @@ jobs:
       TEST_PORT_WIDTH: "32"
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -122,7 +122,7 @@ jobs:
       TEST_PORT_WIDTH: "32"
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

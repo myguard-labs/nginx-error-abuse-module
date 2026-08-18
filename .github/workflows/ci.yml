@@ -1,3 +1,4 @@
+# sync-sha: f62f80a2e1ef07fb30a26069295ab6d44f10826b7a4e8b672a056bd3ff914d61
 name: CI
 
 # Single entry point orchestrator (cp4a). This is the ONLY workflow carrying a
@@ -7,39 +8,33 @@ name: CI
 #
 # ci-deep.yml is schedule-driven and deliberately NOT a member of this lane.
 #
-# Runner lanes (cp8). Measured per-called-workflow wall clock from run
-# 30864509849 (2026-08-04, branch ci/cp7b-linter, self-hosted builder02):
-#   fuzzing            265s (self-hosted) -- longest single job, the budget
-#   valgrind            90s (self-hosted)
-#   build-test          85s (self-hosted; internally Build 47s, Test::Nginx 51s,
-#                             Validation 17s, Runtime 35s)
-#   security-scanners   65s (self-hosted)
-#   asan                62s (self-hosted; internally 59s + 62s)
-#   codeql              93s (HOSTED ubuntu-latest)
-#   lint                56s (HOSTED ubuntu-latest)
+# Runner lanes. Measured per-called-workflow wall clock from run 32162088333
+# (2026-08-18, PR #53, self-hosted builder02):
+#   fuzzing            296s -- longest single job, the budget
+#   build-test         155s -- first child start through Runtime completion
+#   codeql             134s
+#   valgrind            80s
+#   asan                62s -- slower of its two parallel jobs
+#   security-scanners   44s
+#   lint                29s
 #
-# builder02 has 6 real self-hosted ephemeral slots (docker-01, docker-02,
-# runner-01..04 -- `systemctl list-units | grep ci-ephemeral`). Before this
-# change, every self-hosted job started at t=0 with no `needs:` between them:
-# build-test fans out to 3 concurrent jobs, asan to 2, plus valgrind,
-# security-scanners and fuzzing each 1 -- 8 self-hosted jobs racing 6 slots.
-# The measured run (30864509849) happened to show zero queueing delay (all
-# jobs startedAt 00:06:30, run created 00:06:27), so this is oversubscription
-# headroom removed, NOT a measured wall-clock speedup -- no speedup was
-# measured or claimed here.
+# Every member reads the POOL repository variable. On builder02 that selects 6
+# ephemeral slots (docker-01, docker-02, runner-01..04; count with
+# `systemctl list-units | grep ci-ephemeral`). The measured run started five
+# pool jobs at once: fuzzing, CodeQL, and build-test's three-way fan-out.
 #
 # Three lanes -- three that fit beats four that fit:
-#   Lane A: fuzzing alone (265s), nothing chained behind it. Headroom 0s.
-#   Lane B: valgrind (90s) -> security-scanners (65s) = 155s. Headroom 110s.
-#   Lane C: build-test (85s) -> asan (62s) = 147s. Headroom 118s.
-#   codeql and lint are HOSTED (ubuntu-latest): no `needs:`, not laned,
-#   start immediately alongside everything else.
-#
-# After this change, peak self-hosted concurrency at t=0 is 5 (fuzzing 1 +
-# valgrind 1 + build-test's 3 fanned-out jobs), under the 6-slot ceiling.
+#   Lane A: fuzzing alone (296s), nothing chained behind it. Headroom 0s.
+#   Lane B: build-test (155s) -> asan (62s) -> lint (29s) = 246s.
+#           Headroom 50s.
+#   Lane C: codeql (134s) -> valgrind (80s) -> security-scanners (44s)
+#           = 258s. Headroom 38s.
 #
 # Re-derive the per-job timings with:
-#   gh run view <id> --json jobs -q '.jobs[] | [.name, .conclusion, (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s", .startedAt, .completedAt] | @tsv'
+#   gh run view 32162088333 -R myguard-labs/nginx-error-abuse-module \
+#     --json jobs -q '.jobs[] | [.name, .conclusion,
+#     (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s",
+#     .startedAt, .completedAt] | @tsv'
 
 on:
   pull_request:
@@ -79,6 +74,8 @@ jobs:
     uses: ./.github/workflows/fuzzing.yml
 
   valgrind:
+    needs: codeql
+    if: ${{ !cancelled() }}
     permissions:
       contents: read
     uses: ./.github/workflows/valgrind.yml
@@ -97,7 +94,8 @@ jobs:
     uses: ./.github/workflows/codeql.yml
 
   lint:
+    needs: asan
+    if: ${{ !cancelled() }}
     permissions:
       contents: read
     uses: ./.github/workflows/lint.yml
-# sync-sha: bac8cf5fa25302ed5883799c76c04a9096f999ad9cf4cbf1343d9dfc51565ee1
