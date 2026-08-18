@@ -3007,8 +3007,9 @@ ngx_http_error_abuse_redis_handshake_callback(redisAsyncContext *ac,
         worker->ready = 0;
         ngx_log_error(NGX_LOG_ERR, worker->log, 0,
                       "error_abuse: Redis handshake (AUTH/SELECT) failed "
-                      "(type=%d, detail_len=%uz)", reply->type,
+                      "(type=%d, detail_len=%uz); disconnecting", reply->type,
                       reply->str ? reply->len : 0);
+        redisAsyncDisconnect(ac);
     }
 }
 
