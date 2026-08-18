@@ -194,6 +194,19 @@ NUL bytes back into error.log and the named control fails with
 rebuilding, and rerunning returns "OK: log safety controls". The same control
 also drives LF/CR identities plus NUL-bearing Redis GET, EVALSHA and SCRIPT
 error replies, asserting fixed-format one-line records and no raw backend text.
+
+RA-11a runtime persistence/eviction controls (2026-08-18) -- each is runnable
+in isolation after rebuilding the module. `--oversized-snapshot-only` writes a
+CRC-valid 1 MiB+ snapshot made solely of a real serialized ban record. Changing
+the loader's `file_size > (zone->shm_zone->shm.size + mac_len)` term to `0`
+made it fail with `/persist-ok: expected 200, got 429`; restoring the term
+returned `OK: oversized snapshot rejection control`. `--mixed-eviction-only`
+first calibrates the bounded minimum-zone capacity using only active bans, then
+places an active LRU-tail ban before exactly one reclaimable entry. Changing
+`if (ean->blocked_until <= now)` to `if (1)` made the calibration fail with
+`eviction capacity exceeded bounded fixture (300 nodes)`, because active bans
+were evicted instead of preserving a full zone; restoring the predicate returned
+`OK: mixed blocked/unblocked eviction control`.
 """
 
 from __future__ import annotations
@@ -210,6 +223,7 @@ import signal
 import socket
 import socketserver
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -217,6 +231,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 # A test that raises before stop() would orphan every child we spawned:
 # an nginx master (or redis) keeps listening on its test port, which
@@ -263,6 +278,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")
     parser.add_argument("--log-safety-only", action="store_true")
+    parser.add_argument("--mixed-eviction-only", action="store_true")
+    parser.add_argument("--oversized-snapshot-only", action="store_true")
     parser.add_argument(
         "--reject-header-fault",
         choices=("cache-control", "retry-after"),
@@ -1249,6 +1266,7 @@ def _on_full_config(
     on_full: str,
     redis_port: int | None,
     redis_prefix: str,
+    threshold: int = 1,
 ) -> str:
     # F-3: minimum-size zone (8 pages), threshold=1 so a single 404 both
     # creates AND permanently blocks each distinct identity -- every
@@ -1275,7 +1293,7 @@ http {{
     access_log off;
 
 {redis}    error_abuse_zone zone=full:{_ZONE_FULL_SIZE} key=$arg_client
-                     statuses=404 interval=60s threshold=1 block=600s
+                     statuses=404 interval=60s threshold={threshold} block=600s
                      on_full={on_full}{redis_param};
 
     server {{
@@ -1303,12 +1321,15 @@ def _on_full_start(
     on_full: str,
     redis_port: int | None = None,
     redis_prefix: str = "error-abuse-ci-full:",
+    threshold: int = 1,
 ) -> subprocess.Popen[str]:
     (root / "conf").mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
     (root / "empty").mkdir(parents=True, exist_ok=True)
     (root / "conf" / "nginx.conf").write_text(
-        _on_full_config(root, port, module, on_full, redis_port, redis_prefix),
+        _on_full_config(
+            root, port, module, on_full, redis_port, redis_prefix, threshold
+        ),
         encoding="ascii",
     )
     output = (root / "nginx-output.log").open("a", encoding="utf-8")
@@ -1372,6 +1393,125 @@ def _fill_zone(port: int, tag: str, n: int = _ZONE_FILL_REQUESTS) -> None:
     # its assertion vacuous.
     for i in range(n):
         request(port, f"/err?client={tag}{i}")
+
+
+def _calibrate_eviction_capacity(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> int:
+    """Return the exact number of blocked threshold=2 nodes a small zone holds."""
+    proc = _on_full_start(binary, module, root, runner, port, "reject", threshold=2)
+    blocked = 0
+    try:
+        for i in range(_ZONE_FILL_REQUESTS):
+            client = f"capacity-{i}"
+            status = request(port, f"/err?client={client}")
+            if status == 503:
+                if blocked < 3:
+                    raise AssertionError(
+                        f"eviction capacity unexpectedly small: {blocked} nodes"
+                    )
+                return blocked
+            if status != 404:
+                raise AssertionError(
+                    f"capacity fill {client}: expected 404 or 503, got {status}"
+                )
+            expect(port, f"/err?client={client}", 404)
+            blocked += 1
+    finally:
+        _on_full_stop(proc)
+    raise AssertionError(
+        f"eviction capacity exceeded bounded fixture ({_ZONE_FILL_REQUESTS} nodes)"
+    )
+
+
+def test_mixed_eviction(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+) -> None:
+    """A full mixed zone must reclaim only an unblocked LRU identity."""
+    capacity = _calibrate_eviction_capacity(
+        binary, module, root / "eviction-capacity", runner, nginx_port
+    )
+    proc = _on_full_start(
+        binary,
+        module,
+        root / "eviction-mixed",
+        runner,
+        nginx_port + 1,
+        "reject",
+        threshold=2,
+    )
+    try:
+        # Keep the protected ban at the LRU tail. The next node is deliberately
+        # unblocked, and every later node is a fresh active ban. At pressure the
+        # eviction walk must skip the tail ban and reclaim this exact identity.
+        expect(nginx_port + 1, "/err?client=protected", 404)
+        expect(nginx_port + 1, "/err?client=protected", 404)
+        expect(nginx_port + 1, "/err?client=reclaim", 404)
+        for i in range(capacity - 2):
+            client = f"blocked-{i}"
+            expect(nginx_port + 1, f"/err?client={client}", 404)
+            expect(nginx_port + 1, f"/err?client={client}", 404)
+
+        # The new identity must be admitted by reclaiming the unblocked node.
+        # It is then made active to prove this was a real allocation, not an
+        # on_full=reject response that happened to look like a first error.
+        expect(nginx_port + 1, "/err?client=fresh", 404)
+        expect(nginx_port + 1, "/ok?client=protected", 503)
+        expect(nginx_port + 1, "/ok?client=reclaim", 200)
+        expect(nginx_port + 1, "/err?client=fresh", 404)
+        expect(nginx_port + 1, "/ok?client=fresh", 503)
+    finally:
+        _on_full_stop(proc)
+
+
+def test_oversized_snapshot_rejected(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+) -> None:
+    """A structurally valid snapshot just beyond the zone limit is ignored."""
+    nginx = Nginx(binary, module, root / "oversized-snapshot", nginx_port, runner, True)
+    state = nginx.root / "persisted.state"
+    try:
+        nginx.start()
+        for _ in range(3):
+            expect(nginx_port, "/persist-error", 404)
+        nginx.stop()
+
+        data = state.read_bytes()
+        header_len = 24
+        if len(data) <= header_len or struct.unpack_from("<I", data, 16)[0] != 1:
+            raise AssertionError(
+                "oversized snapshot fixture did not serialize one record"
+            )
+        record = data[header_len:]
+        # `persisted` is declared as 1m in nginx_config(). Repeat its one valid
+        # ban record only enough times to cross that exact loader bound. This is
+        # a bounded file-format control, not an allocation-failure simulation.
+        zone_size = 1024 * 1024
+        records = (zone_size + 1 - header_len + len(record) - 1) // len(record)
+        oversized = bytearray(data[:header_len] + record * records)
+        struct.pack_into("<I", oversized, 16, records)
+        struct.pack_into("<I", oversized, 20, zlib.crc32(oversized[header_len:]))
+        if len(oversized) <= zone_size:
+            raise AssertionError("oversized snapshot fixture did not cross zone bound")
+        state.write_bytes(oversized)
+        os.chmod(state, 0o600)
+
+        nginx.start()
+        expect(nginx_port, "/persist-ok", 200)
+    finally:
+        nginx.stop()
 
 
 def test_on_full_policy(
@@ -2152,6 +2292,20 @@ def main() -> int:
                 args.reject_header_fault,
             )
             return 0
+        if args.mixed_eviction_only or args.oversized_snapshot_only:
+            if module is None:
+                raise ValueError("runtime control requires --module")
+            if args.mixed_eviction_only and args.oversized_snapshot_only:
+                raise ValueError("select only one runtime control")
+            if args.mixed_eviction_only:
+                test_mixed_eviction(binary, module, root, args.runner, args.port)
+                print("OK: mixed blocked/unblocked eviction control")
+            else:
+                test_oversized_snapshot_rejected(
+                    binary, module, root, args.runner, args.port
+                )
+                print("OK: oversized snapshot rejection control")
+            return 0
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
         test_log_safety(binary, module, root, args.runner, args.port + 10)
@@ -2165,6 +2319,10 @@ def main() -> int:
             args.runner,
             args.port,
             pathlib.Path(args.redis_server).absolute() if args.redis_server else None,
+        )
+        test_mixed_eviction(binary, module, root, args.runner, args.port + 14)
+        test_oversized_snapshot_rejected(
+            binary, module, root, args.runner, args.port + 16
         )
         test_error_page_redirect(binary, module, root, args.runner, args.port + 20)
         if args.redis_server:
