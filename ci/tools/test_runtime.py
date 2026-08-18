@@ -263,6 +263,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")
     parser.add_argument("--log-safety-only", action="store_true")
+    parser.add_argument(
+        "--reject-header-fault",
+        choices=("cache-control", "retry-after"),
+        help="run only the matching test-build rejection-header fault case",
+    )
     return parser.parse_args()
 
 
@@ -310,6 +315,115 @@ def fetch(port: int, path: str) -> tuple[int, dict[str, str]]:
     except urllib.error.HTTPError as exc:
         exc.read()
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}
+
+
+def fetch_or_closed(port: int, path: str) -> tuple[int, dict[str, str]] | None:
+    """Return None when a fail-closed header filter aborts the response."""
+    try:
+        return fetch(port, path)
+    except ConnectionResetError:
+        return None
+
+
+def test_reject_header_fault(
+    binary: pathlib.Path,
+    module: pathlib.Path,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+    fault: str,
+) -> None:
+    server = root / f"reject-header-{fault}"
+    (server / "conf").mkdir(parents=True)
+    (server / "logs").mkdir()
+    (server / "empty").mkdir()
+    (server / "conf" / "nginx.conf").write_text(
+        f"""load_module {module};
+worker_processes 1;
+pid {server}/nginx.pid;
+error_log {server}/logs/error.log notice;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    error_abuse_zone zone=fault:1m key=$arg_client
+                     statuses=404 interval=60s threshold=1 block=60s;
+    server {{
+        listen 127.0.0.1:{port};
+        location = /error {{
+            error_abuse zone=fault status=429;
+            root {server}/empty;
+        }}
+        location = /reject {{
+            error_abuse zone=fault status=429;
+            empty_gif;
+        }}
+    }}
+}}
+""",
+        encoding="ascii",
+    )
+    command = [
+        str(binary),
+        "-p",
+        str(server),
+        "-c",
+        str(server / "conf" / "nginx.conf"),
+        "-g",
+        "daemon off; master_process off;",
+    ]
+    process = _track(
+        subprocess.Popen(
+            shlex.split(runner) + command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    try:
+        wait_port(port)
+        expect(port, "/error?client=fault", 404)
+        response = fetch_or_closed(port, "/reject?client=fault")
+        error_log = (server / "logs" / "error.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        markers = {
+            "cache-control": "error_abuse test fault: rejection header list push",
+            "retry-after": "error_abuse test fault: Retry-After buffer allocation",
+        }
+        expected_marker = markers[fault]
+        if expected_marker not in error_log:
+            raise AssertionError(
+                f"{fault} fault seam did not emit its marker: {expected_marker!r}"
+            )
+        unexpected_markers = [
+            marker for name, marker in markers.items() if name != fault
+        ]
+        if any(marker in error_log for marker in unexpected_markers):
+            raise AssertionError(f"{fault} fault triggered the wrong allocation seam")
+        if response is not None:
+            status, headers = response
+            cache_control = headers.get("cache-control", "")
+            if fault == "cache-control":
+                raise AssertionError(
+                    "Cache-Control list-push fault escaped fail-closed: "
+                    f"status={status}, Cache-Control={cache_control!r}"
+                )
+            raise AssertionError(
+                "Retry-After buffer fault returned a partial rejection "
+                f"instead of NGX_ERROR: status={status}, "
+                f"Cache-Control={cache_control!r}, "
+                f"Retry-After={headers.get('retry-after', '')!r}"
+            )
+        if process.poll() is not None:
+            raise AssertionError(
+                f"nginx exited after {fault} fault with {process.returncode}"
+            )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=15)
+
+    print(f"OK: rejection-header {fault} allocation failure returned NGX_ERROR")
 
 
 def nginx_config(
@@ -2026,6 +2140,18 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
         root = pathlib.Path(tmp)
+        if args.reject_header_fault:
+            if module is None:
+                raise ValueError("--reject-header-fault requires --module")
+            test_reject_header_fault(
+                binary,
+                module,
+                root,
+                args.runner,
+                args.port,
+                args.reject_header_fault,
+            )
+            return 0
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
         test_log_safety(binary, module, root, args.runner, args.port + 10)

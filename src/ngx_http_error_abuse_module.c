@@ -790,13 +790,39 @@ ngx_http_error_abuse_log_decision(ngx_http_request_t *r,
                   ctx->count, ctx->blocked_until);
 }
 
+/* Test-only compile seams force the two rejection-header allocation sites
+ * independently.  Production builds call nginx's allocators directly. */
+static ngx_table_elt_t *
+ngx_http_error_abuse_reject_header_push(ngx_http_request_t *r)
+{
+#if defined(NGX_HTTP_ERROR_ABUSE_TEST_FAIL_REJECT_HEADER_PUSH)
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "error_abuse test fault: rejection header list push");
+    return NULL;
+#else
+    return ngx_list_push(&r->headers_out.headers);
+#endif
+}
+
+static u_char *
+ngx_http_error_abuse_retry_after_alloc(ngx_http_request_t *r)
+{
+#if defined(NGX_HTTP_ERROR_ABUSE_TEST_FAIL_RETRY_AFTER_ALLOC)
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "error_abuse test fault: Retry-After buffer allocation");
+    return NULL;
+#else
+    return ngx_pnalloc(r->pool, NGX_TIME_T_LEN);
+#endif
+}
+
 static ngx_int_t
 ngx_http_error_abuse_add_header(ngx_http_request_t *r, const char *key,
     size_t key_len, u_char *value, size_t value_len)
 {
     ngx_table_elt_t  *h;
 
-    h = ngx_list_push(&r->headers_out.headers);
+    h = ngx_http_error_abuse_reject_header_push(r);
     if (h == NULL) {
         return NGX_ERROR;
     }
@@ -816,7 +842,7 @@ ngx_http_error_abuse_add_header(ngx_http_request_t *r, const char *key,
  * authorization state. Mark it private and non-storable so a downstream shared
  * cache can never replay one client's ban to another, and advertise a
  * Retry-After deadline for 429/503 so clients know when to come back. */
-static void
+static ngx_int_t
 ngx_http_error_abuse_add_reject_headers(ngx_http_request_t *r,
     ngx_http_error_abuse_req_ctx_t *ctx)
 {
@@ -830,9 +856,14 @@ ngx_http_error_abuse_add_reject_headers(ngx_http_request_t *r,
         r->headers_out.last_modified = NULL;
     }
 
-    (void) ngx_http_error_abuse_add_header(r, "Cache-Control",
-        sizeof("Cache-Control") - 1, (u_char *) "private, no-store",
-        sizeof("private, no-store") - 1);
+    if (ngx_http_error_abuse_add_header(r, "Cache-Control",
+                                        sizeof("Cache-Control") - 1,
+                                        (u_char *) "private, no-store",
+                                        sizeof("private, no-store") - 1)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
     if ((r->headers_out.status == NGX_HTTP_TOO_MANY_REQUESTS
          || r->headers_out.status == NGX_HTTP_SERVICE_UNAVAILABLE)
@@ -842,13 +873,23 @@ ngx_http_error_abuse_add_reject_headers(ngx_http_request_t *r,
         if (retry < 1) {
             retry = 1;
         }
-        p = ngx_pnalloc(r->pool, NGX_TIME_T_LEN);
-        if (p != NULL) {
-            (void) ngx_http_error_abuse_add_header(r, "Retry-After",
-                sizeof("Retry-After") - 1, p,
-                ngx_sprintf(p, "%T", retry) - p);
+        p = ngx_http_error_abuse_retry_after_alloc(r);
+        if (p == NULL) {
+            /* nginx header filters abort on allocation failure rather than
+             * emit a partially constructed response, even for an advisory
+             * header such as Retry-After. */
+            return NGX_ERROR;
+        }
+        if (ngx_http_error_abuse_add_header(r, "Retry-After",
+                                            sizeof("Retry-After") - 1, p,
+                                            ngx_sprintf(p, "%T", retry) - p)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
         }
     }
+
+    return NGX_OK;
 }
 
 static ngx_int_t
@@ -1009,7 +1050,9 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
     /* SEC-2/RFC-1/RFC-2: this is our own synthetic rejection; tag it private,
      * no-store and (for 429/503) Retry-After so it is never shared-cached. */
     if (ctx->own_rejection) {
-        ngx_http_error_abuse_add_reject_headers(r, ctx);
+        if (ngx_http_error_abuse_add_reject_headers(r, ctx) != NGX_OK) {
+            return NGX_ERROR;
+        }
         return ngx_http_error_abuse_next_header_filter(r);
     }
 

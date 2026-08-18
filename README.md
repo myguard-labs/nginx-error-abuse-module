@@ -183,7 +183,10 @@ never counts its own ban responses or subrequests.
 Every ban response the module generates carries `Cache-Control: private,
 no-store` so a downstream shared cache can never replay one client's ban to
 another; `429`/`503` responses also get a `Retry-After` reflecting the ban
-deadline.
+deadline. If nginx cannot allocate either rejection header, the header filter
+returns `NGX_ERROR` and aborts the response instead of sending a partial ban
+response; `Retry-After` is advisory, but follows nginx's normal allocation-
+failure convention rather than being silently omitted.
 
 An `error_page` internal redirect (either a URI target or a named
 `@location`) does not lose enforcement: the identity, counter and ban status
