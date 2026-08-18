@@ -1,4 +1,4 @@
-# sync-sha: edf6c4469e86283aa7af8bfd343b1cf5f10095b44b3fc6a8f11ca63c79673c36
+# sync-sha: 24385813b294d90673a9c59f5e9d1e72bdd258beade02ec10703094fd839cea9
 name: CodeQL
 
 env:
@@ -26,7 +26,7 @@ permissions:
 jobs:
   analyze:
     name: Analyze C
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     permissions:
       contents: read

@@ -1,3 +1,4 @@
+# sync-sha: 2ac962c3a782d06fca8eaea70b51652659a2de24d00f2f915b9628f391d2c35b
 name: Build and Test
 
 env:
@@ -22,7 +23,7 @@ permissions:
 jobs:
   validation:
     name: Validation
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -81,7 +82,7 @@ jobs:
     # blocks while CI is green. Retarget the rule in the same change if it ever
     # has to move; do not merge with --admin.
     name: Build (${{ matrix.flavor }} / ${{ matrix.cc }})
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     # Latest nginx mainline only, amd64, gcc. The version is NOT a matrix
     # value: it is resolved from .github/versions.env at run time, because a
@@ -178,7 +179,7 @@ jobs:
 
   runtime:
     name: Runtime
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     needs: build
     env:
@@ -238,7 +239,7 @@ jobs:
 
   test-nginx:
     name: Test::Nginx
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     env:
       # `prove` binds too. Test::Nginx::Util binds TEST_NGINX_PORT, default
@@ -305,4 +306,3 @@ jobs:
           TEST_NGINX_SERVROOT: ${{ github.workspace }}/ci/t/servroot
         run: |
           prove -v ci/t/basic.t
-# sync-sha: 331791aa2f0da72223f6f02ec34fbff5735a44c0d349fbc4dad93e50f9d745e1

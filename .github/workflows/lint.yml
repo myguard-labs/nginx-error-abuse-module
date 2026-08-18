@@ -1,3 +1,4 @@
+# sync-sha: 2ef45abe51186927db58b3e9d64d1bb927be2bd44a39f599cab77e20918cbca0
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -10,7 +11,8 @@ name: Lint
 # are already the job of security-scanners.yml, at the same thresholds
 # (ci/linter/lint-c.sh mirrors that workflow).
 #
-# runs-on: ubuntu-latest, NOT the self-hosted pool -- this job needs no nginx
+# Keep the same portable POOL selector as every job; an unset variable falls
+# back to hosted runners in standalone clones.
 # build.
 
 env:
@@ -31,7 +33,7 @@ permissions:
 jobs:
   lint:
     name: Linters
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout module
@@ -65,4 +67,3 @@ jobs:
           # name here leaves it running locally and never in CI.
           LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift
         run: ci/linter/run-all.sh
-# sync-sha: a4e2ca15ea06de4dce6a539ce46380c543e373be547ecc482f3187727b39e410

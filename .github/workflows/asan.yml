@@ -1,3 +1,4 @@
+# sync-sha: a74d80884a192c6a6c666ad4378c0aba0b4a103407b82420e6e01e1a09727f90
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml
@@ -34,7 +35,7 @@ permissions:
 jobs:
   asan:
     name: ASan and UBSan
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     env:
       # Own band, disjoint from build-test.yml:runtime and this file's
@@ -111,7 +112,7 @@ jobs:
 
   asan-reload:
     name: ASan multi-worker + reload
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","builder02","lxc"]') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     env:
       # Own band -- see the asan job above and build-test.yml:runtime for the
@@ -182,4 +183,3 @@ jobs:
             --port "$TEST_BASE_PORT" \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}-asan/objs/nginx"
-# sync-sha: 880cd36c2eb3a31d2b328225a2fbc8fc2ff474116161f9cce68b7e199058eaf1
