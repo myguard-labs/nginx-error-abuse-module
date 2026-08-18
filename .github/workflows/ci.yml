@@ -1,4 +1,4 @@
-# sync-sha: f62f80a2e1ef07fb30a26069295ab6d44f10826b7a4e8b672a056bd3ff914d61
+# sync-sha: e98ac3b66988d8619a8a1f421644c4e4aacbdb2a534fb384c72923b492979bb9
 name: CI
 
 # Single entry point orchestrator (cp4a). This is the ONLY workflow carrying a
@@ -8,30 +8,30 @@ name: CI
 #
 # ci-deep.yml is schedule-driven and deliberately NOT a member of this lane.
 #
-# Runner lanes. Measured per-called-workflow wall clock from run 32162088333
-# (2026-08-18, PR #53, self-hosted builder02):
-#   fuzzing            296s -- longest single job, the budget
-#   build-test         155s -- first child start through Runtime completion
-#   codeql             134s
-#   valgrind            80s
-#   asan                62s -- slower of its two parallel jobs
-#   security-scanners   44s
-#   lint                29s
+# Runner lanes. Measured per-called-workflow wall clock from run 32162940330
+# (2026-08-18, PR #54, self-hosted builder02):
+#   fuzzing            307s -- longest single job, the budget
+#   codeql             179s
+#   asan               154s -- slower of its two parallel jobs
+#   build-test         136s -- first child start through Runtime completion
+#   valgrind           132s
+#   security-scanners   93s
+#   lint                14s
 #
 # Every member reads the POOL repository variable. On builder02 that selects 6
 # ephemeral slots (docker-01, docker-02, runner-01..04; count with
-# `systemctl list-units | grep ci-ephemeral`). The measured run started five
-# pool jobs at once: fuzzing, CodeQL, and build-test's three-way fan-out.
+# `systemctl list-units | grep ci-ephemeral`). Four lanes start six pool jobs:
+# fuzzing, CodeQL, Valgrind, and build-test's three-way fan-out.
 #
-# Three lanes -- three that fit beats four that fit:
-#   Lane A: fuzzing alone (296s), nothing chained behind it. Headroom 0s.
-#   Lane B: build-test (155s) -> asan (62s) -> lint (29s) = 246s.
-#           Headroom 50s.
-#   Lane C: codeql (134s) -> valgrind (80s) -> security-scanners (44s)
-#           = 258s. Headroom 38s.
+# Four lanes are the minimum: 1015s total does not fit three 307s lanes.
+#   Lane A: fuzzing alone (307s), nothing chained behind it. Headroom 0s.
+#   Lane B: build-test (136s) -> asan (154s) = 290s. Headroom 17s.
+#   Lane C: codeql (179s) -> security-scanners (93s) = 272s.
+#           Headroom 35s.
+#   Lane D: valgrind (132s) -> lint (14s) = 146s. Headroom 161s.
 #
 # Re-derive the per-job timings with:
-#   gh run view 32162088333 -R myguard-labs/nginx-error-abuse-module \
+#   gh run view 32162940330 -R myguard-labs/nginx-error-abuse-module \
 #     --json jobs -q '.jobs[] | [.name, .conclusion,
 #     (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s",
 #     .startedAt, .completedAt] | @tsv'
@@ -74,14 +74,12 @@ jobs:
     uses: ./.github/workflows/fuzzing.yml
 
   valgrind:
-    needs: codeql
-    if: ${{ !cancelled() }}
     permissions:
       contents: read
     uses: ./.github/workflows/valgrind.yml
 
   security-scanners:
-    needs: valgrind
+    needs: codeql
     if: ${{ !cancelled() }}
     permissions:
       contents: read
@@ -94,7 +92,7 @@ jobs:
     uses: ./.github/workflows/codeql.yml
 
   lint:
-    needs: asan
+    needs: valgrind
     if: ${{ !cancelled() }}
     permissions:
       contents: read
