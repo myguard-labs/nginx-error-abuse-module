@@ -71,6 +71,9 @@
 #ifndef NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION 30
 #endif
+#ifndef NGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT
+#define NGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT 64
+#endif
 
 typedef struct {
     ngx_str_t   host;       /* numeric address (resolved at config time) */
@@ -523,24 +526,36 @@ ngx_http_error_abuse_expire(ngx_http_error_abuse_zone_t *zone, time_t now,
     }
 }
 
-/* SEC-1: evict the oldest non-blocked node (LRU tail) to make room for a new
- * identity, preserving active bans. Returns 1 if a node was freed. */
+/* SEC-1/SP-2: evict an old non-blocked node to make room for a new identity,
+ * preserving active bans. Work is capped per allocation miss: active bans are
+ * rotated to the LRU head so repeated pressure resumes after the blocked tail
+ * segment instead of walking the whole zone under the shared slab mutex. */
 static ngx_flag_t
 ngx_http_error_abuse_evict_one_unblocked(ngx_http_error_abuse_zone_t *zone,
     time_t now)
 {
-    ngx_queue_t                  *q;
+    ngx_queue_t                  *next, *q, *sentinel, *stop;
+    ngx_uint_t                    limit;
     ngx_http_error_abuse_node_t  *ean;
 
-    for (q = ngx_queue_last(&zone->sh->queue);
-         q != ngx_queue_sentinel(&zone->sh->queue);
-         q = ngx_queue_prev(q))
-    {
+    sentinel = ngx_queue_sentinel(&zone->sh->queue);
+    q = ngx_queue_last(&zone->sh->queue);
+    stop = ngx_queue_head(&zone->sh->queue);
+    limit = NGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT;
+
+    while (limit-- && q != sentinel) {
+        next = ngx_queue_prev(q);
         ean = ngx_queue_data(q, ngx_http_error_abuse_node_t, queue);
         if (ean->blocked_until <= now) {
             ngx_http_error_abuse_delete(zone, ean);
             return 1;
         }
+
+        ngx_http_error_abuse_touch(zone, ean);
+        if (q == stop) {
+            return 0;
+        }
+        q = next;
     }
 
     return 0;
