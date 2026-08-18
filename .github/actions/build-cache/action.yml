@@ -1,4 +1,4 @@
-# sync-sha: ab9fc87f06caa90af9ab1b819cf15ae20e7138b81469b102df1c7e19f7a93cba
+# sync-sha: 67b85c2033383359226a1cdec7d4cc241a7aaa77481144d5325cfcd14d180410
 name: Build cache
 description: >-
   Restore the ccache + nginx source/build caches for one build mode. Hybrid by
@@ -11,7 +11,7 @@ inputs:
     description: "Build mode: debug | asan | module | coverage. MUST match the ci-build.sh arg."
     required: true
   nginx-version:
-    description: "source version, e.g. 1.31.1"
+    description: "pinned source version, e.g. 1.31.3"
     required: true
   flavor:
     description: "nginx (default) | angie -- MUST match the ci-build.sh arg."
@@ -64,13 +64,14 @@ runs:
           ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-
           ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-
 
-    # The upstream tarball never changes for a given version -- key on version
-    # alone, no restore-keys ladder (a "close" tarball is the wrong tarball).
+    # No restore-keys ladder: a "close" tarball is the wrong tarball. Include
+    # versions.env so replacing a digest for an unchanged version cannot keep
+    # restoring an archive from the old trust decision.
     - name: Cache source tarball
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: .build/${{ inputs.flavor }}-${{ inputs.nginx-version }}.tar.gz
-        key: src-${{ inputs.flavor }}-${{ inputs.nginx-version }}
+        key: src-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ hashFiles('.github/versions.env') }}
 
     # THE DANGEROUS ONE. The build tree holds compiled objects, and
     # debug/asan/coverage/module objects are NOT interchangeable -- restoring a
@@ -89,7 +90,7 @@ runs:
       with:
         path: .build/${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ inputs.mode }}
         key: >-
-          buildtree-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ hashFiles('ci/tools/ci-build.sh', 'config', 'src/**') }}
+          buildtree-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ hashFiles('.github/versions.env', 'ci/tools/ci-build.sh', 'config', 'src/**') }}
 
     # Package layer: check-before-install, NOT an actions/cache layer, and
     # deliberately still not one -- actions/cache cannot safely cache

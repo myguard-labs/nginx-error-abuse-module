@@ -57,8 +57,8 @@ if [ -z "$NGX_SRC" ] || [ ! -f "$NGX_SRC/objs/ngx_auto_config.h" ]; then
   The fuzz targets link nginx's real src/core/ngx_string.c and need
   objs/ngx_auto_config.h, which only exists after nginx is configured.
 
-  Run first:  bash ci/tools/ci-build.sh nginx 1.31.1
-  Or point at a tree explicitly:  NGX_SRC=/path/to/nginx-1.31.1 ci/fuzz/build.sh
+  Run first:  bash ci/tools/ci-build.sh
+  Or point at a tree explicitly:  NGX_SRC=/path/to/nginx-1.31.3 ci/fuzz/build.sh
 EOF
     exit 1
 fi

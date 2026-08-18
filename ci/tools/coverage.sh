@@ -59,7 +59,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-VERSION="${1:-1.31.1}"
+# Keep the standalone default aligned with ci-build.sh's allow-list.
+# Path is rooted at REPO_ROOT after cd above.
+# shellcheck disable=SC1091
+source .github/versions.env
+VERSION="${1:-$NGINX_VERSION}"
 OUT="${COVERAGE_OUT:-$ROOT/.build/coverage}"
 
 command -v gcovr >/dev/null 2>&1 || {
