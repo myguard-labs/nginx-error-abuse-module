@@ -1,4 +1,4 @@
-# sync-sha: 82a5f31a8bee0d7e2a449c45ea201ab604e12b66639bd166a5534ffb98588b34
+# sync-sha: cbdfab4ea94f4d0fe7c2a73ab7a00e4e431955aed8151bbcbd802972a2f4faaf
 name: Build and Test
 
 env:
@@ -170,6 +170,7 @@ jobs:
           bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-persist-short-write
           bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-persist-fsync
           bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-redis-backoff
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" fault-redis-state
 
       - name: Stage artifact
         if: matrix.primary
@@ -189,6 +190,8 @@ jobs:
             artifact/ngx_http_error_abuse_fault_persist_fsync_module.so
           cp ".build/nginx-${NGINX_VERSION}-fault-redis-backoff/objs/ngx_http_error_abuse_module.so" \
             artifact/ngx_http_error_abuse_fault_redis_backoff_module.so
+          cp ".build/nginx-${NGINX_VERSION}-fault-redis-state/objs/ngx_http_error_abuse_module.so" \
+            artifact/ngx_http_error_abuse_fault_redis_state_module.so
 
       - name: Upload nginx artifact
         if: matrix.primary
@@ -271,7 +274,7 @@ jobs:
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_retry_buffer_module.so" \
             --reject-header-fault retry-after
 
-      - name: Run persistence I/O and Redis backoff controls
+      - name: Run persistence I/O and Redis state controls
         run: |
           for fault in short-read short-write fsync; do
             module_name="${fault//-/_}"
@@ -287,6 +290,12 @@ jobs:
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --fault-module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_redis_backoff_module.so" \
             --redis-backoff-cap
+          python3 ci/tools/test_runtime.py \
+            --port "$((TEST_BASE_PORT + 26))" \
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+            --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_fault_redis_state_module.so" \
+            --redis-server /usr/bin/redis-server \
+            --redis-state-controls
 
   coverage:
     name: Coverage report
