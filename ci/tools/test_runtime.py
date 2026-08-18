@@ -2351,7 +2351,7 @@ def main() -> int:
             time.sleep(0.3)
             nginx.stop()
 
-            data = bytearray(state.read_bytes())
+            mutable_data: bytearray = bytearray(state.read_bytes())
             # header(24) + record: key_len(u16) + event_count(u16) +
             # blocked_until(i64) @ offset 4 within the record -> file offset
             # 24 + 4 = 28. Flip a low-order byte in the middle of the i64
@@ -2359,10 +2359,10 @@ def main() -> int:
             # future) timestamp rather than flipping sign/magnitude into
             # something a later stage might reject for an unrelated reason.
             blocked_until_off = 24 + 4 + 2
-            if len(data) <= blocked_until_off:
+            if len(mutable_data) <= blocked_until_off:
                 raise AssertionError("snapshot too small for CRC32 flip case")
-            data[blocked_until_off] ^= 0x01
-            state.write_bytes(bytes(data))
+            mutable_data[blocked_until_off] ^= 0x01
+            state.write_bytes(bytes(mutable_data))
             os.chmod(state, 0o600)
 
             nginx.start()
@@ -2430,7 +2430,7 @@ def main() -> int:
             # the state and counters its own request earned. So key by URI, and
             # keep every counter assertion the sequence version had -- those are
             # what would catch a real counting or identity bug.
-            by_uri = {}
+            by_uri: dict[str, list[list[str]]] = {}
             for ln in lines:
                 by_uri.setdefault(ln[0], []).append(ln)
 
