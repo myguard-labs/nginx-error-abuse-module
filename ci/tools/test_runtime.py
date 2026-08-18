@@ -285,6 +285,20 @@ def parse_args() -> argparse.Namespace:
         choices=("cache-control", "retry-after"),
         help="run only the matching test-build rejection-header fault case",
     )
+    parser.add_argument(
+        "--persistence-io-fault",
+        choices=("short-read", "short-write", "fsync"),
+        help="run only the matching test-build persistence I/O control",
+    )
+    parser.add_argument(
+        "--fault-module",
+        help="test-built module used by a persistence or reconnect control",
+    )
+    parser.add_argument(
+        "--redis-backoff-cap",
+        action="store_true",
+        help="run only the reduced-time Redis reconnect cap control",
+    )
     return parser.parse_args()
 
 
@@ -441,6 +455,127 @@ http {{
             process.wait(timeout=15)
 
     print(f"OK: rejection-header {fault} allocation failure returned NGX_ERROR")
+
+
+def _persist_ban(nginx: Nginx) -> None:
+    nginx.start()
+    try:
+        for _ in range(3):
+            expect(nginx.port, "/persist-error", 404)
+        expect(nginx.port, "/persist-ok", 429)
+        time.sleep(0.3)
+    finally:
+        nginx.stop()
+
+
+def test_persistence_io_fault(
+    binary: pathlib.Path,
+    module: pathlib.Path,
+    fault_module: pathlib.Path,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+    fault: str,
+) -> None:
+    """Exercise the real retry loops and fsync failure branch without host faults."""
+    state = root / "persisted.state"
+
+    if fault == "short-read":
+        _persist_ban(Nginx(binary, module, root, port, runner, False))
+        reader_module = fault_module
+    else:
+        _persist_ban(Nginx(binary, fault_module, root, port, runner, False))
+        reader_module = module
+
+    if fault == "fsync":
+        if state.exists():
+            raise AssertionError("fsync failure published a persistence snapshot")
+        error_log = (root / "logs" / "error.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        if "fsync()" not in error_log:
+            raise AssertionError("fsync fault did not reach persistence fsync")
+        reader = Nginx(binary, reader_module, root, port, runner, False)
+        reader.start()
+        try:
+            expect(port, "/persist-ok", 200)
+        finally:
+            reader.stop()
+    else:
+        if not state.exists() or state.stat().st_size <= 24:
+            raise AssertionError(f"{fault} fault did not produce a snapshot")
+        reader = Nginx(binary, reader_module, root, port, runner, False)
+        reader.start()
+        try:
+            expect(port, "/persist-ok", 429)
+        finally:
+            reader.stop()
+
+    print(f"OK: persistence {fault} control")
+
+
+class DisconnectRedisServer(socketserver.ThreadingTCPServer):
+    """Peer that accepts then closes, taking hiredis through disconnect."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, port: int) -> None:
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(handler_self) -> None:
+                handler_self.request.close()
+
+        super().__init__(("127.0.0.1", port), Handler)
+        self.thread = threading.Thread(target=self.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.shutdown()
+        self.server_close()
+        self.thread.join(timeout=5)
+
+
+def test_redis_backoff_cap(
+    binary: pathlib.Path,
+    fault_module: pathlib.Path,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> None:
+    """The test build uses 10ms/80ms constants, not a long live outage."""
+    peer = DisconnectRedisServer(port + 20)
+    nginx = Nginx(binary, fault_module, root / "backoff", port, runner, True, port + 20)
+    peer.start()
+    try:
+        nginx.start()
+        deadline = time.monotonic() + 2.0
+        error_log = nginx.root / "logs" / "error.log"
+        next_backoffs: list[int] = []
+        while not next_backoffs and time.monotonic() < deadline:
+            time.sleep(0.01)
+            if error_log.exists():
+                next_backoffs = [
+                    int(value)
+                    for value in re.findall(
+                        r"error_abuse test reconnect delay=\d+ next=(\d+)",
+                        error_log.read_text(encoding="utf-8", errors="replace"),
+                    )
+                ]
+        if not next_backoffs:
+            raise AssertionError(
+                "reconnect trace did not observe a test-peer disconnect"
+            )
+        if next_backoffs[0] != 80:
+            raise AssertionError(
+                f"reconnect backoff cap expected 80ms, got {next_backoffs[0]}ms"
+            )
+    finally:
+        nginx.stop()
+        peer.stop()
+
+    print("OK: Redis reconnect backoff cap control")
 
 
 def nginx_config(
@@ -2305,6 +2440,32 @@ def main() -> int:
                     binary, module, root, args.runner, args.port
                 )
                 print("OK: oversized snapshot rejection control")
+            return 0
+        if args.persistence_io_fault:
+            if module is None or not args.fault_module:
+                raise ValueError(
+                    "persistence I/O fault requires --module and --fault-module"
+                )
+            test_persistence_io_fault(
+                binary,
+                module,
+                pathlib.Path(args.fault_module).resolve(),
+                root,
+                args.runner,
+                args.port,
+                args.persistence_io_fault,
+            )
+            return 0
+        if args.redis_backoff_cap:
+            if not args.fault_module:
+                raise ValueError("Redis backoff cap requires --fault-module")
+            test_redis_backoff_cap(
+                binary,
+                pathlib.Path(args.fault_module).resolve(),
+                root,
+                args.runner,
+                args.port,
+            )
             return 0
         test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)

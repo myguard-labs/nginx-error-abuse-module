@@ -9,6 +9,8 @@
 #              | module (dynamic .so only, nginx core NOT compiled)
 #              | coverage (dynamic .so, gcov-instrumented, -O0)
 #              | fault-list-push | fault-retry-buffer
+#              | fault-persist-short-read | fault-persist-short-write
+#              | fault-persist-fsync | fault-redis-backoff
 #                (test-only dynamic .so; nginx core NOT compiled)
 #
 # The built tree lives under ./.build, ONE TREE PER MODE:
@@ -200,6 +202,14 @@ elif [ "$MODE" = "fault-list-push" ]; then
     CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_TEST_FAIL_REJECT_HEADER_PUSH=1"
 elif [ "$MODE" = "fault-retry-buffer" ]; then
     CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_TEST_FAIL_RETRY_AFTER_ALLOC=1"
+elif [ "$MODE" = "fault-persist-short-read" ]; then
+    CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_TEST_SHORT_READ=1"
+elif [ "$MODE" = "fault-persist-short-write" ]; then
+    CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_TEST_SHORT_WRITE=1"
+elif [ "$MODE" = "fault-persist-fsync" ]; then
+    CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_TEST_FAIL_PERSIST_FSYNC=1"
+elif [ "$MODE" = "fault-redis-backoff" ]; then
+    CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT=10 -DNGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX=80 -DNGX_HTTP_ERROR_ABUSE_TEST_REDIS_BACKOFF_CAP=1 -DNGX_HTTP_ERROR_ABUSE_TEST_REDIS_BACKOFF_TRACE=1"
 fi
 
 # --- ccache -------------------------------------------------------------
@@ -274,7 +284,11 @@ if [ "$MODE" != "asan" ] && [ "$MODE" != "coverage" ]; then
 fi
 
 if [ "$MODE" != "module" ] && [ "$MODE" != "fault-list-push" ] \
-   && [ "$MODE" != "fault-retry-buffer" ]; then
+   && [ "$MODE" != "fault-retry-buffer" ] \
+   && [ "$MODE" != "fault-persist-short-read" ] \
+   && [ "$MODE" != "fault-persist-short-write" ] \
+   && [ "$MODE" != "fault-persist-fsync" ] \
+   && [ "$MODE" != "fault-redis-backoff" ]; then
     make -j"$(nproc)"
     printf 'binary=%s\n' "$ROOT/$DIR/objs/$BINARY"
 fi
