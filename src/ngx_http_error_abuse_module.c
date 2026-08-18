@@ -3483,9 +3483,9 @@ ngx_http_error_abuse_fsync_dir(u_char *path, ngx_log_t *log)
     (void) close(dfd);
 }
 
-/* PERF-1: serialize the whole zone into a freshly allocated heap buffer while
+/* PERF-1: serialize the whole zone into the zone-owned grow-only buffer while
  * holding the slab mutex only for the copy (no I/O under the lock). Returns the
- * buffer (caller frees with ngx_free) and its length, or NULL. */
+ * borrowed buffer and its length, or NULL; the caller must not free it. */
 static u_char *
 ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
     ngx_log_t *log, size_t *outlen)
