@@ -87,6 +87,19 @@ VERSION="${2:-$NGINX_VERSION}"
 MODE="${3:-debug}"
 EXPECTED_SHA256=""
 
+case "$MODE" in
+    debug|asan|module|coverage \
+        |fault-list-push|fault-retry-buffer \
+        |fault-persist-short-read|fault-persist-short-write \
+        |fault-persist-fsync|fault-redis-backoff|fault-redis-state \
+        |fault-evict-scan-budget)
+        ;;
+    *)
+        echo "unsupported mode: $MODE" >&2
+        exit 2
+        ;;
+esac
+
 add_matching_pin() {
     local name="$1"
     local pinned_version="$2"

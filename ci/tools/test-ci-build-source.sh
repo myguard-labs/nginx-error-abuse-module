@@ -111,7 +111,7 @@ run_build() {
             FAKE_DOWNLOAD="$download" \
             NO_CACHE="$no_cache" \
             PATH="$FAKEBIN:/usr/bin:/bin" \
-            bash ci/tools/ci-build.sh "$flavor" "$version" asan
+            bash ci/tools/ci-build.sh "$flavor" "$version" "${BUILD_MODE:-asan}"
     ) > "$output" 2>&1 || status=$?
     return "$status"
 }
@@ -220,6 +220,9 @@ expect_failure "unknown Angie version fails closed" 2 \
 expect_failure "unknown flavor fails closed" 2 \
     "unsupported flavor: unknown" "$TMP/flavor-unknown-root" \
     "$TMP/flavor-unknown.out" /nonexistent 0 unknown 1.31.3
+BUILD_MODE=unknown expect_failure "unknown mode fails closed" 2 \
+    "unsupported mode: unknown" "$TMP/mode-unknown-root" \
+    "$TMP/mode-unknown.out" /nonexistent 0 nginx 1.31.3
 
 write_versions "$nginx_sha" "$(printf '0%.0s' {1..64})" "$angie_sha"
 expect_failure "conflicting duplicate nginx pins fail closed" 2 \
