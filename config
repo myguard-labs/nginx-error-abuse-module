@@ -14,7 +14,7 @@ ngx_module_deps="$ngx_addon_dir/src/ngx_http_error_abuse_scan.h \
                  $ngx_addon_dir/src/ngx_http_error_abuse_win32.h \
                  $ngx_addon_dir/src/ngx_http_error_abuse_probe_hooks.h"
 
-# The CI-only test probe comes from ci/t/harness (nginx-test-harness). It is
+# The CI-only test probe comes from ci/t/harness (nginx-module-testkit). It is
 # real code only when NGX_TEST_HARNESS is defined -- the CI build sets both
 # TEST_HARNESS=1 (seen here) and -DNGX_TEST_HARNESS (the compile define), and
 # never for a packaged build. Gate its sources on the same switch so the

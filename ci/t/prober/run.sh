@@ -10,11 +10,11 @@
 # a mode switch never reuses another mode's object files; this is passed
 # through to the harness as PROBER_BUILD.
 #
-# The engine lives in ci/t/harness (nginx-test-harness) and knows nothing about
-# this module: this only supplies the four things that are ours -- which .so to
-# look in, which directive proves the harness build, and where the conf and
-# rules are. Everything else (boot, teardown, TAP, the delta engine, the pid
-# oracle, the error-log scrape) is the harness's.
+# The engine lives in ci/t/harness (nginx-module-testkit) and knows nothing
+# about this module: this only supplies the four things that are ours --
+# which .so to look in, which directive proves the harness build, and where
+# the conf and rules are. Everything else (boot, teardown, TAP, the delta
+# engine, the pid oracle, the error-log scrape) is the harness's.
 #
 # The build must have been made with TEST_HARNESS=1, otherwise
 # error_abuse_probe does not exist and the config fails to load; the harness
@@ -26,7 +26,7 @@ cd "$(dirname "$0")"
 
 HERE="$PWD"
 
-if [ ! -x ../harness/prober/run.sh ]; then
+if [ ! -x ../harness/ci/prober/run.sh ]; then
     echo "Bail out! ci/t/harness is empty -- run: git submodule update --init"
     exit 1
 fi
@@ -57,4 +57,4 @@ export PROBER_BUILD
 # An allowlist here would be a blanket exemption for a condition that does not
 # occur, and would silently cover a real [crit] the day one appears.
 
-exec ../harness/prober/run.sh "$@"
+exec ../harness/ci/prober/run.sh "$@"

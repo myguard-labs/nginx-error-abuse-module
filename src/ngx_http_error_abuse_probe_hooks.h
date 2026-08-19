@@ -4,7 +4,7 @@
  *
  * ngx_http_error_abuse_probe_hooks.h -- register the probe hooks (CI only).
  *
- * The probe itself lives in ci/t/harness (nginx-test-harness); this declares
+ * The probe itself lives in ci/t/harness (nginx-module-testkit); this declares
  * the one call the HTTP module makes to hand it this module's zone semantics.
  * See ngx_http_error_abuse_probe_hooks.c for what the two hooks do, and
  * ci/t/harness/README.md for the consumer contract.

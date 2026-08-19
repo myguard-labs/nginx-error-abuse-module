@@ -2659,7 +2659,7 @@ ngx_http_error_abuse_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
  * error_abuse_probe <zone>;
  *
  * Installs a content handler in this location that renders worker + shm state
- * as JSON. The renderer itself lives in ci/t/harness (nginx-test-harness);
+ * as JSON. The renderer itself lives in ci/t/harness (nginx-module-testkit);
  * this module supplies only the HTTP surface and, via
  * ngx_http_error_abuse_probe_hooks.c, the module-specific zone semantics.
  * Compiled out entirely unless NGX_TEST_HARNESS is defined.
