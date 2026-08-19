@@ -17,6 +17,7 @@
 #endif
 
 #include "ngx_http_error_abuse_scan.h"
+#include "ngx_http_error_abuse_win32.h"
 #include "ngx_http_error_abuse_time.h"
 
 /* SEC-3: the identity stored in shared memory, Redis and snapshots is a fixed
