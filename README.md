@@ -7,13 +7,14 @@
 [![CodeQL](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/codeql.yml)
 [![A/UBSan](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/asan.yml)
 [![Lint](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/lint.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/lint.yml)
+[![Windows](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/windows.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/windows.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-error-abuse-module/actions/workflows/ci-deep.yml)
 
 ## CI
 
 | Workflow | What it gates |
 |---|---|
-| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the seven members below |
+| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the eight members below |
 | `build-test.yml` | build, `.so` dlopen, bad-config rejection, `-Werror`, Test::Nginx runtime suite |
 | `security-scanners.yml` | flawfinder, clang-tidy, Semgrep |
 | `fuzzing.yml` | recorded-regression replay, then a fresh time-boxed libFuzzer run against the parse targets |
@@ -21,6 +22,7 @@
 | `codeql.yml` | CodeQL over the module TU |
 | `asan.yml` | ASan+UBSan request-storm soak (static `--add-module` build), single-process + multi-worker/reload lanes |
 | `lint.yml` | `ci/linter/` — shellcheck, ruff, perlcritic, yamllint/actionlint/zizmor, nginx-convention and repo-policy checks; same entry point as `.githooks/pre-commit` |
+| `windows.yml` | MSVC and MinGW-w64 static builds; native persistence, restart and two-worker ownership controls under MSVC |
 | `ci-deep.yml` | monthly schedule; long fuzz + memcheck + helgrind sweep, not a PR-lane member |
 
 ### CI caching
@@ -265,6 +267,11 @@ Build against an nginx or Angie source tree with a C compiler and the usual
 PCRE2 and zlib development headers. The module also links against hiredis with
 TLS support and OpenSSL (`libhiredis-dev` and `libssl-dev` on Debian/Ubuntu).
 
+Windows supports a static nginx module with either MSVC or MinGW-w64. MSVC
+uses vcpkg's `hiredis[ssl]:x64-windows-static` triplet and `/MT`; MinGW-w64
+uses the SSL-enabled MSYS2 hiredis package. A Win32 dynamic module is supported
+only by nginx's GCC/Clang build path, not by MSVC.
+
 ## Building from source
 
 ```bash
@@ -278,6 +285,13 @@ make modules
 Copy `objs/ngx_http_error_abuse_module.so` into your NGINX module directory and
 `load_module` it. The full CI/sanitizer matrix lives in
 [`.github/CI.md`](.github/CI.md).
+
+For MSVC, set `NGX_ERROR_ABUSE_INCS` to the vcpkg include directory and
+`NGX_ERROR_ABUSE_LIBS` to the `/LIBPATH` plus hiredis, OpenSSL, `crypt32`,
+`advapi32`, and `ws2_32` libraries, then configure nginx with
+`--crossbuild=win32 --with-cc=cl --add-module=...`. The
+[`windows.yml`](.github/workflows/windows.yml) workflow is the executable build
+recipe for both Windows toolchains.
 
 ## Linting
 

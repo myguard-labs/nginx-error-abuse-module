@@ -6,7 +6,7 @@ Pull-request gate:
 
 | Workflow | Check | Coverage |
 |---|---|---|
-| `ci.yml` | Orchestrator | The only `pull_request` entry point; calls the seven reusable members below. |
+| `ci.yml` | Orchestrator | The only `pull_request` entry point; calls the eight reusable members below. |
 | `build-test.yml` | `Validation` | workflow lint, shellcheck, Python syntax, cppcheck |
 | `build-test.yml` | `Build` | pinned nginx mainline, strict compile |
 | `build-test.yml` | `Runtime` | multi-worker behavior, two-host Redis aggregation, snapshots and restart restore |
@@ -17,11 +17,13 @@ Pull-request gate:
 | `security-scanners.yml` | `Security scanners` | flawfinder (high-severity gate), clang-tidy (`cert-*`, `bugprone-*`, `clang-analyzer-security.*`), Semgrep (`p/c`, `p/security-audit`) |
 | `codeql.yml` | `CodeQL` | CodeQL analysis over the module translation unit |
 | `lint.yml` | `Lint` | shell, Python, Perl, YAML/workflow, spelling, runner, port, cadence, secret, sync-stamp and docs-drift checks |
+| `windows.yml` | `MSVC static module and runtime`; `MinGW-w64 static module` | native Windows builds, directive controls, two-worker persistence ownership and restart restore |
 
-The seven reusable members are called by `ci.yml` in four runner lanes. `build-test`
+The eight reusable members are called by `ci.yml`; the seven Linux members use four runner lanes. `build-test`
 precedes `asan`; `codeql` precedes `security-scanners`; `valgrind` precedes
-`lint`; `fuzzing` runs independently. Members carry `workflow_call` and do not
-have their own pull-request or push trigger, so each change enters the lane once.
+`lint`; `fuzzing` and the hosted Windows workflow run independently. Members
+carry `workflow_call` and do not have their own pull-request or push trigger,
+so each change enters the lane once.
 
 Deep pass (`ci-deep.yml`, monthly cron on the 4th + `workflow_dispatch`, not a
 PR-lane member):
