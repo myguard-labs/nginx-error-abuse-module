@@ -1,4 +1,4 @@
-# sync-sha: a7a73d8e44d9745e9b10d51c6469ca24853137a1fef443446198471515b220ad
+# sync-sha: 56b340a6915301217b7a955e9189934577f5c5ba048291434ee95a1182474f45
 name: Windows
 
 on:
@@ -115,8 +115,6 @@ jobs:
           module_dir=$(cygpath -w "$GITHUB_WORKSPACE")
           module_dir=${module_dir//\\//}
           deps=${DEPS_ROOT//\\//}
-          sed -i '/extern ngx_wsapoll_pt.*WSAPoll;/i #define WSAPoll ngx_wsapoll' \
-            src/os/win32/ngx_socket.h
           export NGX_ERROR_ABUSE_INCS="$deps/include"
           export NGX_ERROR_ABUSE_LIBS="$deps/lib/hiredis.lib \
             $deps/lib/hiredis_ssl.lib $deps/lib/libssl.lib \
@@ -133,7 +131,7 @@ jobs:
             --http-log-path=logs/access.log \
             --without-http_rewrite_module \
             --without-http_gzip_module \
-            --with-cc-opt="-DFD_SETSIZE=1024 -MT -WX /utf-8 \
+            --with-cc-opt="-D_WIN32_WINNT=0x0600 -DFD_SETSIZE=1024 -MT -WX /utf-8 \
               /Zc:preprocessor" \
             --add-module="$module_dir"
 
@@ -223,6 +221,7 @@ jobs:
             "  $zone",
             '  server {',
             '    listen 127.0.0.1:18080;',
+            '    location = /health { root html; }',
             '    location / { error_abuse zone=abuse; root html; }',
             '  }',
             '}'
