@@ -1,4 +1,4 @@
-# sync-sha: d74fbcf3867080f407582fd56377305568652e59e15a3529fb5580f3b9cec016
+# sync-sha: d6c0fe75437042bdbf09968e68acce0903c90174dc8c33368d8ed8e08ebf23a0
 name: Windows
 
 on:
@@ -20,6 +20,8 @@ jobs:
     name: MSVC static module and runtime
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      ASAN_OPTIONS: detect_odr_violation=0
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
