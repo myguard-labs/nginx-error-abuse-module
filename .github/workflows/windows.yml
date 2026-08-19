@@ -1,4 +1,4 @@
-# sync-sha: fd38f669c7f352b5ecde480a19bfa1191c3f7bbaca5320fad1069d3e81644817
+# sync-sha: d74fbcf3867080f407582fd56377305568652e59e15a3529fb5580f3b9cec016
 name: Windows
 
 on:
@@ -147,6 +147,7 @@ jobs:
         working-directory: nginx-${{ env.NGINX_VERSION }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:ASAN_OPTIONS = 'detect_odr_violation=0'
           if (-not (Test-Path objs\nginx.exe)) { throw 'nginx.exe missing' }
           if (-not (Test-Path objs\addon\src\ngx_http_error_abuse_win32.obj)) {
             throw 'Win32 module object missing'
@@ -209,6 +210,7 @@ jobs:
         working-directory: nginx-${{ env.NGINX_VERSION }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:ASAN_OPTIONS = 'detect_odr_violation=0'
           $snapshot = ((Resolve-Path temp).Path -replace '\\', '/') + '/abuse.state'
           $zone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
                   'threshold=2 block=60s ' +
