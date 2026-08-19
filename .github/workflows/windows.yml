@@ -1,4 +1,4 @@
-# sync-sha: 5b1735fb9fbe724d57d1ff17972a2524808b000fbbf8597c46ead31e17861178
+# sync-sha: 03e11a37341c950259b6ae55f1e2a462da34f1ba64ae042aed96d88a9972a572
 name: Windows
 
 on:
@@ -144,7 +144,7 @@ jobs:
               'ngx_http_error_abuse_module') { throw 'module table entry missing' }
           New-Item -ItemType Directory -Force -Path conf, logs, temp, html | Out-Null
           $snapshot = ((Resolve-Path temp).Path -replace '\\', '/') + '/abuse.state'
-          function Write-Config([string]$directive) {
+          function Write-Config([string]$directive, [string]$location) {
             @(
               'worker_processes 2;',
               'error_log logs/error.log notice;',
@@ -153,7 +153,7 @@ jobs:
               "  $directive",
               '  server {',
               '    listen 127.0.0.1:18080;',
-              '    location / { error_abuse zone=abuse; root html; }',
+              "    location / { $location }",
               '  }',
               '}'
             ) | Set-Content -Encoding ascii conf/nginx.conf
@@ -168,15 +168,27 @@ jobs:
             Get-Content $stdout, $stderr | Write-Host
             return $process.ExitCode
           }
+          Write-Config '' 'root html;'
+          $exitCode = Test-Config
+          if ($exitCode -ne 0) {
+            throw "baseline configuration failed (exit $exitCode)"
+          }
+          $baseZone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
+                      'threshold=2 block=60s;'
+          Write-Config $baseZone 'error_abuse zone=abuse; root html;'
+          $exitCode = Test-Config
+          if ($exitCode -ne 0) {
+            throw "non-persistent zone failed (exit $exitCode)"
+          }
           $zone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
                   'threshold=2 block=60s ' +
                   "persist=$snapshot persist_interval=200ms;"
-          Write-Config $zone
+          Write-Config $zone 'error_abuse zone=abuse; root html;'
           $exitCode = Test-Config
           if ($exitCode -ne 0) {
             throw "valid directive rejected (exit $exitCode)"
           }
-          Write-Config 'error_abuse_NOT_A_DIRECTIVE on;'
+          Write-Config 'error_abuse_NOT_A_DIRECTIVE on;' 'root html;'
           $exitCode = Test-Config
           if ($exitCode -eq 0) { throw 'bogus directive accepted' }
           exit 0
