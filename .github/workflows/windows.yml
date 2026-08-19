@@ -1,4 +1,4 @@
-# sync-sha: c1a64505df8577a0afb7ed7c92ab69fd7909de259a6a921a43c8771386cb085f
+# sync-sha: 92d4e3cc3cb83ebb795e150f5b044db689b3d5024d567d7599ca959a25dd09d4
 name: Windows
 
 on:
@@ -152,13 +152,14 @@ jobs:
             ) | Set-Content -Encoding ascii conf/nginx.conf
           }
           function Test-Config {
-            $old = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            try {
-              & .\objs\nginx.exe -p . -c conf/nginx.conf -t 2>&1 |
-                Out-String | Write-Host
-              return $LASTEXITCODE
-            } finally { $ErrorActionPreference = $old }
+            $stdout = 'logs/config.stdout'
+            $stderr = 'logs/config.stderr'
+            $process = Start-Process -FilePath (Resolve-Path .\objs\nginx.exe) `
+              -ArgumentList '-p', '.', '-c', 'conf/nginx.conf', '-t' `
+              -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            Get-Content $stdout, $stderr | Write-Host
+            return $process.ExitCode
           }
           $zone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
                   'threshold=2 block=60s ' +
