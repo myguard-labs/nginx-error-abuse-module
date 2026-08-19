@@ -1,4 +1,4 @@
-# sync-sha: d6c0fe75437042bdbf09968e68acce0903c90174dc8c33368d8ed8e08ebf23a0
+# sync-sha: 91076f8f68bcd4211ce9fe083f9d8b565dd86834a8b2c0eff45adf4ef6a4be4c
 name: Windows
 
 on:
@@ -117,6 +117,8 @@ jobs:
           module_dir=$(cygpath -w "$GITHUB_WORKSPACE")
           module_dir=${module_dir//\\//}
           deps=${DEPS_ROOT//\\//}
+          sed -i '/extern ngx_wsapoll_pt.*WSAPoll;/i #define WSAPoll ngx_wsapoll' \
+            src/os/win32/ngx_socket.h
           export NGX_ERROR_ABUSE_INCS="$deps/include"
           export NGX_ERROR_ABUSE_LIBS="$deps/lib/hiredis.lib \
             $deps/lib/hiredis_ssl.lib $deps/lib/libssl.lib \
