@@ -1,4 +1,4 @@
-# sync-sha: 92d4e3cc3cb83ebb795e150f5b044db689b3d5024d567d7599ca959a25dd09d4
+# sync-sha: 5b1735fb9fbe724d57d1ff17972a2524808b000fbbf8597c46ead31e17861178
 name: Windows
 
 on:
@@ -51,7 +51,7 @@ jobs:
 
       - name: Cache static dependencies
         id: vcpkg-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: C:\vcpkg\installed
           key: vcpkg-hiredis-ssl-x64-windows-static-${{ runner.os }}-v1
@@ -64,6 +64,13 @@ jobs:
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
             'hiredis[ssl]:x64-windows-static'
           if ($LASTEXITCODE -ne 0) { throw "vcpkg failed with $LASTEXITCODE" }
+
+      - name: Save static dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-hiredis-ssl-x64-windows-static-${{ runner.os }}-v1
 
       - name: Locate static dependencies
         shell: pwsh
@@ -165,9 +172,13 @@ jobs:
                   'threshold=2 block=60s ' +
                   "persist=$snapshot persist_interval=200ms;"
           Write-Config $zone
-          if ((Test-Config) -ne 0) { throw 'valid directive rejected' }
+          $exitCode = Test-Config
+          if ($exitCode -ne 0) {
+            throw "valid directive rejected (exit $exitCode)"
+          }
           Write-Config 'error_abuse_NOT_A_DIRECTIVE on;'
-          if ((Test-Config) -eq 0) { throw 'bogus directive accepted' }
+          $exitCode = Test-Config
+          if ($exitCode -eq 0) { throw 'bogus directive accepted' }
           exit 0
 
       - name: Test persistence and singleton ownership
