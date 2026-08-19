@@ -289,10 +289,10 @@ Copy `objs/ngx_http_error_abuse_module.so` into your NGINX module directory and
 For MSVC, set `NGX_ERROR_ABUSE_INCS` to the vcpkg include directory and
 `NGX_ERROR_ABUSE_LIBS` to absolute paths for the hiredis and OpenSSL static
 libraries plus `crypt32`, `advapi32`, and `ws2_32`. Configure nginx with
-`--crossbuild=win32 --with-cc=cl`, an x64 `vcvars64` environment, and
-`--with-cc-opt="-D_WIN32_WINNT=0x0600 -MT /Zc:preprocessor"`. The Windows API
-floor prevents nginx's compatibility `WSAPoll` pointer from colliding with the
-SDK symbol pulled in by hiredis. The
+`--crossbuild=win32 --with-cc=cl`, an x64 `vcvars64` environment, and `/MT`.
+Nginx 1.31.x also needs its private XP-compatibility `WSAPoll` pointer renamed
+before compilation because static hiredis imports the SDK symbol with that
+name; the Windows workflow contains the exact source-local substitution. The
 [`windows.yml`](.github/workflows/windows.yml) workflow is the executable build
 recipe for both Windows toolchains.
 

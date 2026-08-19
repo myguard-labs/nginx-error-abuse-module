@@ -1,4 +1,4 @@
-# sync-sha: 56b340a6915301217b7a955e9189934577f5c5ba048291434ee95a1182474f45
+# sync-sha: 3e4da9d3d52bf6acbd48538108061f09ce5f8e465f88d82443eb5c42cc157025
 name: Windows
 
 on:
@@ -115,6 +115,11 @@ jobs:
           module_dir=$(cygpath -w "$GITHUB_WORKSPACE")
           module_dir=${module_dir//\\//}
           deps=${DEPS_ROOT//\\//}
+          # Static hiredis imports the SDK's WSAPoll symbol. Rename nginx's
+          # private XP-compatibility function pointer to keep both link names
+          # distinct without raising nginx's forced _WIN32_WINNT floor.
+          sed -i '/extern ngx_wsapoll_pt.*WSAPoll;/i #define WSAPoll ngx_wsapoll' \
+            src/os/win32/ngx_socket.h
           export NGX_ERROR_ABUSE_INCS="$deps/include"
           export NGX_ERROR_ABUSE_LIBS="$deps/lib/hiredis.lib \
             $deps/lib/hiredis_ssl.lib $deps/lib/libssl.lib \
@@ -131,7 +136,7 @@ jobs:
             --http-log-path=logs/access.log \
             --without-http_rewrite_module \
             --without-http_gzip_module \
-            --with-cc-opt="-D_WIN32_WINNT=0x0600 -DFD_SETSIZE=1024 -MT -WX /utf-8 \
+            --with-cc-opt="-DFD_SETSIZE=1024 -MT -WX /utf-8 \
               /Zc:preprocessor" \
             --add-module="$module_dir"
 
