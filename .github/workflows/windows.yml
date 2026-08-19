@@ -1,4 +1,4 @@
-# sync-sha: d7e021f12df72d8e815b3a9dae2e7df174b8d9d5c03e585e30b5dc5beede3d19
+# sync-sha: 94b8c4c3aa60f6a29c863a0425a31e0cc2449b9ca439268aeb90b8c6c7258917
 name: Windows
 
 on:
@@ -84,6 +84,29 @@ jobs:
           }
           "DEPS_ROOT=$root" >> $env:GITHUB_ENV
 
+      - name: Load MSVC environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $root = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $root) { throw 'VC++ toolchain not found' }
+          $vcvars = "$root\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "missing $vcvars" }
+          $lines = & cmd.exe /d /s /c "`"$vcvars`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64.bat failed' }
+          foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH') {
+            $prefix = "$name="
+            $line = $lines | Where-Object {
+              $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+            if (-not $line) { throw "vcvars64.bat omitted $name" }
+            "$name=$($line.Substring($prefix.Length))" >> $env:GITHUB_ENV
+          }
+          "VCVARS=$vcvars" >> $env:GITHUB_ENV
+
       - name: Configure
         shell: bash
         working-directory: nginx-${{ env.NGINX_VERSION }}
@@ -98,6 +121,7 @@ jobs:
             $deps/lib/libcrypto.lib crypt32.lib \
             advapi32.lib ws2_32.lib"
           ./configure \
+            --crossbuild=win32 \
             --with-cc=cl \
             --prefix= \
             --sbin-path=nginx.exe \
@@ -109,19 +133,6 @@ jobs:
             --without-http_gzip_module \
             --with-cc-opt="-MT -WX" \
             --add-module="$module_dir"
-
-      - name: Locate MSVC environment
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $root = & $vswhere -latest -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
-          if (-not $root) { throw 'VC++ toolchain not found' }
-          $vcvars = "$root\VC\Auxiliary\Build\vcvars64.bat"
-          if (-not (Test-Path $vcvars)) { throw "missing $vcvars" }
-          "VCVARS=$vcvars" >> $env:GITHUB_ENV
 
       - name: Build
         shell: cmd  # zizmor: ignore[misfeature]
@@ -306,6 +317,7 @@ jobs:
           export NGX_ERROR_ABUSE_LIBS="-L$MINGW_PREFIX/lib -lhiredis \
             -lhiredis_ssl -lssl -lcrypto -lcrypt32 -ladvapi32 -lws2_32"
           ./configure \
+            --crossbuild=win32 \
             --with-cc=gcc \
             --prefix= \
             --sbin-path=nginx.exe \
