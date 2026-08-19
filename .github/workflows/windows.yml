@@ -1,4 +1,4 @@
-# sync-sha: 03e11a37341c950259b6ae55f1e2a462da34f1ba64ae042aed96d88a9972a572
+# sync-sha: d7e021f12df72d8e815b3a9dae2e7df174b8d9d5c03e585e30b5dc5beede3d19
 name: Windows
 
 on:
@@ -98,7 +98,6 @@ jobs:
             $deps/lib/libcrypto.lib crypt32.lib \
             advapi32.lib ws2_32.lib"
           ./configure \
-            --crossbuild=win32 \
             --with-cc=cl \
             --prefix= \
             --sbin-path=nginx.exe \
@@ -307,7 +306,6 @@ jobs:
           export NGX_ERROR_ABUSE_LIBS="-L$MINGW_PREFIX/lib -lhiredis \
             -lhiredis_ssl -lssl -lcrypto -lcrypt32 -ladvapi32 -lws2_32"
           ./configure \
-            --crossbuild=win32 \
             --with-cc=gcc \
             --prefix= \
             --sbin-path=nginx.exe \
