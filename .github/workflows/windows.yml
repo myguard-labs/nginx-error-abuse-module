@@ -1,4 +1,4 @@
-# sync-sha: 94b8c4c3aa60f6a29c863a0425a31e0cc2449b9ca439268aeb90b8c6c7258917
+# sync-sha: ee60836b8b515a0db693b570e5c1f047c71b249a548194562b39358c2b09bc9e
 name: Windows
 
 on:
@@ -131,7 +131,7 @@ jobs:
             --http-log-path=logs/access.log \
             --without-http_rewrite_module \
             --without-http_gzip_module \
-            --with-cc-opt="-MT -WX" \
+            --with-cc-opt="-DFD_SETSIZE=1024 -MT -WX /utf-8 /Zc:preprocessor" \
             --add-module="$module_dir"
 
       - name: Build
