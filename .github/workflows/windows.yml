@@ -1,4 +1,4 @@
-# sync-sha: fc643bfa6db6319858cf2d9a53e88900f05c61b58827fc670c11785f8f133b8d
+# sync-sha: c1a64505df8577a0afb7ed7c92ab69fd7909de259a6a921a43c8771386cb085f
 name: Windows
 
 on:
@@ -86,8 +86,9 @@ jobs:
           module_dir=${module_dir//\\//}
           deps=${DEPS_ROOT//\\//}
           export NGX_ERROR_ABUSE_INCS="$deps/include"
-          export NGX_ERROR_ABUSE_LIBS="/LIBPATH:$deps/lib hiredis.lib \
-            hiredis_ssl.lib libssl.lib libcrypto.lib crypt32.lib \
+          export NGX_ERROR_ABUSE_LIBS="$deps/lib/hiredis.lib \
+            $deps/lib/hiredis_ssl.lib $deps/lib/libssl.lib \
+            $deps/lib/libcrypto.lib crypt32.lib \
             advapi32.lib ws2_32.lib"
           ./configure \
             --crossbuild=win32 \
