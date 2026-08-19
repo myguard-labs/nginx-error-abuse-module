@@ -11,7 +11,9 @@
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/crypto.h>
+#if !(NGX_WIN32)
 #include <poll.h>
+#endif
 #if (NGX_THREADS)
 #include <ngx_thread_pool.h>
 #endif
@@ -131,6 +133,9 @@ struct ngx_http_error_abuse_zone_s {
 #if (NGX_THREADS)
     ngx_thread_task_t                *persist_task;   /* PERF-1 */
     unsigned                          persist_busy:1;
+#endif
+#if (NGX_WIN32)
+    ngx_http_error_abuse_win32_owner_t persist_owner;
 #endif
 };
 
@@ -312,6 +317,49 @@ static void ngx_http_error_abuse_redis_handshake_callback(
 
 static ngx_http_output_header_filter_pt ngx_http_error_abuse_next_header_filter;
 static ngx_http_error_abuse_redis_worker_t ngx_http_error_abuse_redis_worker;
+
+static ngx_inline ngx_int_t
+ngx_http_error_abuse_platform_socket_readable(ngx_socket_t fd, ngx_log_t *log)
+{
+#if (NGX_WIN32)
+    return ngx_http_error_abuse_win32_socket_readable(fd, log);
+#else
+    struct pollfd  pfd;
+
+    (void) log;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
+           ? NGX_OK : NGX_AGAIN;
+#endif
+}
+
+static ngx_inline ngx_int_t
+ngx_http_error_abuse_platform_owner_try(ngx_http_error_abuse_zone_t *zone,
+    ngx_log_t *log)
+{
+#if (NGX_WIN32)
+    return ngx_http_error_abuse_win32_owner_try(&zone->persist_owner,
+                                                 &zone->persist, log);
+#else
+    (void) zone;
+    (void) log;
+    return NGX_OK;
+#endif
+}
+
+static ngx_inline void
+ngx_http_error_abuse_platform_owner_release(
+    ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
+{
+#if (NGX_WIN32)
+    ngx_http_error_abuse_win32_owner_release(&zone->persist_owner, log);
+#else
+    (void) zone;
+    (void) log;
+#endif
+}
 
 static const char ngx_http_error_abuse_redis_record_script[] =
     "local t=redis.call('TIME') "
@@ -1571,6 +1619,7 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     key.len = 0;
     statuses.len = 0;
     persist.len = 0;
+    persist.data = NULL;
 
     zone = ngx_pcalloc(cf->pool, sizeof(ngx_http_error_abuse_zone_t));
     if (zone == NULL) {
@@ -2798,17 +2847,16 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
 #undef NGX_ERROR_ABUSE_REDIS_NUMBER
 }
 
-/* nginx epoll is edge-triggered only, and redisAsyncHandleRead does a single
- * recv() per call, so a single notification can leave replies buffered in the
- * socket with no further edge. Drain: keep handling while poll() still reports
- * the fd readable. The context may be freed mid-drain (a reply callback can
- * trigger disconnect), so re-check it each iteration — the cleanup callback
- * NULLs adapter.context synchronously before the context is freed. */
+/* nginx's event notification may be edge-triggered, and
+ * redisAsyncHandleRead does a single recv() per call, so a notification can
+ * leave replies buffered with no further edge. Drain while the platform says
+ * the socket is still readable. The context may be freed mid-drain (a reply
+ * callback can trigger disconnect), so re-check it each iteration — the
+ * cleanup callback NULLs adapter.context before the context is freed. */
 static void
 ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev)
 {
     ngx_connection_t                    *c;
-    struct pollfd                        pfd;
     ngx_http_error_abuse_redis_event_t  *ev;
 
     c = rev->data;
@@ -2821,10 +2869,9 @@ ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev)
             break;
         }
 
-        pfd.fd = c->fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) {
+        if (ngx_http_error_abuse_platform_socket_readable(c->fd, c->log)
+            != NGX_OK)
+        {
             break;
         }
     }
@@ -3303,17 +3350,27 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
         }
     }
 
+#if !(NGX_WIN32)
     if (ngx_process != NGX_PROCESS_SINGLE
         && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
     {
         return NGX_OK;
     }
+#endif
 
     zones = mcf->zones.elts;
     for (i = 0; i < mcf->zones.nelts; i++) {
         if (zones[i]->persist.len == 0) {
             continue;
         }
+
+#if (NGX_WIN32)
+        if (ngx_http_error_abuse_platform_owner_try(zones[i], cycle->log)
+            == NGX_ERROR)
+        {
+            continue;
+        }
+#endif
 
         ngx_memzero(&zones[i]->persist_event, sizeof(ngx_event_t));
         zones[i]->persist_event.handler =
@@ -3374,15 +3431,24 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
         return;
     }
 
+#if !(NGX_WIN32)
     if (ngx_process != NGX_PROCESS_SINGLE
         && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
     {
         return;
     }
+#endif
 
     zones = mcf->zones.elts;
     for (i = 0; i < mcf->zones.nelts; i++) {
         if (zones[i]->persist.len != 0) {
+#if (NGX_WIN32)
+            if (!zones[i]->persist_owner.owned) {
+                ngx_http_error_abuse_platform_owner_release(zones[i],
+                                                             cycle->log);
+                continue;
+            }
+#endif
             (void) ngx_http_error_abuse_save(zones[i], cycle->log);
             /* Release the reused serialize buffer (the thread pool has already
              * been drained by its own earlier exit handler, so no in-flight
@@ -3392,6 +3458,7 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
                 zones[i]->persist_buf = NULL;
                 zones[i]->persist_buf_cap = 0;
             }
+            ngx_http_error_abuse_platform_owner_release(zones[i], cycle->log);
         }
     }
 }
@@ -3422,9 +3489,18 @@ ngx_http_error_abuse_persist_complete(ngx_event_t *ev)
 static void
 ngx_http_error_abuse_persist_handler(ngx_event_t *ev)
 {
+    ngx_int_t                     owner_rc;
     ngx_http_error_abuse_zone_t  *zone;
 
     zone = ev->data;
+
+    owner_rc = ngx_http_error_abuse_platform_owner_try(zone, ev->log);
+    if (owner_rc != NGX_OK) {
+        if (owner_rc == NGX_DECLINED) {
+            ngx_add_timer(ev, zone->persist_interval);
+        }
+        return;
+    }
 
 #if (NGX_THREADS)
     {
@@ -3464,6 +3540,51 @@ ngx_http_error_abuse_persist_handler(ngx_event_t *ev)
     ngx_add_timer(ev, zone->persist_interval);
 }
 
+static ngx_inline ngx_uint_t
+ngx_http_error_abuse_platform_interrupted(ngx_err_t err)
+{
+#if (NGX_WIN32)
+    return ngx_http_error_abuse_win32_interrupted(err);
+#else
+    return err == NGX_EINTR;
+#endif
+}
+
+static ngx_inline ngx_fd_t
+ngx_http_error_abuse_platform_create_temp(u_char *path, ngx_log_t *log)
+{
+#if (NGX_WIN32)
+    return ngx_http_error_abuse_win32_create_temp(path, log);
+#else
+    (void) log;
+    return ngx_open_file(path, NGX_FILE_WRONLY,
+                         O_CREAT|O_EXCL|O_NOFOLLOW, NGX_FILE_OWNER_ACCESS);
+#endif
+}
+
+static ngx_inline ngx_int_t
+ngx_http_error_abuse_platform_flush_file(ngx_fd_t fd)
+{
+#if (NGX_WIN32)
+    return ngx_http_error_abuse_win32_flush_file(fd);
+#else
+    return fsync(fd) == 0 ? NGX_OK : NGX_ERROR;
+#endif
+}
+
+static ngx_inline ngx_int_t
+ngx_http_error_abuse_platform_replace(u_char *from, ngx_str_t *to,
+    ngx_log_t *log)
+{
+#if (NGX_WIN32)
+    return ngx_http_error_abuse_win32_replace(from, to, log);
+#else
+    (void) log;
+    return ngx_rename_file(from, to->data) == NGX_FILE_ERROR
+           ? NGX_ERROR : NGX_OK;
+#endif
+}
+
 static ngx_int_t
 ngx_http_error_abuse_write_all(ngx_fd_t fd, u_char *data, size_t len)
 {
@@ -3481,7 +3602,9 @@ ngx_http_error_abuse_write_all(ngx_fd_t fd, u_char *data, size_t len)
             continue;
         }
 
-        if (n == NGX_ERROR && ngx_errno == NGX_EINTR) {
+        if (n == NGX_ERROR
+            && ngx_http_error_abuse_platform_interrupted(ngx_errno))
+        {
             continue;
         }
 
@@ -3508,7 +3631,9 @@ ngx_http_error_abuse_read_all(ngx_fd_t fd, u_char *data, size_t len)
             continue;
         }
 
-        if (n == NGX_ERROR && ngx_errno == NGX_EINTR) {
+        if (n == NGX_ERROR
+            && ngx_http_error_abuse_platform_interrupted(ngx_errno))
+        {
             continue;
         }
 
@@ -3518,11 +3643,14 @@ ngx_http_error_abuse_read_all(ngx_fd_t fd, u_char *data, size_t len)
     return NGX_OK;
 }
 
-/* STAB-2: fsync the directory containing `path` so a rename into it survives a
- * crash. Best-effort: logs but does not fail the save on error. */
+/* STAB-2: sync the directory containing `path` where the platform supports it.
+ * Best-effort: logs but does not fail the save on error. */
 static void
-ngx_http_error_abuse_fsync_dir(u_char *path, ngx_log_t *log)
+ngx_http_error_abuse_platform_sync_parent(u_char *path, ngx_log_t *log)
 {
+#if (NGX_WIN32)
+    ngx_http_error_abuse_win32_sync_parent(path, log);
+#else
     u_char    *slash;
     ngx_fd_t   dfd;
     u_char     dir[NGX_MAX_PATH];
@@ -3551,6 +3679,7 @@ ngx_http_error_abuse_fsync_dir(u_char *path, ngx_log_t *log)
                       "fsync(\"%s\") failed", dir);
     }
     (void) close(dfd);
+#endif
 }
 
 /* PERF-1: serialize the whole zone into the zone-owned grow-only buffer while
@@ -3687,8 +3816,7 @@ ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
         ngx_sprintf(tmp, "%V.tmp.%P.%xL%Z", persist, ngx_pid,
                     (uint64_t) ngx_random() ^ ((uint64_t) ngx_random() << 24)
                     ^ ((uint64_t) i << 48));
-        fd = ngx_open_file(tmp, NGX_FILE_WRONLY,
-                           O_CREAT|O_EXCL|O_NOFOLLOW, NGX_FILE_OWNER_ACCESS);
+        fd = ngx_http_error_abuse_platform_create_temp(tmp, log);
         if (fd != NGX_INVALID_FILE || ngx_errno != NGX_EEXIST) {
             break;
         }
@@ -3715,7 +3843,7 @@ ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
     ngx_errno = EIO;
     if (1) {
 #else
-    if (fsync(fd) == -1) {
+    if (ngx_http_error_abuse_platform_flush_file(fd) != NGX_OK) {
 #endif
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       "fsync() \"%s\" failed", tmp);
@@ -3733,7 +3861,7 @@ ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
         return NGX_ERROR;
     }
 
-    if (ngx_rename_file(tmp, persist->data) == NGX_FILE_ERROR) {
+    if (ngx_http_error_abuse_platform_replace(tmp, persist, log) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       ngx_rename_file_n " \"%s\" to \"%V\" failed",
                       tmp, persist);
@@ -3743,7 +3871,7 @@ ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
     }
 
     /* STAB-2: fsync the parent directory so the rename itself is durable. */
-    ngx_http_error_abuse_fsync_dir(persist->data, log);
+    ngx_http_error_abuse_platform_sync_parent(persist->data, log);
 
     ngx_free(tmp);
     return NGX_OK;

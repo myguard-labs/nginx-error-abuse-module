@@ -1,0 +1,343 @@
+# sync-sha: 2923b542edf6e62baf2d6359043465df69fac2a408f71c65f972ed9428153129
+name: Windows
+
+on:
+  workflow_call: {}
+  workflow_dispatch: {}
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  msvc:
+    name: MSVC static module and runtime
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load version pins
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-Content .github/versions.env |
+            Where-Object { $_ -match '^(NGINX_VERSION|NGINX_VERSION_SHA256)=' } |
+            ForEach-Object { $_ >> $env:GITHUB_ENV }
+
+      - name: Fetch and verify nginx
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "nginx-$env:NGINX_VERSION.tar.gz"
+          Invoke-WebRequest -Uri "https://nginx.org/download/$archive" `
+            -OutFile $archive -ConnectionTimeoutSeconds 30 `
+            -OperationTimeoutSeconds 60
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:NGINX_VERSION_SHA256.ToLower()) {
+            throw "sha256 mismatch for ${archive}: got $actual"
+          }
+          tar -xzf $archive
+          if ($LASTEXITCODE -ne 0) { throw "tar failed with $LASTEXITCODE" }
+
+      - name: Cache static dependencies
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-hiredis-ssl-x64-windows-static-${{ runner.os }}-v1
+
+      - name: Install static hiredis and OpenSSL
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
+            'hiredis[ssl]:x64-windows-static'
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg failed with $LASTEXITCODE" }
+
+      - name: Save static dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-hiredis-ssl-x64-windows-static-${{ runner.os }}-v1
+
+      - name: Locate static dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
+          foreach ($file in 'include\hiredis\async.h', 'lib\hiredis.lib',
+                               'lib\hiredis_ssl.lib', 'lib\libssl.lib',
+                               'lib\libcrypto.lib') {
+            if (-not (Test-Path "$root\$file")) { throw "missing $root\$file" }
+          }
+          "DEPS_ROOT=$root" >> $env:GITHUB_ENV
+
+      - name: Load MSVC environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $root = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $root) { throw 'VC++ toolchain not found' }
+          $vcvars = "$root\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "missing $vcvars" }
+          $lines = & cmd.exe /d /s /c "`"$vcvars`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64.bat failed' }
+          foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH') {
+            $prefix = "$name="
+            $line = $lines | Where-Object {
+              $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+            if (-not $line) { throw "vcvars64.bat omitted $name" }
+            "$name=$($line.Substring($prefix.Length))" >> $env:GITHUB_ENV
+          }
+          "VCVARS=$vcvars" >> $env:GITHUB_ENV
+
+      - name: Configure
+        shell: bash
+        working-directory: nginx-${{ env.NGINX_VERSION }}
+        run: |
+          set -euo pipefail
+          module_dir=$(cygpath -w "$GITHUB_WORKSPACE")
+          module_dir=${module_dir//\\//}
+          deps=${DEPS_ROOT//\\//}
+          # Static hiredis imports the SDK's WSAPoll symbol. Rename nginx's
+          # private XP-compatibility function pointer to keep both link names
+          # distinct without raising nginx's forced _WIN32_WINNT floor.
+          sed -i '/extern ngx_wsapoll_pt.*WSAPoll;/i #define WSAPoll ngx_wsapoll' \
+            src/os/win32/ngx_socket.h
+          export NGX_ERROR_ABUSE_INCS="$deps/include"
+          export NGX_ERROR_ABUSE_LIBS="$deps/lib/hiredis.lib \
+            $deps/lib/hiredis_ssl.lib $deps/lib/libssl.lib \
+            $deps/lib/libcrypto.lib crypt32.lib \
+            advapi32.lib ws2_32.lib"
+          ./configure \
+            --crossbuild=win32 \
+            --with-cc=cl \
+            --prefix= \
+            --sbin-path=nginx.exe \
+            --conf-path=conf/nginx.conf \
+            --pid-path=logs/nginx.pid \
+            --error-log-path=logs/error.log \
+            --http-log-path=logs/access.log \
+            --without-http_rewrite_module \
+            --without-http_gzip_module \
+            --with-cc-opt="-DFD_SETSIZE=1024 -MT -WX /utf-8 \
+              /Zc:preprocessor" \
+            --add-module="$module_dir"
+
+      - name: Build
+        shell: cmd  # zizmor: ignore[misfeature]
+        working-directory: nginx-${{ env.NGINX_VERSION }}
+        run: |
+          call "%VCVARS%" || exit /b 1
+          nmake -f objs/Makefile || exit /b 1
+
+      - name: Verify module and configuration controls
+        shell: pwsh
+        working-directory: nginx-${{ env.NGINX_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path objs\nginx.exe)) { throw 'nginx.exe missing' }
+          if (-not (Test-Path objs\addon\src\ngx_http_error_abuse_win32.obj)) {
+            throw 'Win32 module object missing'
+          }
+          if ((Get-Content objs\ngx_modules.c -Raw) -notmatch
+              'ngx_http_error_abuse_module') { throw 'module table entry missing' }
+          New-Item -ItemType Directory -Force -Path conf, logs, temp, html | Out-Null
+          $snapshot = ((Resolve-Path temp).Path -replace '\\', '/') + '/abuse.state'
+          function Write-Config([string]$directive, [string]$location) {
+            @(
+              'worker_processes 2;',
+              'error_log logs/error.log notice;',
+              'events { worker_connections 64; }',
+              'http {',
+              "  $directive",
+              '  server {',
+              '    listen 127.0.0.1:18080;',
+              "    location / { $location }",
+              '  }',
+              '}'
+            ) | Set-Content -Encoding ascii conf/nginx.conf
+          }
+          function Test-Config {
+            $stdout = 'logs/config.stdout'
+            $stderr = 'logs/config.stderr'
+            $process = Start-Process -FilePath (Resolve-Path .\objs\nginx.exe) `
+              -ArgumentList '-p', '.', '-c', 'conf/nginx.conf', '-t' `
+              -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            Get-Content $stdout, $stderr | Write-Host
+            return $process.ExitCode
+          }
+          Write-Config '' 'root html;'
+          $exitCode = Test-Config
+          if ($exitCode -ne 0) {
+            throw "baseline configuration failed (exit $exitCode)"
+          }
+          $baseZone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
+                      'threshold=2 block=60s;'
+          Write-Config $baseZone 'error_abuse zone=abuse; root html;'
+          $exitCode = Test-Config
+          if ($exitCode -ne 0) {
+            throw "non-persistent zone failed (exit $exitCode)"
+          }
+          $zone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
+                  'threshold=2 block=60s ' +
+                  "persist=$snapshot persist_interval=200ms;"
+          Write-Config $zone 'error_abuse zone=abuse; root html;'
+          $exitCode = Test-Config
+          if ($exitCode -ne 0) {
+            throw "valid directive rejected (exit $exitCode)"
+          }
+          Write-Config 'error_abuse_NOT_A_DIRECTIVE on;' 'root html;'
+          $exitCode = Test-Config
+          if ($exitCode -eq 0) { throw 'bogus directive accepted' }
+          exit 0
+
+      - name: Test persistence and singleton ownership
+        shell: pwsh
+        working-directory: nginx-${{ env.NGINX_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $snapshot = ((Resolve-Path temp).Path -replace '\\', '/') + '/abuse.state'
+          $zone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
+                  'threshold=2 block=60s ' +
+                  "persist=$snapshot persist_interval=200ms;"
+          @(
+            'worker_processes 2;',
+            'error_log logs/error.log notice;',
+            'events { worker_connections 64; }',
+            'http {',
+            "  $zone",
+            '  server {',
+            '    listen 127.0.0.1:18080;',
+            '    location = /health { root html; }',
+            '    location / { error_abuse zone=abuse; root html; }',
+            '  }',
+            '}'
+          ) | Set-Content -Encoding ascii conf/nginx.conf
+          Set-Content -Encoding ascii -NoNewline html/health 'ok'
+
+          function Start-Nginx {
+            $p = Start-Process -FilePath (Resolve-Path .\objs\nginx.exe) `
+              -ArgumentList '-p', '.', '-c', 'conf/nginx.conf' `
+              -PassThru -NoNewWindow
+            foreach ($i in 1..60) {
+              try {
+                Invoke-WebRequest -Uri 'http://127.0.0.1:18080/health' `
+                  -SkipHttpErrorCheck -ConnectionTimeoutSeconds 2 `
+                  -OperationTimeoutSeconds 2 | Out-Null
+                return $p
+              } catch { Start-Sleep -Milliseconds 250 }
+            }
+            if (Test-Path logs/error.log) {
+              Get-Content logs/error.log | Write-Host
+            }
+            if ($p.HasExited) { Write-Host "nginx exited with $($p.ExitCode)" }
+            throw 'nginx did not become ready'
+          }
+          function Stop-Nginx([System.Diagnostics.Process]$p) {
+            & .\objs\nginx.exe -p . -c conf/nginx.conf -s stop
+            if ($LASTEXITCODE -ne 0) { throw 'nginx stop failed' }
+            if (-not $p.WaitForExit(15000)) { throw 'nginx did not stop' }
+          }
+          function Status {
+            return (Invoke-WebRequest -Uri 'http://127.0.0.1:18080/missing' `
+              -SkipHttpErrorCheck -ConnectionTimeoutSeconds 5 `
+              -OperationTimeoutSeconds 5).StatusCode
+          }
+
+          $proc = Start-Nginx
+          try {
+            if ((Status) -ne 404 -or (Status) -ne 404) {
+              throw 'requests before the threshold did not return 404'
+            }
+            foreach ($i in 1..40) {
+              if ((Test-Path $snapshot) -and (Get-Item $snapshot).Length -gt 24) {
+                break
+              }
+              Start-Sleep -Milliseconds 250
+            }
+            if (-not (Test-Path $snapshot)) { throw 'snapshot was not written' }
+            $owners = @(Select-String -Path logs/error.log -SimpleMatch `
+              'acquired persistence ownership').Count
+            if ($owners -ne 1) { throw "expected one persistence owner, got $owners" }
+          } finally { Stop-Nginx $proc }
+
+          Clear-Content logs/error.log
+          $proc = Start-Nginx
+          try {
+            if ((Status) -ne 429) { throw 'restart did not restore blocked state' }
+          } finally { Stop-Nginx $proc }
+
+  mingw:
+    name: MinGW-w64 static module
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load version pins
+        shell: pwsh
+        run: |
+          Get-Content .github/versions.env |
+            Where-Object { $_ -match '^(NGINX_VERSION|NGINX_VERSION_SHA256)=' } |
+            ForEach-Object { $_ >> $env:GITHUB_ENV }
+
+      - name: Install MSYS2 dependencies
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-hiredis
+            mingw-w64-x86_64-openssl
+
+      - name: Fetch, configure, and build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          archive="nginx-$NGINX_VERSION.tar.gz"
+          curl -fsSLo "$archive" "https://nginx.org/download/$archive"
+          printf '%s  %s\n' "$NGINX_VERSION_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive"
+          module_dir=$(cygpath -w "$GITHUB_WORKSPACE")
+          module_dir=${module_dir//\\//}
+          cd "nginx-$NGINX_VERSION"
+          export NGX_ERROR_ABUSE_INCS="$MINGW_PREFIX/include"
+          export NGX_ERROR_ABUSE_LIBS="-L$MINGW_PREFIX/lib -lhiredis \
+            -lhiredis_ssl -lssl -lcrypto -lcrypt32 -ladvapi32 -lws2_32"
+          ./configure \
+            --crossbuild=win32 \
+            --with-cc=gcc \
+            --prefix= \
+            --sbin-path=nginx.exe \
+            --conf-path=conf/nginx.conf \
+            --without-http_rewrite_module \
+            --without-http_gzip_module \
+            --with-cc-opt='-Werror' \
+            --add-module="$module_dir"
+          make -f objs/Makefile -j2
+          test -f objs/nginx.exe
+          test -f objs/addon/src/ngx_http_error_abuse_win32.o
+          grep -q ngx_http_error_abuse_module objs/ngx_modules.c

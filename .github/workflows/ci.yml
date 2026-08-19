@@ -1,4 +1,4 @@
-# sync-sha: e98ac3b66988d8619a8a1f421644c4e4aacbdb2a534fb384c72923b492979bb9
+# sync-sha: 4c19e129e019bec5f8bc1781e15c64e317ef21d64b57e61348bbb9463fb248af
 name: CI
 
 # Single entry point orchestrator (cp4a). This is the ONLY workflow carrying a
@@ -97,3 +97,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/lint.yml
+
+  windows:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows.yml

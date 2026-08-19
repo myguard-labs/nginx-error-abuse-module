@@ -67,7 +67,7 @@ class PolicyError(Exception):
 APPROVED_SELECTOR = "${{ fromJSON(vars.POOL || '[\"ubuntu-latest\"]') }}"
 SELF_HOSTED_ALLOWED = True
 
-HOSTED = re.compile(r"ubuntu-(?:latest|[0-9]+\.[0-9]+)")
+HOSTED = re.compile(r"(?:ubuntu-(?:latest|[0-9]+\.[0-9]+)|windows-(?:latest|[0-9]{4}))")
 
 # The runtime driver. A job that starts it is a "runtime-bearing" job and owes
 # the port-band declaration checked below.
