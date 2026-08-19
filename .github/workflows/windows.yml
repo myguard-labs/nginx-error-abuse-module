@@ -1,4 +1,4 @@
-# sync-sha: cd9fa328862133f1d469e4eb5444e30dfcaacdc72b23730ec98613e3090d7af8
+# sync-sha: fc643bfa6db6319858cf2d9a53e88900f05c61b58827fc670c11785f8f133b8d
 name: Windows
 
 on:
@@ -49,13 +49,26 @@ jobs:
           tar -xzf $archive
           if ($LASTEXITCODE -ne 0) { throw "tar failed with $LASTEXITCODE" }
 
+      - name: Cache static dependencies
+        id: vcpkg-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-hiredis-ssl-x64-windows-static-${{ runner.os }}-v1
+
       - name: Install static hiredis and OpenSSL
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
             'hiredis[ssl]:x64-windows-static'
           if ($LASTEXITCODE -ne 0) { throw "vcpkg failed with $LASTEXITCODE" }
+
+      - name: Locate static dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
           $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
           foreach ($file in 'include\hiredis\async.h', 'lib\hiredis.lib',
                                'lib\hiredis_ssl.lib', 'lib\libssl.lib',
@@ -73,7 +86,9 @@ jobs:
           module_dir=${module_dir//\\//}
           deps=${DEPS_ROOT//\\//}
           export NGX_ERROR_ABUSE_INCS="$deps/include"
-          export NGX_ERROR_ABUSE_LIBS="/LIBPATH:$deps/lib hiredis.lib hiredis_ssl.lib libssl.lib libcrypto.lib crypt32.lib advapi32.lib ws2_32.lib"
+          export NGX_ERROR_ABUSE_LIBS="/LIBPATH:$deps/lib hiredis.lib \
+            hiredis_ssl.lib libssl.lib libcrypto.lib crypt32.lib \
+            advapi32.lib ws2_32.lib"
           ./configure \
             --crossbuild=win32 \
             --with-cc=cl \
@@ -144,7 +159,9 @@ jobs:
               return $LASTEXITCODE
             } finally { $ErrorActionPreference = $old }
           }
-          $zone = "error_abuse_zone zone=abuse:1m interval=10s threshold=2 block=60s persist=$snapshot persist_interval=200ms;"
+          $zone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
+                  'threshold=2 block=60s ' +
+                  "persist=$snapshot persist_interval=200ms;"
           Write-Config $zone
           if ((Test-Config) -ne 0) { throw 'valid directive rejected' }
           Write-Config 'error_abuse_NOT_A_DIRECTIVE on;'
@@ -157,7 +174,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $snapshot = ((Resolve-Path temp).Path -replace '\\', '/') + '/abuse.state'
-          $zone = "error_abuse_zone zone=abuse:1m interval=10s threshold=2 block=60s persist=$snapshot persist_interval=200ms;"
+          $zone = 'error_abuse_zone zone=abuse:1m interval=10s ' +
+                  'threshold=2 block=60s ' +
+                  "persist=$snapshot persist_interval=200ms;"
           @(
             'worker_processes 2;',
             'error_log logs/error.log notice;',
@@ -260,7 +279,8 @@ jobs:
           module_dir=${module_dir//\\//}
           cd "nginx-$NGINX_VERSION"
           export NGX_ERROR_ABUSE_INCS="$MINGW_PREFIX/include"
-          export NGX_ERROR_ABUSE_LIBS="-L$MINGW_PREFIX/lib -lhiredis -lhiredis_ssl -lssl -lcrypto -lcrypt32 -ladvapi32 -lws2_32"
+          export NGX_ERROR_ABUSE_LIBS="-L$MINGW_PREFIX/lib -lhiredis \
+            -lhiredis_ssl -lssl -lcrypto -lcrypt32 -ladvapi32 -lws2_32"
           ./configure \
             --crossbuild=win32 \
             --with-cc=gcc \

@@ -1619,6 +1619,7 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     key.len = 0;
     statuses.len = 0;
     persist.len = 0;
+    persist.data = NULL;
 
     zone = ngx_pcalloc(cf->pool, sizeof(ngx_http_error_abuse_zone_t));
     if (zone == NULL) {
