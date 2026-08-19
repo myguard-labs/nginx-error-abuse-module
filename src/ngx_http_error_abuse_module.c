@@ -21,6 +21,11 @@
 #include "ngx_http_error_abuse_scan.h"
 #include "ngx_http_error_abuse_win32.h"
 #include "ngx_http_error_abuse_time.h"
+#include "ngx_http_error_abuse_probe_hooks.h"
+
+#ifdef NGX_TEST_HARNESS
+#include "ngx_test_probe.h"
+#endif
 
 /* SEC-3: the identity stored in shared memory, Redis and snapshots is a fixed
  * 32-byte SHA-256 digest of the configured key, regardless of how large the raw
@@ -95,6 +100,27 @@ typedef struct {
     ngx_rbtree_t       rbtree;
     ngx_rbtree_node_t  sentinel;
     ngx_queue_t        queue;
+#if (NGX_TEST_HARNESS)
+    /*
+     * Slab fault injection, CI only -- absent from a packaged build, so the
+     * production zone layout is unchanged.
+     *
+     * These live in SHARED memory rather than in a process global because the
+     * worker that arms the fault need not be the worker that trips it; a
+     * global would make the result depend on which worker answered the probe
+     * request. Tests pin worker_processes 1 (the harness requires it for the
+     * pid oracle), which would hide exactly that bug, so the storage decision
+     * cannot be left to the test configuration.
+     *
+     * nth < 0 means disarmed. `seen` counts create_node allocation attempts
+     * since arming; every attempt from the nth onwards is forced to fail --
+     * a threshold rather than a single shot, because create_node retries and
+     * a one-shot fault is absorbed by those retries. See the wrapper in
+     * ngx_http_error_abuse_slab_alloc_locked().
+     */
+    ngx_int_t          fault_slab_nth;
+    ngx_uint_t         fault_slab_seen;
+#endif
 } ngx_http_error_abuse_shctx_t;
 
 typedef struct {
@@ -167,6 +193,10 @@ typedef struct {
     ngx_uint_t                    log_level;
     ngx_flag_t                    dry_run;
     ngx_flag_t                    enabled;
+#ifdef NGX_TEST_HARNESS
+    /* zone the error_abuse_probe endpoint reports on */
+    ngx_shm_zone_t               *probe_zone;
+#endif
 } ngx_http_error_abuse_loc_conf_t;
 
 typedef enum {
@@ -264,6 +294,11 @@ static ngx_int_t ngx_http_error_abuse_header_filter(ngx_http_request_t *r);
 static ngx_http_error_abuse_req_ctx_t *ngx_http_error_abuse_prepare_ctx(
     ngx_http_request_t *r, ngx_http_error_abuse_loc_conf_t *conf);
 static ngx_int_t ngx_http_error_abuse_init(ngx_conf_t *cf);
+#ifdef NGX_TEST_HARNESS
+static char *ngx_http_error_abuse_probe(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_error_abuse_probe_handler(ngx_http_request_t *r);
+#endif
 static ngx_int_t ngx_http_error_abuse_init_process(ngx_cycle_t *cycle);
 static void ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle);
 static void *ngx_http_error_abuse_create_main_conf(ngx_conf_t *cf);
@@ -414,6 +449,20 @@ static ngx_command_t ngx_http_error_abuse_commands[] = {
         0,
         NULL
     },
+#ifdef NGX_TEST_HARNESS
+
+    /* CI-only introspection endpoint; absent from any build that does not
+     * define NGX_TEST_HARNESS, so a config using it fails to load there
+     * rather than silently exposing zone internals. */
+    { ngx_string("error_abuse_probe"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_error_abuse_probe,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+#endif
+
     ngx_null_command
 };
 
@@ -610,6 +659,49 @@ ngx_http_error_abuse_evict_one_unblocked(ngx_http_error_abuse_zone_t *zone,
     return 0;
 }
 
+/*
+ * Node allocation, with a CI-only failure injector in front of it.
+ *
+ * Every node allocation in create_node() -- the first attempt and both retries
+ * -- goes through here, so a fault armed at the Nth attempt can single out the
+ * bounded-expire retry (PERF-2) or the force-evict loop (SEC-1) rather than
+ * only the first call. Filling a real zone honestly would take thousands of
+ * distinct identities, which a loopback harness cannot produce.
+ *
+ * Without NGX_TEST_HARNESS this is a straight call to ngx_slab_alloc_locked()
+ * and compiles away to nothing. Caller holds the zone mutex.
+ */
+static void *
+ngx_http_error_abuse_slab_alloc_locked(ngx_http_error_abuse_zone_t *zone,
+    size_t size)
+{
+#if (NGX_TEST_HARNESS)
+    /*
+     * nth is a THRESHOLD, not a single shot: every attempt from the nth
+     * onwards fails while the fault stays armed.
+     *
+     * Failing exactly one attempt cannot reach the branch this injector exists
+     * for. create_node() retries after a bounded expire() and again after each
+     * force-evict, and those retries succeed against a slab that is not really
+     * full -- so a one-shot fault is absorbed by the ladder and the terminal
+     * NGX_ERROR never happens. Measured: fault_slab=0 produced slab_seen=2 and
+     * a successfully created node.
+     *
+     * Arming at 0 therefore drives the whole ladder to exhaustion (the
+     * zone-full path); arming at 1 or 2 lets the first attempts succeed and
+     * singles out a specific retry rung.
+     */
+    if (zone->sh->fault_slab_nth >= 0
+        && zone->sh->fault_slab_seen++ >= (ngx_uint_t) zone->sh->fault_slab_nth)
+    {
+        return NULL;
+    }
+#endif
+
+    return ngx_slab_alloc_locked(zone->shpool, size);
+}
+
+
 static ngx_http_error_abuse_node_t *
 ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
     uint32_t hash, ngx_str_t *key, time_t now)
@@ -632,13 +724,13 @@ ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
     key_len = key->len;
 
     size = ngx_http_error_abuse_node_size(key_len, zone->threshold);
-    ean = ngx_slab_alloc_locked(zone->shpool, size);
+    ean = ngx_http_error_abuse_slab_alloc_locked(zone, size);
 
     if (ean == NULL) {
         /* PERF-2: bound housekeeping eviction so a single request cannot scan
          * and delete the entire inactive tail while holding the zone mutex. */
         ngx_http_error_abuse_expire(zone, now, 64);
-        ean = ngx_slab_alloc_locked(zone->shpool, size);
+        ean = ngx_http_error_abuse_slab_alloc_locked(zone, size);
     }
 
     /* SEC-1: under sustained pressure expire frees nothing (every node is
@@ -647,7 +739,7 @@ ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
     while (ean == NULL
            && ngx_http_error_abuse_evict_one_unblocked(zone, now))
     {
-        ean = ngx_slab_alloc_locked(zone->shpool, size);
+        ean = ngx_http_error_abuse_slab_alloc_locked(zone, size);
     }
 
     if (ean == NULL) {
@@ -665,6 +757,123 @@ ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
 
     return ean;
 }
+
+#if (NGX_TEST_HARNESS)
+
+/*
+ * Probe accessors, CI only.
+ *
+ * ngx_http_error_abuse_probe_hooks.c renders the probe JSON and arms the
+ * injector, but it must not carry a copy of the zone or node layout. These two
+ * functions are the whole surface it needs, so the structs above stay private
+ * to this translation unit.
+ */
+
+/*
+ * Count tracked identities, and how many are currently blocked, under the zone
+ * mutex. Both figures come from ONE walk of the LRU queue so the probe cannot
+ * report a node as present in one number and missing from the other.
+ */
+ngx_uint_t
+ngx_http_error_abuse_probe_count_nodes(ngx_shm_zone_t *shm_zone,
+    ngx_uint_t *blocked)
+{
+    time_t                          now;
+    ngx_queue_t                    *q;
+    ngx_uint_t                      nodes;
+    ngx_http_error_abuse_zone_t    *zone;
+    ngx_http_error_abuse_node_t    *ean;
+
+    nodes = 0;
+    *blocked = 0;
+
+    zone = shm_zone->data;
+
+    if (zone == NULL || zone->sh == NULL || zone->shpool == NULL) {
+        return 0;
+    }
+
+    now = ngx_time();
+
+    ngx_shmtx_lock(&zone->shpool->mutex);
+
+    for (q = ngx_queue_head(&zone->sh->queue);
+         q != ngx_queue_sentinel(&zone->sh->queue);
+         q = ngx_queue_next(q))
+    {
+        ean = ngx_queue_data(q, ngx_http_error_abuse_node_t, queue);
+        nodes++;
+
+        /* An expired ban is not a ban: record() clears blocked_until the next
+         * time it sees the identity, so comparing against now here keeps the
+         * probe consistent with what the module would decide. */
+        if (ean->blocked_until > now) {
+            (*blocked)++;
+        }
+    }
+
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+
+    return nodes;
+}
+
+
+/*
+ * Report the injector state so a rule can assert that arming took effect and
+ * that a case which should have tripped the fault actually reached an
+ * allocation. Read under the mutex: both values are written together by
+ * arm_slab, and an unsynchronised pair could report an nth from after a
+ * re-arm alongside a seen from before it.
+ */
+void
+ngx_http_error_abuse_probe_fault_state(ngx_shm_zone_t *shm_zone,
+    ngx_int_t *nth, ngx_uint_t *seen)
+{
+    ngx_http_error_abuse_zone_t  *zone;
+
+    *nth = -1;
+    *seen = 0;
+
+    zone = shm_zone->data;
+
+    if (zone == NULL || zone->sh == NULL || zone->shpool == NULL) {
+        return;
+    }
+
+    ngx_shmtx_lock(&zone->shpool->mutex);
+    *nth = zone->sh->fault_slab_nth;
+    *seen = zone->sh->fault_slab_seen;
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+}
+
+
+/*
+ * Arm (nth >= 0) or disarm (nth < 0) the slab failure injector.
+ *
+ * Arming resets `seen`, so an armed nth counts from this request rather than
+ * from whatever traffic the zone saw before it.
+ */
+ngx_int_t
+ngx_http_error_abuse_probe_arm_slab(ngx_shm_zone_t *shm_zone, ngx_int_t nth)
+{
+    ngx_http_error_abuse_zone_t  *zone;
+
+    zone = shm_zone->data;
+
+    if (zone == NULL || zone->sh == NULL || zone->shpool == NULL) {
+        return NGX_DECLINED;
+    }
+
+    ngx_shmtx_lock(&zone->shpool->mutex);
+    zone->sh->fault_slab_nth = nth;
+    zone->sh->fault_slab_seen = 0;
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+
+    return NGX_OK;
+}
+
+#endif /* NGX_TEST_HARNESS */
+
 
 static void
 ngx_http_error_abuse_prune_events(ngx_http_error_abuse_zone_t *zone,
@@ -1463,6 +1672,14 @@ ngx_http_error_abuse_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ngx_rbtree_init(&zone->sh->rbtree, &zone->sh->sentinel,
                     ngx_http_error_abuse_rbtree_insert);
     ngx_queue_init(&zone->sh->queue);
+
+#if (NGX_TEST_HARNESS)
+    /* -1 = no fault armed. ngx_slab_alloc() does not zero, so this must be set
+     * explicitly; a zero here would arm the fault on the first allocation of
+     * every zone. */
+    zone->sh->fault_slab_nth = -1;
+    zone->sh->fault_slab_seen = 0;
+#endif
 
     len = sizeof(" in error_abuse zone \"\"") + zone->name.len;
     zone->shpool->log_ctx = ngx_slab_alloc(zone->shpool, len);
@@ -2434,6 +2651,129 @@ ngx_http_error_abuse_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
+#ifdef NGX_TEST_HARNESS
+
+/* ---- error_abuse_probe: CI-only introspection endpoint ----------------- */
+
+/*
+ * error_abuse_probe <zone>;
+ *
+ * Installs a content handler in this location that renders worker + shm state
+ * as JSON. The renderer itself lives in ci/t/harness (nginx-test-harness);
+ * this module supplies only the HTTP surface and, via
+ * ngx_http_error_abuse_probe_hooks.c, the module-specific zone semantics.
+ * Compiled out entirely unless NGX_TEST_HARNESS is defined.
+ *
+ * The zone is resolved with a size of 0, which is nginx's documented "attach
+ * to an already-declared zone" form. Declaring the zone remains
+ * error_abuse_zone's job -- a probe must observe state, never create it.
+ */
+static char *
+ngx_http_error_abuse_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_error_abuse_loc_conf_t  *elcf = conf;
+
+    ngx_str_t                 *value;
+    ngx_http_core_loc_conf_t  *clcf;
+
+    value = cf->args->elts;
+
+    if (elcf->probe_zone != NULL) {
+        return "is duplicate";
+    }
+
+    elcf->probe_zone = ngx_shared_memory_add(cf, &value[1], 0,
+                                             &ngx_http_error_abuse_module);
+    if (elcf->probe_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_error_abuse_probe_handler;
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_error_abuse_probe_handler(ngx_http_request_t *r)
+{
+    size_t                            size;
+    u_char                           *buf, *last;
+    ngx_int_t                         rc;
+    ngx_buf_t                        *b;
+    ngx_chain_t                       out;
+    ngx_http_error_abuse_loc_conf_t  *elcf;
+
+    if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    elcf = ngx_http_get_module_loc_conf(r, ngx_http_error_abuse_module);
+
+    /* Applied before rendering, so the response reports the state the caller
+     * just asked for rather than the state from before the request. */
+    (void) ngx_test_probe_arm(elcf->probe_zone, &r->args);
+
+    /*
+     * NGX_TEST_PROBE_JSON_MAX bounds the harness's GENERIC document only; the
+     * zone name and whatever the module hook appends are the caller's to add.
+     * NGX_HTTP_ERROR_ABUSE_PROBE_ZONE_MAX is the bound reserved for this
+     * module's hook output.
+     *
+     * Undersizing here does not overflow (rendering is ngx_slprintf-based and
+     * truncates at `last`), but a truncated document fails to parse in the
+     * prober, which surfaces as "broken probe" on every case rather than as a
+     * wrong answer on one.
+     */
+    size = NGX_TEST_PROBE_JSON_MAX + NGX_HTTP_ERROR_ABUSE_PROBE_ZONE_MAX;
+    if (elcf->probe_zone != NULL) {
+        size += elcf->probe_zone->shm.name.len;
+    }
+
+    buf = ngx_pnalloc(r->pool, size);
+    if (buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    last = ngx_test_probe_json(buf, buf + size, elcf->probe_zone);
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = last - buf;
+    ngx_str_set(&r->headers_out.content_type, "application/json");
+    r->headers_out.content_type_len = r->headers_out.content_type.len;
+    r->headers_out.content_type_lowcase = NULL;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    b = ngx_calloc_buf(r->pool);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->pos = buf;
+    b->last = last;
+    b->memory = 1;
+    b->last_buf = (r == r->main) ? 1 : 0;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
+}
+
+#endif /* NGX_TEST_HARNESS */
+
+
 static ngx_int_t
 ngx_http_error_abuse_init(ngx_conf_t *cf)
 {
@@ -2443,6 +2783,13 @@ ngx_http_error_abuse_init(ngx_conf_t *cf)
     ngx_http_error_abuse_main_conf_t *mcf;
     ngx_http_core_main_conf_t  *cmcf;
     ngx_http_variable_t        *var;
+
+#if (NGX_TEST_HARNESS)
+    /* Registering is what makes the probe report zone.nodes / zone.blocked and
+     * accept fault_slab=. A missed call degrades to "every module-specific
+     * assertion fails", not to a crash. */
+    ngx_http_error_abuse_probe_hooks_register();
+#endif
 
     mcf = ngx_http_conf_get_module_main_conf(
         cf, ngx_http_error_abuse_module);

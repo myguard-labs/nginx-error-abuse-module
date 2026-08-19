@@ -1,0 +1,71 @@
+# on_full=reject -- the fail-closed half of the F-3 zone-full branch.
+#
+# This is the payoff of the injector. Under on_full=allow a full zone loses
+# enforcement silently; on_full=reject exists so an operator can choose to fail
+# closed instead. The difference is observable ONLY when the zone is actually
+# full, which no amount of loopback traffic can produce, so before the injector
+# this branch had no test at all -- the parameter was configurable and unproven.
+#
+# Run against conf/prober-reject.conf, which differs from conf/prober.conf only
+# in the zone's on_full parameter. Separate run rather than a second zone:
+# the prober arms faults through a single probe URI per run, so a second
+# error_abuse_probe location would never receive the `fault` line.
+
+name    disarm any inherited slab fault
+send    GET /__probe?fault_slab=-1 HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.fault.slab_nth == -1
+
+# Baseline: a healthy allocator tracks the identity and the client sees the
+# upstream 502. Establishes that 502 is what "not rejected" looks like here, so
+# the 429 below is a real change and not the only status this location returns.
+name    a trackable identity passes through under on_full=reject
+from    127.0.0.21
+send    GET /counted HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=502
+probe   zone.nodes == 1
+
+# The branch that only fault injection can reach: a NEW identity that cannot be
+# allocated gets the location's configured rejection status (429) instead of
+# the upstream's 502. Same request, same location, same policy -- the only
+# variable is that the zone had no room.
+#
+# nth=0 is a threshold, so every allocation attempt fails and the retry ladder
+# is driven to exhaustion. A single-shot fault would be absorbed by the retries
+# and this case would see a 502.
+name    zone-full fails closed under on_full=reject
+from    127.0.0.22
+fault   fault_slab=0
+send    GET /counted HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=429
+probe   zone.fault.slab_seen >= 1
+
+# The rejection is a policy decision about an untrackable identity, not a side
+# effect of having recorded something: no node for it survives. The count is 0
+# rather than 1 because the force-evict loop (SEC-1) reclaimed the baseline
+# identity while the rejected request was trying to make room for itself.
+name    a rejected zone-full response records no node
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.nodes == 0
+
+name    disarm and confirm the allocator recovers
+send    GET /__probe?fault_slab=-1 HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.fault.slab_nth == -1
+
+# Negative control for the rejection case. The same address that was rejected
+# while the zone was full is tracked and passed through once it is not, which
+# proves the 429 came from the zone-full policy rather than from anything
+# intrinsic to that address or to the request.
+name    the same identity passes once the zone has room again
+from    127.0.0.22
+send    GET /counted HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=502
+probe   zone.nodes == 1
