@@ -1,4 +1,4 @@
-# sync-sha: 3e4da9d3d52bf6acbd48538108061f09ce5f8e465f88d82443eb5c42cc157025
+# sync-sha: 2923b542edf6e62baf2d6359043465df69fac2a408f71c65f972ed9428153129
 name: Windows
 
 on:
@@ -257,7 +257,7 @@ jobs:
             if (-not $p.WaitForExit(15000)) { throw 'nginx did not stop' }
           }
           function Status {
-            return (Invoke-WebRequest -Uri 'http://127.0.0.1:18080/' `
+            return (Invoke-WebRequest -Uri 'http://127.0.0.1:18080/missing' `
               -SkipHttpErrorCheck -ConnectionTimeoutSeconds 5 `
               -OperationTimeoutSeconds 5).StatusCode
           }
