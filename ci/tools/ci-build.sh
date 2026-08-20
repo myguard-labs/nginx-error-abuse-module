@@ -156,7 +156,16 @@ fi
 # The mode is in the tree path -- see the CACHING block above. Sharing one
 # tree across modes is what lets a cached debug objs/ silently disarm the
 # asan/coverage job, so every mode (not just coverage) gets its own dir.
+# TEST_HARNESS=1 gets its own suffix for the same reason: it is an ADDITIVE
+# flag on top of any mode (see the CC_OPT append below), not a mode of its
+# own, but the shared .github/actions/build-cache key is keyed on mode alone
+# -- without a distinct suffix a harness-enabled debug tree and a plain debug
+# tree would collide on the SAME cache key and tree path, and whichever job
+# ran last would silently overwrite the other's objects.
 DIR="${TARBALL_DIR}-${MODE}"
+if [ "${TEST_HARNESS:-0}" = "1" ]; then
+    DIR="${DIR}-harness"
+fi
 
 mkdir -p "$ROOT"
 
@@ -228,6 +237,18 @@ elif [ "$MODE" = "fault-redis-state" ]; then
     CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD=2 -DNGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION=2"
 elif [ "$MODE" = "fault-evict-scan-budget" ]; then
     CC_OPT="$CC_OPT -DNGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT=1"
+fi
+
+# TEST_HARNESS=1 compiles in the probe endpoint and the slab fault injector
+# (NGX_TEST_HARNESS, see src/ngx_http_error_abuse_probe_hooks.c) so
+# ci/t/prober/run.sh's error_abuse_probe directive exists in the built
+# binary. Additive across every mode above, not a mode of its own: the
+# prober needs to run against debug, coverage and asan trees alike, and each
+# already has its own tree path (see the CACHING block), so the flag folds
+# into whichever CC_OPT that mode picked rather than adding a fourth axis to
+# the mode enum.
+if [ "${TEST_HARNESS:-0}" = "1" ]; then
+    CC_OPT="$CC_OPT -DNGX_TEST_HARNESS=1"
 fi
 
 # --- ccache -------------------------------------------------------------

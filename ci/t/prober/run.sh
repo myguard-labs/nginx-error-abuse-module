@@ -6,6 +6,16 @@
 #     flavor : nginx (default) | angie
 #     version: source version; must match what ci/tools/ci-build.sh fetched
 #
+# PROBER_SCENARIO selects which conf/rules pair to run (default: allow, the
+# original conf/prober.conf + rules/*.rule, byte-compatible with every caller
+# that predates this variable):
+#   allow  -> conf/prober.conf      + rules/*.rule
+#   reject -> conf/prober-reject.conf + rules-reject/*.rule
+# These are separate runs, never one: the prober arms and reads state through
+# ONE probe URI per run (prober.c's opt_probe_uri), and on_full is a ZONE
+# parameter, so a single run cannot exercise both policies -- see
+# conf/prober-reject.conf's header.
+#
 # NGX_BUILD_MODE selects which per-mode build tree to use (default: debug), so
 # a mode switch never reuses another mode's object files; this is passed
 # through to the harness as PROBER_BUILD.
@@ -35,8 +45,23 @@ fi
 # passed as absolute paths out of this one.
 export PROBER_MODULE="ngx_http_error_abuse_module.so"
 export PROBER_DIRECTIVE="error_abuse_probe"
-export PROBER_CONF="$HERE/conf/prober.conf"
-export PROBER_RULES="$HERE/rules/*.rule"
+
+PROBER_SCENARIO="${PROBER_SCENARIO:-allow}"
+case "$PROBER_SCENARIO" in
+    allow)
+        export PROBER_CONF="$HERE/conf/prober.conf"
+        export PROBER_RULES="$HERE/rules/*.rule"
+        ;;
+    reject)
+        export PROBER_CONF="$HERE/conf/prober-reject.conf"
+        export PROBER_RULES="$HERE/rules-reject/*.rule"
+        ;;
+    *)
+        echo "Bail out! unknown PROBER_SCENARIO: $PROBER_SCENARIO" \
+            "(expected allow or reject)"
+        exit 1
+        ;;
+esac
 # SC2155: split declare from assign so a failed cd/pwd surfaces its exit status
 # instead of being masked by export's own success.
 PROBER_ROOT="$(cd ../../.. && pwd)"
