@@ -1,4 +1,4 @@
-# sync-sha: cbdfab4ea94f4d0fe7c2a73ab7a00e4e431955aed8151bbcbd802972a2f4faaf
+# sync-sha: 70345c8992b39d70de3be7c191a185c7f9eacc8412ec4138628679d43224a1e9
 name: Build and Test
 
 env:
@@ -219,6 +219,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The prober engine lives in ci/t/harness (nginx-module-testkit).
+          # Without this the prober steps below fail fast with "ci/t/harness
+          # is empty" instead of silently skipping -- see run.sh's own gate.
+          submodules: true
+
+      # Needed for the prober's own harness build below (TEST_HARNESS=1
+      # ci-build.sh call); the downloaded artifact does not need it.
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
 
       - name: Download nginx artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -229,7 +238,9 @@ jobs:
       - name: Install runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libhiredis-dev redis-server
+          sudo apt-get install -y \
+            build-essential curl libhiredis-dev libpcre2-dev redis-server \
+            zlib1g-dev
 
       - name: Sweep stale test listeners
         run: |
@@ -297,6 +308,49 @@ jobs:
             --redis-server /usr/bin/redis-server \
             --redis-state-controls
 
+      # The prober reaches paths ci/t/ and test_runtime.py structurally
+      # cannot: the slab-exhaustion branches in create_node (via armed
+      # allocation failure). Needs its own build -- the artifact downloaded
+      # above was built WITHOUT TEST_HARNESS=1, so error_abuse_probe does not
+      # exist in it. Its own tree (the -harness suffix in ci-build.sh) so
+      # this never collides with the plain debug tree cached under the same
+      # mode name.
+      - name: Build with the probe harness enabled
+        run: TEST_HARNESS=1 bash ci/tools/ci-build.sh nginx "$NGINX_VERSION"
+
+      - name: Build the prober
+        run: bash ci/t/harness/ci/prober/build.sh
+
+      # Own band, disjoint from every TEST_BASE_PORT band declared across
+      # every workflow (18880/18912/18944/18976/19008, all width 32) -- the
+      # next free band above that contiguous run.
+      - name: Verify prober port band is free
+        run: bash ci/tools/max-port.sh 19040 32
+
+      # Two SEPARATE runs, not one: on_full is a ZONE parameter and the
+      # prober arms/reads state through a single probe URI per run, so one
+      # run cannot exercise both on_full=allow and on_full=reject -- see
+      # ci/t/prober/conf/prober-reject.conf's header. Both steps reuse the
+      # same PROBER_PORT because they are sequential, never overlapping.
+      - name: Run prober rules (allow)
+        env:
+          PROBER_SCENARIO: allow
+          PROBER_BUILD: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}-debug-harness
+          # Own band (19040+), NOT this job's TEST_BASE_PORT band: the
+          # runtime driver above uses this job's whole 18880-18911 span
+          # internally (up to nginx_port+30 in some sub-scenarios in
+          # test_runtime.py), so borrowing an offset from it risks a
+          # same-job collision, not just a cross-job one.
+          PROBER_PORT: "19040"
+        run: bash ci/t/prober/run.sh nginx "$NGINX_VERSION"
+
+      - name: Run prober rules (reject)
+        env:
+          PROBER_SCENARIO: reject
+          PROBER_BUILD: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}-debug-harness
+          PROBER_PORT: "19040"
+        run: bash ci/t/prober/run.sh nginx "$NGINX_VERSION"
+
   coverage:
     name: Coverage report
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
@@ -312,6 +366,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The prober engine lives in ci/t/harness (nginx-module-testkit).
+          submodules: true
 
       - name: Load version pins
         run: bash .github/scripts/load-versions.sh
@@ -325,6 +381,12 @@ jobs:
           # libtest-nginx-perl is unavailable on ubuntu-24.04 runners.
           sudo cpanm --notest --quiet Test::Nginx
 
+      # Keyed on mode: coverage, which is the PLAIN (non-harness) tree --
+      # the "Generate coverage report" step below sets TEST_HARNESS=1, which
+      # builds into a separate "-harness" suffixed tree (see ci-build.sh), so
+      # this restores nothing for that tree and coverage.sh builds it fresh.
+      # Kept anyway: coverage.sh's own internal tooling (ci/tests/unit)
+      # still benefits from a warm ccache.
       - name: Restore coverage build cache
         uses: ./.github/actions/build-cache
         with:
@@ -334,9 +396,24 @@ jobs:
       - name: Verify coverage port band is free
         run: bash ci/tools/max-port.sh "$TEST_BASE_PORT" "$TEST_PORT_WIDTH"
 
+      # Own band for the prober step INSIDE coverage.sh below, disjoint from
+      # every TEST_BASE_PORT band declared across every workflow (18880,
+      # 18912, 18944, 18976, 19008, all width 32) and from the runtime job's
+      # own prober band (19040) so the two coverage/runtime jobs can run
+      # concurrently on a shared runner without colliding.
+      - name: Verify prober port band is free
+        run: bash ci/tools/max-port.sh 19072 32
+
       - name: Generate coverage report
         # No COVERAGE_FAIL_UNDER: this job publishes measured coverage, not a
         # gamed percentage gate. Build and runtime failures still fail it.
+        # TEST_HARNESS=1 makes coverage.sh build the probe-enabled tree and
+        # run both prober scenarios against it BEFORE gcovr runs, so the
+        # slab-exhaustion branches the prober alone reaches land in the SAME
+        # report as everything else, not a separate one -- see coverage.sh.
+        env:
+          TEST_HARNESS: "1"
+          PROBER_PORT: "19072"
         run: ci/tools/coverage.sh "$NGINX_VERSION"
 
       - name: Upload coverage report

@@ -78,7 +78,14 @@ command -v gcovr >/dev/null 2>&1 || {
 echo "==> Building nginx $VERSION with gcov instrumentation"
 bash ci/tools/ci-build.sh nginx "$VERSION" coverage
 
+# TEST_HARNESS=1 (see ci-build.sh) lands in a "-harness" suffixed tree of its
+# own, same as every other mode -- this mirrors that suffix so the prober
+# steps below (added by the caller when TEST_HARNESS=1) look in the tree that
+# was actually built, not the plain coverage tree next to it.
 BUILD="$ROOT/.build/nginx-${VERSION}-coverage"
+if [ "${TEST_HARNESS:-0}" = "1" ]; then
+    BUILD="${BUILD}-harness"
+fi
 OBJDIR="$BUILD/objs/addon/src"
 
 # The instrumented objects must actually exist before anything is run against
@@ -104,10 +111,19 @@ find "$OBJDIR" -name '*.gcda' -delete
 find "$ROOT/ci/tests/unit" -name '*.gcda' -delete
 
 echo "==> Unit tests (instrumented)"
-# NGINX_VERSION passed explicitly, with the -coverage suffix run.sh appends via
-# NGX_BUILD_SUFFIX, so the instrumented unit run links the SAME objects gcovr
-# will scan below -- not a stray debug tree of the same version.
-COVERAGE=1 NGINX_VERSION="$VERSION" NGX_BUILD_SUFFIX="-coverage" \
+# NGINX_VERSION passed explicitly, with the SAME suffix $BUILD above resolved
+# to, so the instrumented unit run links the objects gcovr will scan below --
+# not a stray tree of the same version. Hardcoding "-coverage" here used to
+# work because that was the only suffix this script ever built; TEST_HARNESS=1
+# now builds "-coverage-harness" instead, and a hardcoded "-coverage" then
+# pointed the unit stage at a tree ci-build.sh never created in this run --
+# CI-01, caught live: "no configured nginx tree at .../nginx-<ver>-coverage"
+# while .../nginx-<ver>-coverage-harness sat right next to it, fully built.
+UNIT_BUILD_SUFFIX="-coverage"
+if [ "${TEST_HARNESS:-0}" = "1" ]; then
+    UNIT_BUILD_SUFFIX="-coverage-harness"
+fi
+COVERAGE=1 NGINX_VERSION="$VERSION" NGX_BUILD_SUFFIX="$UNIT_BUILD_SUFFIX" \
     bash ci/tests/unit/run.sh
 
 echo "==> Runtime suite against the instrumented server"
@@ -133,6 +149,23 @@ TEST_NGINX_TIMEOUT="${TEST_NGINX_TIMEOUT:-20}" \
 TEST_NGINX_PORT="${TEST_BASE_PORT:-18890}" \
 TEST_NGINX_SERVROOT="$ROOT/ci/t/servroot" \
     prove ci/t/
+
+# The prober reaches paths none of the drivers above can: the slab-exhaustion
+# branches in create_node, only reachable via armed allocation failure. Only
+# when TEST_HARNESS=1 built this tree with the probe endpoint compiled in
+# (see ci-build.sh) -- unset, this whole block is a no-op and behavior is
+# byte-compatible with every caller that predates it. Runs against the SAME
+# instrumented $BUILD tree the suites above just exercised, so its .gcda
+# lands next to theirs and gcovr below reports the union, not a separate run.
+if [ "${TEST_HARNESS:-0}" = "1" ]; then
+    echo "==> Prober rules (instrumented, both scenarios)"
+    bash ci/t/harness/ci/prober/build.sh
+    for scenario in allow reject; do
+        PROBER_SCENARIO="$scenario" PROBER_BUILD="$BUILD" \
+            PROBER_PORT="${PROBER_PORT:-19072}" \
+            bash ci/t/prober/run.sh nginx "$VERSION"
+    done
+fi
 
 echo "==> Report"
 mkdir -p "$OUT"

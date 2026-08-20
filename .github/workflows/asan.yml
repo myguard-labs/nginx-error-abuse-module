@@ -1,4 +1,4 @@
-# sync-sha: c24c034a5033c178a6d596e69e30e3109f1bc9c5cac43d9fa671545a1cf692da
+# sync-sha: 1b9d620f6c98e5c5253b500f42dd886710a26fc02fa25b2db4b3d26e320add4b
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml
@@ -54,6 +54,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The prober engine lives in ci/t/harness (nginx-module-testkit).
+          # Without this the prober steps below fail fast with "ci/t/harness
+          # is empty" instead of silently skipping -- see run.sh's own gate.
+          submodules: true
 
       - name: Load version pins
         run: bash .github/scripts/load-versions.sh
@@ -109,6 +113,44 @@ jobs:
             --single-process \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}-asan/objs/nginx"
+
+      # The prober's own fault-injected paths (slab exhaustion) under ASan and
+      # UBSan too, not just the runtime suite above. Own tree: TEST_HARNESS=1
+      # lands in a "-harness" suffixed tree (see ci-build.sh) distinct from
+      # the plain asan tree the step above built and cached.
+      - name: Build with sanitizers and the probe harness enabled
+        run: TEST_HARNESS=1 bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
+
+      - name: Build the prober
+        run: bash ci/t/harness/ci/prober/build.sh
+
+      # Own band -- disjoint from every TEST_BASE_PORT band declared across
+      # every workflow (18880/18912/18944/18976/19008, width 32 each) and
+      # from build-test.yml's runtime (19040) and coverage (19072) prober
+      # bands, so all four prober-running jobs can run concurrently.
+      - name: Verify prober port band is free
+        run: bash ci/tools/max-port.sh 19104 32
+
+      # Two SEPARATE runs, not one -- see build-test.yml:runtime's identical
+      # comment; on_full is a ZONE parameter and the prober arms/reads state
+      # through one probe URI per run.
+      - name: Run prober rules under ASan and UBSan (allow)
+        env:
+          PROBER_SCENARIO: allow
+          PROBER_BUILD: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}-asan-harness
+          PROBER_PORT: "19104"
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: bash ci/t/prober/run.sh nginx "$NGINX_VERSION"
+
+      - name: Run prober rules under ASan and UBSan (reject)
+        env:
+          PROBER_SCENARIO: reject
+          PROBER_BUILD: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}-asan-harness
+          PROBER_PORT: "19104"
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: bash ci/t/prober/run.sh nginx "$NGINX_VERSION"
 
   asan-reload:
     name: ASan multi-worker + reload
