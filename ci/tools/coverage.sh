@@ -111,10 +111,19 @@ find "$OBJDIR" -name '*.gcda' -delete
 find "$ROOT/ci/tests/unit" -name '*.gcda' -delete
 
 echo "==> Unit tests (instrumented)"
-# NGINX_VERSION passed explicitly, with the -coverage suffix run.sh appends via
-# NGX_BUILD_SUFFIX, so the instrumented unit run links the SAME objects gcovr
-# will scan below -- not a stray debug tree of the same version.
-COVERAGE=1 NGINX_VERSION="$VERSION" NGX_BUILD_SUFFIX="-coverage" \
+# NGINX_VERSION passed explicitly, with the SAME suffix $BUILD above resolved
+# to, so the instrumented unit run links the objects gcovr will scan below --
+# not a stray tree of the same version. Hardcoding "-coverage" here used to
+# work because that was the only suffix this script ever built; TEST_HARNESS=1
+# now builds "-coverage-harness" instead, and a hardcoded "-coverage" then
+# pointed the unit stage at a tree ci-build.sh never created in this run --
+# CI-01, caught live: "no configured nginx tree at .../nginx-<ver>-coverage"
+# while .../nginx-<ver>-coverage-harness sat right next to it, fully built.
+UNIT_BUILD_SUFFIX="-coverage"
+if [ "${TEST_HARNESS:-0}" = "1" ]; then
+    UNIT_BUILD_SUFFIX="-coverage-harness"
+fi
+COVERAGE=1 NGINX_VERSION="$VERSION" NGX_BUILD_SUFFIX="$UNIT_BUILD_SUFFIX" \
     bash ci/tests/unit/run.sh
 
 echo "==> Runtime suite against the instrumented server"
