@@ -126,9 +126,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/../../.." && pwd)"
 SCAN_BIN="$DIR/test_scan"
 TIME_BIN="$DIR/test_time"
+STATS_BIN="$DIR/test_stats"
 
 if [ "${1:-}" = "clean" ]; then
-  rm -f "$SCAN_BIN" "$TIME_BIN" "$DIR"/*.o "$DIR"/*.gcda "$DIR"/*.gcno
+  rm -f "$SCAN_BIN" "$TIME_BIN" "$STATS_BIN" "$DIR"/*.o "$DIR"/*.gcda "$DIR"/*.gcno
   echo "unit test binaries removed"
   exit 0
 fi
@@ -214,6 +215,15 @@ $CC "${LINK_EXTRA[@]}" -o "$TIME_BIN" "$DIR/test_time.o"
 
 echo "==> Running"
 "$TIME_BIN"
+
+echo "==> Building $STATS_BIN with ${CC}"
+$CC "${OWN_CFLAGS[@]}" "${NGX_INCS[@]}" -I"$ROOT/src" -c "$DIR/test_stats.c" \
+  -o "$DIR/test_stats.o"
+$CC "${LINK_EXTRA[@]}" -o "$STATS_BIN" \
+  "$DIR/test_stats.o" "$DIR/ngx_stubs.o" "$DIR/ngx_string.o"
+
+echo "==> Running"
+"$STATS_BIN"
 
 deadline_add_re='([[:alnum:]_.>-]+|\([^)]*\))[[:space:]]*\+[[:space:]]*(zone->block|ctx->zone->block|zone->inactive|NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION)'
 if grep -nE "$deadline_add_re" "$ROOT/src/ngx_http_error_abuse_module.c"; then

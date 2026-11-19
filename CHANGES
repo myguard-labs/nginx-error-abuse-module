@@ -1,3 +1,17 @@
+Changes with ngx_http_error_abuse_module                         (unreleased)
+
+    *) Feature: the $error_abuse_matched variable is "1" for requests that
+       matched a zone's rule (counted, blocked, or observed in dry-run) and
+       empty otherwise, so "access_log ... if=$error_abuse_matched" logs
+       only matching requests. Default logging is unchanged (issue #86).
+
+    *) Feature: the "error_abuse_stats" and "error_abuse_stats_format"
+       directives expose per-zone counters (requests, matched responses,
+       blocks, dry-run would-blocks, bans, evictions, allocation failures)
+       and gauges (nodes, blocked clients, zone bytes) as JSON or
+       Prometheus/OpenMetrics text, with the same format negotiation as
+       nginx-http-shield-module's shield_ban_status.
+
 Changes with ngx_http_error_abuse_module            18 Aug 2026
 
     *) Change: completed the security, correctness, performance and format

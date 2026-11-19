@@ -219,6 +219,89 @@ Redis behind volatile DNS.
 - `$error_abuse_blocked_until` — Unix timestamp the ban ends, or `0`. Populated
   for both local and Redis bans (Redis stores the absolute deadline as the block
   value).
+- `$error_abuse_matched` — `1` when the request matched the zone's rule
+  (`$error_abuse_status` is `COUNTED`, `BLOCKED` or `DRY_RUN`), otherwise
+  empty. Use it with `access_log ... if=` to log only matching requests. That
+  is handy in a dry run, where a full access log is too large to review:
+
+  ```nginx
+  log_format error_abuse '$remote_addr [$time_local] "$request" $status '
+                         '$error_abuse_status count=$error_abuse_count';
+
+  location / {
+      error_abuse zone=client_errors dry_run=on;
+      # An access_log here replaces the inherited ones, so repeat your
+      # normal log next to the filtered one.
+      access_log /var/log/nginx/access.log main;
+      access_log /var/log/nginx/error-abuse.log error_abuse
+                 if=$error_abuse_matched;
+  }
+  ```
+
+  Requests that pass untouched (`PASSED`) or are not covered by a zone
+  (`BYPASSED`) are not written to the filtered log.
+  The "would block" decisions also appear in the error log at `log_level`.
+
+### `error_abuse_stats zone;` — context: `location`
+
+Turns the location into a read-only counters endpoint for a zone declared with
+`error_abuse_zone`. It uses the same format negotiation as
+nginx-http-shield-module's `shield_ban_status`. JSON is the default:
+
+```json
+{"zone":"client_errors","requests":1520,"matched":233,"blocked":41,
+ "would_block":0,"bans":3,"evictions":0,"alloc_failures":0,
+ "nodes":187,"blocked_clients":2,"used":69632,"size":10485760}
+```
+
+| JSON field        | Prometheus metric                          | Type    | Meaning |
+| ----------------- | ------------------------------------------ | ------- | ------- |
+| `requests`        | `error_abuse_requests_total`               | counter | Requests checked against the zone (once per request). |
+| `matched`         | `error_abuse_matched_responses_total`      | counter | Responses with a tracked status that were checked against the threshold (enforcing and dry-run). Responses from a client that is already banned are counted under `blocked` or `would_block` instead. |
+| `blocked`         | `error_abuse_blocked_total`                | counter | Requests the module rejected: active bans, local or Redis, and `on_full=reject`. |
+| `would_block`     | `error_abuse_dry_run_would_block_total`    | counter | Dry-run decisions that would have blocked: a request from a banned client, or a response that would reach the threshold. |
+| `bans`            | `error_abuse_bans_total`                   | counter | Bans armed by this instance's local tracker when a client reached the threshold. A ban armed only in Redis (from responses counted on other instances) is not included; it shows up under `blocked` when the client returns. |
+| `evictions`       | `error_abuse_zone_evictions_total`         | counter | Unblocked clients evicted to make room for a new one. |
+| `alloc_failures`  | `error_abuse_zone_alloc_failures_total`    | counter | Tracked responses not recorded because the zone was full. |
+| `nodes`           | `error_abuse_zone_nodes`                   | gauge   | Clients held in the zone, including expired entries not yet reclaimed. |
+| `blocked_clients` | `error_abuse_blocked_clients`              | gauge   | Clients with an unexpired ban. |
+| `used`            | `error_abuse_zone_used_bytes`              | gauge   | Zone bytes in use, including slab overhead. |
+| `size`            | `error_abuse_zone_size_bytes`              | gauge   | Zone size in bytes. |
+
+Every metric has a `zone` label. Client identities are never exported, so the
+series count does not grow with traffic. Counters live in the zone's shared
+memory and survive `nginx -s reload` when the zone size is unchanged. They are
+not written to the `persist=` snapshot, so they restart from zero when nginx
+restarts; Prometheus `rate()` and `increase()` handle that.
+
+### `error_abuse_stats_format json|prometheus;` — context: `http`, `server`, `location`
+
+Default output format for `error_abuse_stats`. The default is `json`. For one
+request, `?format=json` or `?format=prometheus` overrides it. Query names and
+values are case-sensitive and are not percent-decoded. An empty, unknown or
+repeated `format` argument, or a query string over 8192 bytes, returns `400`.
+Other arguments are ignored. Methods other than `GET` and `HEAD` return `405`.
+
+```nginx
+location = /error-abuse-metrics {
+    error_abuse_stats client_errors;
+    error_abuse_stats_format prometheus;
+    allow 127.0.0.1;
+    deny all;
+}
+```
+
+Metrics use Prometheus 0.0.4 (`text/plain; version=0.0.4; charset=utf-8`).
+OpenMetrics 1.0 (`application/openmetrics-text; version=1.0.0;
+charset=utf-8`, ending in `# EOF`) is used only when `Accept` names
+`application/openmetrics-text` with a positive `q` at least as high as
+`text/plain`. Wildcards never select OpenMetrics, and a malformed `Accept`
+falls back to 0.0.4. Responses carry `Vary: Accept`.
+
+> **Restrict this location.** The module applies no access control of its own.
+> Use `allow`/`deny`, `auth_basic` or a management-only listener. Each scrape
+> walks the zone under its lock, which takes O(clients) time, so scrape at a
+> normal interval (15 s or more), not continuously.
 
 ## About Redis (optional)
 

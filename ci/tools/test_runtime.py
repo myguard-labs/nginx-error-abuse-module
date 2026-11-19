@@ -723,6 +723,8 @@ http {{
 
     # Exercise the three exposed variables end-to-end at the log phase, where
     # the request ctx state is fully settled.
+    # Issue #86: logged only when $error_abuse_matched is non-empty.
+    log_format eamatched '$uri $error_abuse_status $error_abuse_matched';
     log_format eavars '$uri $error_abuse_status $error_abuse_count '
                       '$error_abuse_blocked_until';
 
@@ -740,6 +742,12 @@ http {{
                      statuses=404 interval=30s threshold=1 block=10s;
     error_abuse_zone zone=dry:1m key=$binary_remote_addr
                      statuses=404 interval=5s threshold=1 block=10s;
+    error_abuse_zone zone=statret:1m key=$binary_remote_addr
+                     statuses=404 interval=30s threshold=5 block=30s;
+    error_abuse_zone zone=statz:1m key=$binary_remote_addr
+                     statuses=404 interval=30s threshold=2 block=30s;
+    error_abuse_zone zone=statban:1m key=$binary_remote_addr
+                     statuses=404 interval=30s threshold=1 block=30s;
     error_abuse_zone zone=dryshared:1m key=$binary_remote_addr
                      statuses=404 interval=30s threshold=2 block=30s;
     error_abuse_zone zone=window:1m key=$binary_remote_addr
@@ -846,6 +854,64 @@ http {{
             access_log {root}/logs/vars.log eavars;
             root {root}/empty;
         }}
+        location = /stats-error {{
+            error_abuse zone=statz status=429;
+            access_log {root}/logs/matched.log eamatched
+                       if=$error_abuse_matched;
+            root {root}/empty;
+        }}
+        location = /stats-ok {{
+            error_abuse zone=statz status=429;
+            access_log {root}/logs/matched.log eamatched
+                       if=$error_abuse_matched;
+            empty_gif;
+        }}
+        location = /stats-dry {{
+            error_abuse zone=statz dry_run=on;
+            access_log {root}/logs/matched.log eamatched
+                       if=$error_abuse_matched;
+            root {root}/empty;
+        }}
+        location = /ea-stats {{
+            error_abuse_stats statz;
+        }}
+        location = /ea-stats-if {{
+            error_abuse_stats statz;
+            if ($arg_x) {{
+                set $ea_dummy 1;
+            }}
+        }}
+        location = /stats-return {{
+            error_abuse zone=statret status=429;
+            return 404;
+        }}
+        location = /stats-return-ok {{
+            error_abuse zone=statret status=429;
+            return 200;
+        }}
+        location = /ea-stats-ret {{
+            error_abuse_stats statret;
+        }}
+        location = /stats-ban-arm {{
+            error_abuse zone=statban status=429;
+            root {root}/empty;
+        }}
+        location = /stats-ban-return {{
+            error_abuse zone=statban status=429;
+            return 404;
+        }}
+        location = /stats-ban-dry {{
+            error_abuse zone=statban dry_run=on;
+            return 404;
+        }}
+        location = /ea-stats-ban {{
+            error_abuse_stats statban;
+        }}
+        location = /ea-stats-prom {{
+            error_abuse_stats statz;
+            error_abuse_stats_format prometheus;
+        }}
+
         location = /var-ok {{
             error_abuse zone=vars status=429;
             access_log {root}/logs/vars.log eavars;
@@ -2108,6 +2174,9 @@ http {{
             error_abuse zone=full status=503;
             empty_gif;
         }}
+        location = /stats {{
+            error_abuse_stats full;
+        }}
     }}
 }}
 """
@@ -2158,6 +2227,25 @@ def _on_full_start(
         _on_full_stop(proc)
         raise
     return proc
+
+
+def _zone_stats(port: int) -> dict[str, int]:
+    """Read the zone counters through the production error_abuse_stats path."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/stats", headers={"Connection": "close"}
+    )
+    with urllib.request.urlopen(req, timeout=5) as response:
+        return json.loads(response.read())
+
+
+def _assert_stats_delta(
+    before: dict[str, int], after: dict[str, int], **expected: int
+) -> None:
+    for key, delta in expected.items():
+        if after[key] - before[key] != delta:
+            raise AssertionError(
+                f"stats {key}: expected +{delta}, before={before} after={after}"
+            )
 
 
 def _on_full_stop(proc: subprocess.Popen[str]) -> None:
@@ -2264,7 +2352,17 @@ def test_mixed_eviction(
         # The new identity must be admitted by reclaiming the unblocked node.
         # It is then made active to prove this was a real allocation, not an
         # on_full=reject response that happened to look like a first error.
+        before = _zone_stats(nginx_port + 1)
         expect(nginx_port + 1, "/err?client=fresh", 404)
+        _assert_stats_delta(
+            before,
+            _zone_stats(nginx_port + 1),
+            evictions=1,
+            alloc_failures=0,
+            blocked=0,
+            matched=1,
+            nodes=0,
+        )
         expect(nginx_port + 1, "/ok?client=protected", 503)
         expect(nginx_port + 1, "/ok?client=reclaim", 200)
         expect(nginx_port + 1, "/err?client=fresh", 404)
@@ -2377,7 +2475,14 @@ def test_on_full_policy(
         _fill_zone(nginx_port + 10, "allow")
         # F-3 default: the zone is full, so the fresh identity's error
         # response passes through untracked -- same as historical behaviour.
+        before = _zone_stats(nginx_port + 10)
         expect(nginx_port + 10, "/err?client=fresh-allow", 404)
+        after = _zone_stats(nginx_port + 10)
+        _assert_stats_delta(
+            before, after, alloc_failures=1, blocked=0, evictions=0, nodes=0
+        )
+        if after["blocked_clients"] != after["nodes"]:
+            raise AssertionError(f"threshold=1 zone has unblocked nodes: {after}")
         # The 404 above is NOT by itself evidence of pass-through: at
         # threshold=1 a successfully TRACKED identity also gets 404 on its
         # first error (it is blocked only from the next request on). Ask for a
@@ -2397,7 +2502,15 @@ def test_on_full_policy(
         # F-3 opt-in: the zone is full, so the fresh identity's error
         # response is rejected with the location's configured status instead
         # of passing through untracked.
+        before = _zone_stats(nginx_port + 11)
         status, headers = fetch(nginx_port + 11, "/err?client=fresh-reject")
+        _assert_stats_delta(
+            before,
+            _zone_stats(nginx_port + 11),
+            alloc_failures=1,
+            blocked=1,
+            evictions=0,
+        )
         if status != 503:
             raise AssertionError(f"/err?client=fresh-reject expected 503, got {status}")
         cache_control = headers.get("cache-control", "")
@@ -3051,9 +3164,241 @@ def test_valid_configs(
     )
 
 
+def http_call(
+    port: int,
+    path: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    """Return (status, lower-cased headers, body) for any status code."""
+    hdrs = {"Connection": "close", "User-Agent": "error-abuse-ci/1.0"}
+    hdrs.update(headers or {})
+    data = b"x" if method == "POST" else None
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=data, headers=hdrs, method=method
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = response.read()
+            return (
+                response.status,
+                {k.lower(): v for k, v in response.headers.items()},
+                body,
+            )
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        return exc.code, {k.lower(): v for k, v in exc.headers.items()}, body
+
+
+STATS_EXPECTED = {
+    "requests": 7,
+    "matched": 4,
+    "blocked": 1,
+    "would_block": 2,
+    "bans": 1,
+    "evictions": 0,
+    "alloc_failures": 0,
+    "nodes": 1,
+    "blocked_clients": 1,
+}
+
+STATS_FAMILIES = {
+    "requests": ("error_abuse_requests", True),
+    "matched": ("error_abuse_matched_responses", True),
+    "blocked": ("error_abuse_blocked", True),
+    "would_block": ("error_abuse_dry_run_would_block", True),
+    "bans": ("error_abuse_bans", True),
+    "evictions": ("error_abuse_zone_evictions", True),
+    "alloc_failures": ("error_abuse_zone_alloc_failures", True),
+    "nodes": ("error_abuse_zone_nodes", False),
+    "blocked_clients": ("error_abuse_blocked_clients", False),
+}
+
+
+def _assert_prometheus(body: str, openmetrics: bool) -> None:
+    for key, (family, counter) in STATS_FAMILIES.items():
+        sample = f"{family}{'_total' if counter else ''}"
+        declared = family if (openmetrics or not counter) else sample
+        kind = "counter" if counter else "gauge"
+        if f"# TYPE {declared} {kind}\n" not in body:
+            raise AssertionError(f"missing TYPE {declared} {kind}:\n{body}")
+        line = f'{sample}{{zone="statz"}} {STATS_EXPECTED[key]}\n'
+        if line not in body:
+            raise AssertionError(f"missing sample {line!r}:\n{body}")
+    if openmetrics != body.endswith("# EOF\n"):
+        raise AssertionError(f"EOF marker mismatch (openmetrics={openmetrics})")
+
+
+def test_stats_and_matched(port: int, root: pathlib.Path) -> None:
+    """Issue #86 log filter + error_abuse_stats counters, one zone, threshold 2.
+
+    Every step names the counters it moves; STATS_EXPECTED is their sum.
+    """
+    status, _, body = http_call(port, "/ea-stats")
+    if status != 200 or json.loads(body)["requests"] != 0:
+        raise AssertionError(f"fresh zone stats not zero: {status} {body!r}")
+
+    expect(port, "/stats-ok", 200)  # requests 1, PASSED (not logged)
+    expect(port, "/stats-dry", 404)  # requests 2, matched 1 (peek 1/2)
+    expect(port, "/stats-error", 404)  # requests 3, matched 2, count 1
+    expect(port, "/stats-dry", 404)  # requests 4, matched 3, would_block 1
+    expect(port, "/stats-error", 404)  # requests 5, matched 4, bans 1
+    expect(port, "/stats-ok", 429)  # requests 6, blocked 1
+    expect(port, "/stats-dry", 404)  # requests 7, would_block 2 (preaccess)
+
+    status, headers, body = http_call(port, "/ea-stats")
+    if status != 200 or headers.get("content-type") != "application/json":
+        raise AssertionError(f"JSON stats: {status} {headers}")
+    if headers.get("vary") != "Accept":
+        raise AssertionError(f"JSON stats missing Vary: Accept: {headers}")
+    doc = json.loads(body)
+    if doc.get("zone") != "statz":
+        raise AssertionError(f"stats zone name: {doc}")
+    for key, value in STATS_EXPECTED.items():
+        if doc.get(key) != value:
+            raise AssertionError(f"stats {key}: expected {value}, got {doc}")
+    if not 0 < doc["used"] <= doc["size"]:
+        raise AssertionError(f"stats used/size inconsistent: {doc}")
+    if list(doc)[:3] != ["zone", "requests", "matched"]:
+        raise AssertionError(f"stats key order changed: {list(doc)}")
+
+    # Prometheus 0.0.4: by query override, and by directive default.
+    for path in ("/ea-stats?format=prometheus", "/ea-stats-prom"):
+        status, headers, body = http_call(port, path)
+        if (
+            status != 200
+            or headers.get("content-type") != "text/plain; version=0.0.4; charset=utf-8"
+        ):
+            raise AssertionError(f"{path}: {status} {headers}")
+        _assert_prometheus(body.decode(), openmetrics=False)
+
+    # OpenMetrics only when Accept explicitly prefers it.
+    status, headers, body = http_call(
+        port,
+        "/ea-stats-prom",
+        headers={"Accept": "application/openmetrics-text;version=1.0.0"},
+    )
+    if not headers.get("content-type", "").startswith(
+        "application/openmetrics-text; version=1.0.0"
+    ):
+        raise AssertionError(f"OpenMetrics not negotiated: {headers}")
+    _assert_prometheus(body.decode(), openmetrics=True)
+    for accept in (
+        "*/*",
+        "text/plain, application/openmetrics-text;q=0.5",
+        "application/openmetrics-text;q=2",
+    ):
+        _, headers, _ = http_call(port, "/ea-stats-prom", headers={"Accept": accept})
+        if not headers.get("content-type", "").startswith("text/plain"):
+            raise AssertionError(f"Accept {accept!r} chose {headers}")
+
+    # ?format=json overrides the prometheus directive default.
+    status, headers, body = http_call(port, "/ea-stats-prom?format=json")
+    if headers.get("content-type") != "application/json":
+        raise AssertionError(f"format=json override ignored: {headers}")
+
+    # Error controls: bad/empty/duplicate format -> 400; POST -> 405.
+    for query in ("format=xml", "format=", "format=json&format=json"):
+        status, _, _ = http_call(port, f"/ea-stats?{query}")
+        if status != 400:
+            raise AssertionError(f"?{query}: expected 400, got {status}")
+    status, _, _ = http_call(port, "/ea-stats", method="POST")
+    if status != 405:
+        raise AssertionError(f"POST stats: expected 405, got {status}")
+    status, headers, body = http_call(port, "/ea-stats", method="HEAD")
+    if status != 200 or body or int(headers.get("content-length", "0")) <= 0:
+        raise AssertionError(f"HEAD stats: {status} {headers} {body!r}")
+
+    # CodeRabbit major: an "if" inside the stats location keeps the handler
+    # and must still find the zone (it used to dereference NULL and crash).
+    status, _, body = http_call(port, "/ea-stats-if?x=1")
+    if status != 200 or json.loads(body)["zone"] != "statz":
+        raise AssertionError(f"stats inside if block: {status} {body!r}")
+
+    # A location finalized before preaccess (return 404;) is still counted as
+    # a request, once, alongside its matched response.
+    expect(port, "/stats-return", 404)
+    expect(port, "/stats-return-ok", 200)
+    _, _, body = http_call(port, "/ea-stats-ret")
+    ret = json.loads(body)
+    if ret["requests"] != 2 or ret["matched"] != 1:
+        raise AssertionError(f"return-404 request not counted once: {ret}")
+
+    # A tracked response from an already-banned client is not a threshold
+    # check: record()/peek() see the existing ban, so it must not count as
+    # matched. return 404; skips preaccess, so the ban is only seen there.
+    expect(port, "/stats-ban-arm", 404)  # matched 1, bans 1
+    expect(port, "/stats-ban-return", 404)  # existing ban: not matched
+    expect(port, "/stats-ban-dry", 404)  # existing ban: would_block only
+    _, _, body = http_call(port, "/ea-stats-ban")
+    ban = json.loads(body)
+    want = {"requests": 3, "matched": 1, "bans": 1, "blocked": 0, "would_block": 1}
+    if any(ban[k] != v for k, v in want.items()):
+        raise AssertionError(f"banned-client response counted as matched: {ban}")
+
+    # Scrapes are not requests of the zone: counters are unchanged.
+    _, _, body = http_call(port, "/ea-stats")
+    if json.loads(body)["requests"] != STATS_EXPECTED["requests"]:
+        raise AssertionError(f"stats scrape counted as a request: {body!r}")
+
+    # $error_abuse_matched: 6 matching requests logged, the PASSED one not.
+    matched_log = root / "logs" / "matched.log"
+    lines: list[list[str]] = []
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if matched_log.exists():
+            lines = [
+                ln.split()
+                for ln in matched_log.read_text(encoding="utf-8").splitlines()
+                if ln.strip()
+            ]
+            if len(lines) >= 6:
+                break
+        time.sleep(0.05)
+    if len(lines) != 6:
+        raise AssertionError(f"matched.log expected 6 lines, got {lines}")
+    if any(ln[2] != "1" or ln[1] == "PASSED" for ln in lines):
+        raise AssertionError(f"matched.log has an unmatched line: {lines}")
+    uris = sorted(ln[0] for ln in lines)
+    if uris != ["/stats-dry"] * 3 + ["/stats-error"] * 2 + ["/stats-ok"]:
+        raise AssertionError(f"matched.log URIs: {uris}")
+    blocked_ok = [ln for ln in lines if ln[0] == "/stats-ok"]
+    if blocked_ok[0][1] != "BLOCKED":
+        raise AssertionError(f"/stats-ok logged without BLOCKED: {blocked_ok}")
+
+
 def test_invalid_configs(
     binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
 ) -> None:
+    # error_abuse_stats attaches to a declared zone; it never creates one.
+    expect_invalid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "stats-undeclared-zone",
+        """    server { location = /s { error_abuse_stats nosuch; } }""",
+        "zero size shared memory zone",
+    )
+    expect_invalid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "stats-duplicate",
+        """    error_abuse_zone zone=s:1m key=$binary_remote_addr;
+    server { location = /s { error_abuse_stats s; error_abuse_stats s; } }""",
+        "is duplicate",
+    )
+    expect_invalid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "stats-bad-format",
+        """    error_abuse_stats_format xml;""",
+        "invalid value",
+    )
     # COR-8: a trailing comma in the status list is malformed, not ignored.
     expect_invalid_config(
         binary,
@@ -3424,6 +3769,8 @@ def main() -> int:
                 expect(args.port, "/dryshared-dry", 404)
             expect(args.port, "/dryshared-ok", 200)
             expect(args.port, "/dryshared-ok", 200)
+
+            test_stats_and_matched(args.port, nginx.root)
 
             expect(args.port, "/key-error?client=a", 404)
             expect(args.port, "/key-error?client=b", 404)
