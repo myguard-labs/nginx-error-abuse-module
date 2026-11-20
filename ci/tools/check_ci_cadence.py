@@ -152,6 +152,13 @@ def check(root):
         for name in sorted(required & actual):
             if not healthy_pr_condition(caller, name, children[name]):
                 errors.append(f"PR target cannot run on healthy PR: {caller}/{name}")
+    basic = [
+        step
+        for step in workflow("build-test.yml")["jobs"]["test-nginx"].get("steps", [])
+        if step.get("name") == "Run ci/t/basic.t"
+    ]
+    if len(basic) != 1 or basic[0].get("continue-on-error", False) is not False:
+        errors.append("required basic.t step can suppress failure")
     events = deep.get("on", deep.get(True, {}))
     if (
         not isinstance(events, dict)
@@ -222,13 +229,47 @@ def check(root):
             "env", {}
         ):
             errors.append("fuzz phase overrides selected duration")
-    if "FUZZ_SECS=3600" not in script(fuzz):
+    # This is a deliberately bounded shell contract, not a shell interpreter.
+    # Match the selector's final scheduled branch and its actual environment
+    # write; comments and literals elsewhere cannot satisfy the contract.
+    selectors = [
+        step
+        for step in fuzz.get("steps", [])
+        if step.get("name") == "Select fuzz duration"
+    ]
+    selection = (
+        "\n".join(
+            line.strip()
+            for line in str(selectors[0].get("run", "")).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if len(selectors) == 1
+        else ""
+    )
+    if not re.fullmatch(
+        r'set -euo pipefail\nif \[ "\$EVENT_NAME" = "workflow_dispatch" \]; then\n'
+        r'.*\nelse\nprintf \'FUZZ_SECS=3600\\n\' >> "\$GITHUB_ENV"\nfi',
+        selection,
+        re.DOTALL,
+    ) or not healthy_fuzz_step_condition(selectors[0]):
         errors.append("lost full fuzz duration")
-    for name in ("memcheck", "helgrind"):
-        if not re.search(
-            r'ci/tools/soak.sh\s+\\\s+"[^"\n]+" 600 4', script(jobs.get(name, {}))
-        ):
+    for name, variable in (("memcheck", "USE_VALGRIND"), ("helgrind", "USE_HELGRIND")):
+        soaks = [
+            step
+            for step in jobs.get(name, {}).get("steps", [])
+            if re.search(
+                r'ci/tools/soak.sh\s+\\\s+"[^"\n]+" 600 4', str(step.get("run", ""))
+            )
+        ]
+        if not soaks:
             errors.append(f"lost {name} full duration")
+        for step in soaks:
+            if step.get("env", {}).get(variable) != "1":
+                errors.append(f"lost {name} instrumentation")
+            if not healthy_fuzz_step_condition(step):
+                errors.append(f"{name} soak cannot run on healthy monthly run")
+    for event in event_names(pr) - {"pull_request", "workflow_dispatch"}:
+        errors.append(f"unexpected PR entry point: {event}")
     if "pull_request" not in event_names(pr):
         errors.append("lost PR entry point")
     elif not isinstance(pr.get("on"), dict) or pr["on"]["pull_request"] != {
@@ -241,7 +282,14 @@ def check(root):
 def main():
     try:
         errors = check(ROOT)
-    except (GraphError, OSError, KeyError, TypeError, yaml.YAMLError) as exc:
+    except (
+        GraphError,
+        OSError,
+        UnicodeError,
+        KeyError,
+        TypeError,
+        yaml.YAMLError,
+    ) as exc:
         print(f"CI cadence cannot be checked: {exc}", file=sys.stderr)
         return 2
     for error in errors:

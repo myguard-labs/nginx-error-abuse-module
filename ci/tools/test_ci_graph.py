@@ -161,12 +161,38 @@ class GraphTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.workflows = self.root / ".github/workflows"
         self.workflows.mkdir(parents=True)
 
     def write(self, name, body):
         (self.workflows / name).write_text(body)
+
+    def test_fixture_resolves_symlinked_tempdir_and_cleans_up(self):
+        link = self.root / "tmp-link"
+        link.symlink_to(self.root, target_is_directory=True)
+        fixture = GraphTests()
+        with mock.patch.object(tempfile, "tempdir", str(link)):
+            fixture.setUp()
+        try:
+            self.assertEqual(fixture.root, fixture.root.resolve())
+            fixture.test_loader_cannot_bypass_confinement_or_recursion()
+        finally:
+            fixture.doCleanups()
+        self.assertFalse(fixture.root.exists())
+
+    def test_loader_rejects_python_object_tags(self):
+        self.write("ci.yml", "!!python/object/apply:builtins.eval ['1 + 1']")
+        with self.assertRaisesRegex(GraphError, "cannot load") as caught:
+            graph(self.root)
+        self.assertIsInstance(caught.exception.__cause__, check_ci_graph.yaml.YAMLError)
+
+    def test_invalid_utf8_uses_load_error_path(self):
+        (self.workflows / "ci.yml").write_bytes(b"# \xff\n")
+        with self.assertRaisesRegex(GraphError, "cannot load"):
+            graph(self.root)
+        with mock.patch.object(check_ci_graph, "ROOT", self.root):
+            self.assertEqual(check_ci_graph.main(), 2)
 
     def test_real_graph(self):
         self.assertLessEqual(len(width(graph(Path(__file__).resolve().parents[2]))), 4)

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Positive, malformed, lost-gate and fifth-leaf cadence controls."""
 
+import os
 import runpy
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +20,7 @@ class WorkflowFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         shutil.copytree(
             policy.ROOT / ".github/workflows", self.root / ".github/workflows"
         )
@@ -34,6 +37,121 @@ class CadenceTests(WorkflowFixture):
         doc = policy.load(self.root, name)
         update(doc)
         (self.root / ".github/workflows" / name).write_text(yaml.safe_dump(doc))
+
+    def test_pr_target_event_rejected(self):
+        self.update_workflow(
+            "ci.yml", lambda doc: doc["on"].update(pull_request_target={})
+        )
+        self.assertIn(
+            "unexpected PR entry point: pull_request_target", policy.check(self.root)
+        )
+        self.update_workflow("ci.yml", lambda doc: doc["on"].pop("pull_request_target"))
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_basic_test_failure_must_propagate(self):
+        def update(doc, value):
+            next(
+                step
+                for step in doc["jobs"]["test-nginx"]["steps"]
+                if step.get("name") == "Run ci/t/basic.t"
+            )["continue-on-error"] = value
+
+        for value in (True, "${{ true }}", "false"):
+            with self.subTest(value=value):
+                self.update_workflow(
+                    "build-test.yml", lambda doc, value=value: update(doc, value)
+                )
+                self.assertIn(
+                    "required basic.t step can suppress failure",
+                    policy.check(self.root),
+                )
+        self.update_workflow("build-test.yml", lambda doc: update(doc, False))
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_scheduled_fuzz_export_ignores_stale_literal(self):
+        self.replace(
+            "ci-deep.yml",
+            "printf 'FUZZ_SECS=3600",
+            "# FUZZ_SECS=3600 retained comment\n            printf 'FUZZ_SECS=60",
+        )
+        self.assertIn("lost full fuzz duration", policy.check(self.root))
+
+    def test_scheduled_fuzz_export_requires_environment_destination(self):
+        self.replace(
+            "ci-deep.yml",
+            "printf 'FUZZ_SECS=3600\\n' >> \"$GITHUB_ENV\"",
+            "printf 'FUZZ_SECS=3600\\n'",
+        )
+        self.assertIn("lost full fuzz duration", policy.check(self.root))
+
+    def test_soak_modes_and_healthy_execution(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_text()
+        for name, variable in (
+            ("memcheck", "USE_VALGRIND"),
+            ("helgrind", "USE_HELGRIND"),
+        ):
+            for field, value, error in (
+                ("env", {}, f"lost {name} instrumentation"),
+                ("env", {variable: "0"}, f"lost {name} instrumentation"),
+                ("if", "failure()", f"{name} soak cannot run on healthy monthly run"),
+                ("if", False, f"{name} soak cannot run on healthy monthly run"),
+            ):
+                with self.subTest(name=name, field=field, value=value):
+                    self.update_workflow(
+                        "ci-deep.yml",
+                        lambda doc, name=name, field=field, value=value: next(
+                            step
+                            for step in doc["jobs"][name]["steps"]
+                            if "ci/tools/soak.sh" in step.get("run", "")
+                        ).update({field: value}),
+                    )
+                    self.assertIn(error, policy.check(self.root))
+                    path.write_text(original)
+        self.assertEqual(
+            policy.check(self.root), []
+        )  # failure-only notifications remain valid
+
+    def test_utf8_load_and_invalid_bytes(self):
+        path = self.root / ".github/workflows/ci.yml"
+        with mock.patch.object(
+            Path, "read_text", autospec=True, side_effect=Path.read_text
+        ) as read:
+            policy.load(self.root, "ci.yml")
+        read.assert_called_once_with(path, encoding="utf-8")
+        path.write_bytes(b"# \xff\n")
+        with mock.patch.object(policy, "ROOT", self.root):
+            self.assertEqual(policy.main(), 2)
+
+    def test_utf8_under_ascii_locale(self):
+        path = self.root / ".github/workflows/ci.yml"
+        path.write_bytes(path.read_bytes() + "\n# UTF-8 \u00e9\n".encode("utf-8"))
+        code = (
+            "import sys; from pathlib import Path; import check_ci_cadence as p; "
+            "p.ROOT=Path(sys.argv[1]); sys.exit(p.main())"
+        )
+        env = dict(os.environ, LC_ALL="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(self.root)],
+            cwd=Path(policy.__file__).parent,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fixture_resolves_symlinked_tempdir_and_cleans_up(self):
+        link = self.root / "tmp-link"
+        link.symlink_to(self.root, target_is_directory=True)
+        fixture = WorkflowFixture()
+        with mock.patch.object(tempfile, "tempdir", str(link)):
+            fixture.setUp()
+        try:
+            self.assertEqual(fixture.root, fixture.root.resolve())
+            self.assertEqual(policy.check(fixture.root), [])
+        finally:
+            fixture.doCleanups()
+        self.assertFalse(fixture.root.exists())
 
     def test_pr_entry_jobs_cannot_depend_on_failure_only_root(self):
         for caller in ("build-test", "lint"):
@@ -255,7 +373,10 @@ class CadenceTests(WorkflowFixture):
                     expected = (
                         ["PR trigger must target main without filters"]
                         if event == "pull_request"
-                        else ["lost PR entry point"]
+                        else [
+                            f"unexpected PR entry point: {event}",
+                            "lost PR entry point",
+                        ]
                     )
                     self.assertEqual(policy.check(self.root), expected)
 

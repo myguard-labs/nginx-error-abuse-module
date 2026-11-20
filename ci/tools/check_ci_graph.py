@@ -36,7 +36,7 @@ class WorkflowLoader(yaml.SafeLoader):
 
 def load_workflow(path):
     """Load workflow data safely while retaining every job and event name."""
-    return yaml.load(path.read_text(), Loader=WorkflowLoader)
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
 
 
 class GraphError(ValueError):
@@ -106,7 +106,7 @@ def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
                 else document_loader(path)
             )
             jobs = doc["jobs"]
-        except (OSError, yaml.YAMLError, KeyError, TypeError) as exc:
+        except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError) as exc:
             raise GraphError(f"cannot load {path}: {exc}") from exc
         if not isinstance(jobs, dict) or not jobs:
             raise GraphError("missing jobs")
