@@ -22,6 +22,7 @@
 #include "ngx_http_error_abuse_win32.h"
 #include "ngx_http_error_abuse_time.h"
 #include "ngx_http_error_abuse_probe_hooks.h"
+#include "ngx_http_error_abuse_stats.h"
 
 #ifdef NGX_TEST_HARNESS
 #include "ngx_test_probe.h"
@@ -100,6 +101,8 @@ typedef struct {
     ngx_rbtree_t       rbtree;
     ngx_rbtree_node_t  sentinel;
     ngx_queue_t        queue;
+    /* error_abuse_stats counters; updated only with the slab mutex held. */
+    ngx_http_error_abuse_stats_t  stats;
 #if (NGX_TEST_HARNESS)
     /*
      * Slab fault injection, CI only -- absent from a packaged build, so the
@@ -193,6 +196,8 @@ typedef struct {
     ngx_uint_t                    log_level;
     ngx_flag_t                    dry_run;
     ngx_flag_t                    enabled;
+    ngx_shm_zone_t               *stats_zone;     /* error_abuse_stats */
+    ngx_uint_t                    stats_format;
 #ifdef NGX_TEST_HARNESS
     /* zone the error_abuse_probe endpoint reports on */
     ngx_shm_zone_t               *probe_zone;
@@ -222,6 +227,12 @@ typedef struct {
     unsigned                      redis_pending:1;
     unsigned                      redis_checked:1;
     unsigned                      redis_blocked:1;
+    /* error_abuse_stats: the request, and separately its block decision,
+     * were counted once already. A preaccess re-run after an error_page
+     * redirect must not count the request again, but a block first found on
+     * that re-run (a ban armed meanwhile by another request) still counts. */
+    unsigned                      stats_counted:1;
+    unsigned                      stats_block_counted:1;
     /* F-2: set once, when prepare_ctx() restores this ctx from the
      * r->cleanup anchor after an error_page internal redirect zeroed
      * r->ctx. Never cleared -- every subsequent hop for this request must
@@ -330,6 +341,11 @@ static ngx_int_t ngx_http_error_abuse_variable_count(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_error_abuse_variable_blocked_until(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_error_abuse_variable_matched(
+    ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
+static char *ngx_http_error_abuse_stats(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_error_abuse_stats_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_error_abuse_redis_check(
     ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx);
 static void ngx_http_error_abuse_redis_record(
@@ -424,6 +440,12 @@ static ngx_conf_enum_t ngx_http_error_abuse_log_levels[] = {
     { ngx_null_string, 0 }
 };
 
+static ngx_conf_enum_t ngx_http_error_abuse_stats_formats[] = {
+    { ngx_string("json"), NGX_HTTP_ERROR_ABUSE_STATS_JSON },
+    { ngx_string("prometheus"), NGX_HTTP_ERROR_ABUSE_STATS_PROMETHEUS },
+    { ngx_null_string, 0 }
+};
+
 static ngx_command_t ngx_http_error_abuse_commands[] = {
     {
         ngx_string("error_abuse_zone"),
@@ -448,6 +470,22 @@ static ngx_command_t ngx_http_error_abuse_commands[] = {
         NGX_HTTP_MAIN_CONF_OFFSET,
         0,
         NULL
+    },
+    {
+        ngx_string("error_abuse_stats"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_http_error_abuse_stats,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL
+    },
+    {
+        ngx_string("error_abuse_stats_format"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_enum_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_error_abuse_loc_conf_t, stats_format),
+        &ngx_http_error_abuse_stats_formats
     },
 #ifdef NGX_TEST_HARNESS
 
@@ -513,6 +551,14 @@ static ngx_http_variable_t ngx_http_error_abuse_variables[] = {
         ngx_string("error_abuse_blocked_until"),
         NULL,
         ngx_http_error_abuse_variable_blocked_until,
+        0,
+        NGX_HTTP_VAR_NOCACHEABLE,
+        0
+    },
+    {
+        ngx_string("error_abuse_matched"),
+        NULL,
+        ngx_http_error_abuse_variable_matched,
         0,
         NGX_HTTP_VAR_NOCACHEABLE,
         0
@@ -646,6 +692,7 @@ ngx_http_error_abuse_evict_one_unblocked(ngx_http_error_abuse_zone_t *zone,
         ean = ngx_queue_data(q, ngx_http_error_abuse_node_t, queue);
         if (ean->blocked_until <= now) {
             ngx_http_error_abuse_delete(zone, ean);
+            zone->sh->stats.evictions++;
             return 1;
         }
 
@@ -914,7 +961,8 @@ ngx_http_error_abuse_find_touch_locked(ngx_http_error_abuse_zone_t *zone,
 
 static ngx_int_t
 ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
-    time_t now, ngx_uint_t *count, time_t *blocked_until)
+    time_t now, ngx_uint_t *count, time_t *blocked_until,
+    ngx_flag_t count_request)
 {
     uint32_t                        hash;
     ngx_uint_t                      index;
@@ -925,23 +973,37 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
 
     ngx_shmtx_lock(&zone->shpool->mutex);
 
+    zone->sh->stats.requests += count_request;
+
     ean = ngx_http_error_abuse_find_touch_locked(zone, hash, key, now);
     if (ean == NULL) {
         /* create_node sets last_seen and inserts at the LRU head itself. */
         ean = ngx_http_error_abuse_create_node(zone, hash, key, now);
         if (ean == NULL) {
+            /* F-3: on_full=reject turns this into a rejection; the caller
+             * acts on it, the counters are settled here under the lock. */
+            zone->sh->stats.matched++;
+            zone->sh->stats.alloc_failures++;
+            if (zone->on_full_reject) {
+                zone->sh->stats.blocked++;
+            }
             ngx_shmtx_unlock(&zone->shpool->mutex);
             return NGX_ERROR;
         }
     }
 
     if (ean->blocked_until > now) {
-        /* COR-4: a blocked client matched the threshold in this window. */
+        /* COR-4: a blocked client matched the threshold in this window.
+         * Not counted as matched: an existing ban is not a threshold check
+         * (a location finalized before preaccess, or a ban armed while this
+         * response was in flight). */
         *count = zone->threshold;
         *blocked_until = ean->blocked_until;
         ngx_shmtx_unlock(&zone->shpool->mutex);
         return NGX_BUSY;
     }
+
+    zone->sh->stats.matched++;
 
     if (ean->blocked_until != 0) {
         ean->blocked_until = 0;
@@ -960,6 +1022,7 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
             now, zone->block);
         ean->event_head = 0;
         ean->event_count = 0;
+        zone->sh->stats.bans++;
     }
 
     *count = (ean->blocked_until > now) ? zone->threshold
@@ -970,9 +1033,18 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
     return (*blocked_until > now) ? NGX_BUSY : NGX_OK;
 }
 
+/* stats flags, applied inside the zone lock the caller already takes:
+ * COUNT counts the request; BLOCK counts a block decision (under
+ * would_block instead of blocked when DRY_RUN is also set). A repeat check
+ * for the same request passes neither. */
+#define NGX_HTTP_ERROR_ABUSE_STATS_COUNT    0x01
+#define NGX_HTTP_ERROR_ABUSE_STATS_DRY_RUN  0x02
+#define NGX_HTTP_ERROR_ABUSE_STATS_BLOCK    0x04
+
 static ngx_int_t
 ngx_http_error_abuse_is_blocked(ngx_http_error_abuse_zone_t *zone,
-    ngx_str_t *key, time_t now, ngx_uint_t *count, time_t *blocked_until)
+    ngx_str_t *key, time_t now, ngx_uint_t *count, time_t *blocked_until,
+    ngx_uint_t stats)
 {
     uint32_t                        hash;
     ngx_http_error_abuse_node_t    *ean;
@@ -980,6 +1052,10 @@ ngx_http_error_abuse_is_blocked(ngx_http_error_abuse_zone_t *zone,
     hash = ngx_crc32_short(key->data, key->len);
 
     ngx_shmtx_lock(&zone->shpool->mutex);
+
+    if (stats & NGX_HTTP_ERROR_ABUSE_STATS_COUNT) {
+        zone->sh->stats.requests++;
+    }
 
     ean = ngx_http_error_abuse_find_touch_locked(zone, hash, key, now);
     if (ean == NULL) {
@@ -993,6 +1069,13 @@ ngx_http_error_abuse_is_blocked(ngx_http_error_abuse_zone_t *zone,
         /* COR-4: report a stable count for blocked clients. */
         *count = zone->threshold;
         *blocked_until = ean->blocked_until;
+        if (stats & NGX_HTTP_ERROR_ABUSE_STATS_BLOCK) {
+            if (stats & NGX_HTTP_ERROR_ABUSE_STATS_DRY_RUN) {
+                zone->sh->stats.would_block++;
+            } else {
+                zone->sh->stats.blocked++;
+            }
+        }
         ngx_shmtx_unlock(&zone->shpool->mutex);
         return NGX_OK;
     }
@@ -1012,13 +1095,14 @@ ngx_http_error_abuse_is_blocked(ngx_http_error_abuse_zone_t *zone,
 }
 
 /* COR-2: read-only observation for dry-run. Computes what a tracked response
- * WOULD do without mutating shared state: it never inserts an event, never sets
- * blocked_until and never touches Redis. The current response is counted
- * hypothetically (existing in-window events + 1). */
+ * WOULD do without mutating tracking state: it never inserts an event, never
+ * sets blocked_until and never touches Redis. The current response is counted
+ * hypothetically (existing in-window events + 1). Only the error_abuse_stats
+ * counters (matched, would_block) are bumped; they never feed a decision. */
 static void
 ngx_http_error_abuse_peek(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
     time_t now, ngx_uint_t *count, time_t *blocked_until,
-    ngx_uint_t *would_block)
+    ngx_uint_t *would_block, ngx_flag_t count_request)
 {
     uint32_t                        hash;
     ngx_uint_t                      i, valid;
@@ -1029,14 +1113,18 @@ ngx_http_error_abuse_peek(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
 
     ngx_shmtx_lock(&zone->shpool->mutex);
 
+    zone->sh->stats.requests += count_request;
+
     ean = ngx_http_error_abuse_lookup(zone, hash, key);
     if (ean == NULL) {
+        zone->sh->stats.matched++;
         *count = (zone->threshold <= 1) ? zone->threshold : 1;
         *blocked_until = (zone->threshold <= 1)
                          ? ngx_http_error_abuse_time_add_saturate(
                                now, zone->block)
                          : 0;
         *would_block = (zone->threshold <= 1);
+        zone->sh->stats.would_block += *would_block;
         ngx_shmtx_unlock(&zone->shpool->mutex);
         return;
     }
@@ -1045,9 +1133,12 @@ ngx_http_error_abuse_peek(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
         *count = zone->threshold;
         *blocked_until = ean->blocked_until;
         *would_block = 1;
+        zone->sh->stats.would_block++;
         ngx_shmtx_unlock(&zone->shpool->mutex);
         return;
     }
+
+    zone->sh->stats.matched++;
 
     cutoff = now - zone->interval;
     events = ngx_http_error_abuse_events(ean);
@@ -1064,6 +1155,7 @@ ngx_http_error_abuse_peek(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
                      ? ngx_http_error_abuse_time_add_saturate(now,
                                                               zone->block)
                      : 0;
+    zone->sh->stats.would_block += *would_block;
 
     ngx_shmtx_unlock(&zone->shpool->mutex);
 }
@@ -1186,10 +1278,40 @@ ngx_http_error_abuse_add_reject_headers(ngx_http_request_t *r,
     return NGX_OK;
 }
 
+/* error_abuse_stats: a request that finalized before preaccess (return 200;)
+ * and whose status the zone does not track still counts once as a request.
+ * Rare path: only locations that skip preaccess reach it. */
+static void
+ngx_http_error_abuse_stats_count_request(ngx_http_error_abuse_zone_t *zone)
+{
+    ngx_shmtx_lock(&zone->shpool->mutex);
+    zone->sh->stats.requests++;
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+}
+
+/* error_abuse_stats: a Redis-sourced block decision never reaches
+ * is_blocked(), so it is counted here under its own short lock. Rare path:
+ * only a client Redis already reports as blocked gets here. */
+static void
+ngx_http_error_abuse_stats_count_redis_block(ngx_http_error_abuse_zone_t *zone,
+    ngx_flag_t count_request, ngx_flag_t dry_run)
+{
+    ngx_shmtx_lock(&zone->shpool->mutex);
+    zone->sh->stats.requests += count_request;
+    if (dry_run) {
+        zone->sh->stats.would_block++;
+    } else {
+        zone->sh->stats.blocked++;
+    }
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+}
+
 static ngx_int_t
 ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
 {
     ngx_int_t                         rc;
+    ngx_uint_t                        stats;
+    ngx_flag_t                        dry_run;
     time_t                            now;
     ngx_http_error_abuse_req_ctx_t   *ctx;
     ngx_http_error_abuse_loc_conf_t  *conf;
@@ -1245,11 +1367,20 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
             return NGX_AGAIN;
         }
     }
+    dry_run = ngx_http_error_abuse_effective_dry_run(ctx, conf);
+
     if (ctx->redis_blocked) {
         /* COR-4: ctx->blocked_until was populated from the Redis deadline in
          * the check callback; count reflects a threshold match. */
         ctx->count = ctx->zone->threshold;
-        if (ngx_http_error_abuse_effective_dry_run(ctx, conf)) {
+        if (!ctx->stats_block_counted) {
+            ngx_http_error_abuse_stats_count_redis_block(ctx->zone,
+                                                         !ctx->stats_counted,
+                                                         dry_run);
+            ctx->stats_counted = 1;
+            ctx->stats_block_counted = 1;
+        }
+        if (dry_run) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
             ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
                                               "would block (Redis)");
@@ -1262,16 +1393,26 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
         return conf->reject_status;
     }
 
+    stats = dry_run ? NGX_HTTP_ERROR_ABUSE_STATS_DRY_RUN : 0;
+    if (!ctx->stats_counted) {
+        stats |= NGX_HTTP_ERROR_ABUSE_STATS_COUNT;
+    }
+    if (!ctx->stats_block_counted) {
+        stats |= NGX_HTTP_ERROR_ABUSE_STATS_BLOCK;
+    }
+
     now = ngx_time();
     rc = ngx_http_error_abuse_is_blocked(ctx->zone, &ctx->key, now,
                                          &ctx->count,
-                                         &ctx->blocked_until);
+                                         &ctx->blocked_until, stats);
+    ctx->stats_counted = 1;
     if (rc == NGX_OK) {
+        ctx->stats_block_counted = 1;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: client_sha256=\"%V\" in zone \"%V\" "
                        "currently blocked",
                        &ctx->log_key, &ctx->zone->name);
-        if (ngx_http_error_abuse_effective_dry_run(ctx, conf)) {
+        if (dry_run) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
             ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
                                               "would block (local)");
@@ -1358,6 +1499,10 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
     if (!ngx_http_error_abuse_status_matches(ctx->zone,
                                              r->headers_out.status))
     {
+        if (!ctx->stats_counted) {
+            ctx->stats_counted = 1;
+            ngx_http_error_abuse_stats_count_request(ctx->zone);
+        }
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: status %ui not tracked in zone \"%V\" "
                        "for client_sha256=\"%V\"",
@@ -1374,8 +1519,12 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
     if (ctx->dry_run) {
         ngx_uint_t  would_block;
 
+        /* A location that finalizes before preaccess (return 404;) reaches
+         * here uncounted; count the request with the response instead. */
         ngx_http_error_abuse_peek(ctx->zone, &ctx->key, now, &ctx->count,
-                                  &ctx->blocked_until, &would_block);
+                                  &ctx->blocked_until, &would_block,
+                                  !ctx->stats_counted);
+        ctx->stats_counted = 1;
         ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
         if (would_block) {
             ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
@@ -1393,7 +1542,9 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
     }
 
     rc = ngx_http_error_abuse_record(ctx->zone, &ctx->key, now,
-                                     &ctx->count, &ctx->blocked_until);
+                                     &ctx->count, &ctx->blocked_until,
+                                     !ctx->stats_counted);
+    ctx->stats_counted = 1;
     if (ctx->zone->redis) {
         ngx_http_error_abuse_redis_record(r, ctx);
     }
@@ -1669,6 +1820,8 @@ ngx_http_error_abuse_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     }
 
     zone->shpool->data = zone->sh;
+    /* ngx_slab_alloc() does not zero. */
+    ngx_memzero(&zone->sh->stats, sizeof(ngx_http_error_abuse_stats_t));
     ngx_rbtree_init(&zone->sh->rbtree, &zone->sh->sentinel,
                     ngx_http_error_abuse_rbtree_insert);
     ngx_queue_init(&zone->sh->queue);
@@ -2627,6 +2780,7 @@ ngx_http_error_abuse_create_loc_conf(ngx_conf_t *cf)
     conf->reject_status = NGX_CONF_UNSET_UINT;
     conf->log_level = NGX_CONF_UNSET_UINT;
     conf->dry_run = NGX_CONF_UNSET;
+    conf->stats_format = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -2643,6 +2797,13 @@ ngx_http_error_abuse_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->log_level, prev->log_level,
                               NGX_LOG_NOTICE);
     ngx_conf_merge_value(conf->dry_run, prev->dry_run, 0);
+    ngx_conf_merge_uint_value(conf->stats_format, prev->stats_format,
+                              NGX_HTTP_ERROR_ABUSE_STATS_JSON);
+    /* An "if" block inside the stats location keeps the content handler but
+     * gets its own loc conf; inherit the zone so the handler still has it. */
+    if (conf->stats_zone == NULL) {
+        conf->stats_zone = prev->stats_zone;
+    }
 
     if (conf->zone == NULL && conf->enabled) {
         conf->zone = prev->zone;
@@ -2772,6 +2933,315 @@ ngx_http_error_abuse_probe_handler(ngx_http_request_t *r)
 }
 
 #endif /* NGX_TEST_HARNESS */
+
+
+/* ---- error_abuse_stats: operator-facing counters endpoint -------------- */
+
+/*
+ * error_abuse_stats <zone>;
+ *
+ * Installs a content handler reporting the zone's counters as JSON (default)
+ * or Prometheus/OpenMetrics text; see error_abuse_stats_format. A PRODUCTION
+ * feature, unlike error_abuse_probe.
+ *
+ * Deliberately not self-protecting, matching shield_ban_status: the counters
+ * are operational detail, and restricting the location (allow/deny,
+ * auth_basic, a management listener) is the operator's job. A built-in
+ * half-measure would invite trusting it as access control.
+ *
+ * Size 0 is nginx's "attach to an already-declared zone" form: the zone must
+ * be declared by error_abuse_zone, or configuration fails with nginx's own
+ * zero-size-zone error. A same-named zone of another module fails on the tag.
+ */
+static char *
+ngx_http_error_abuse_stats(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_error_abuse_loc_conf_t  *elcf = conf;
+
+    ngx_str_t                 *value;
+    ngx_http_core_loc_conf_t  *clcf;
+
+    if (elcf->stats_zone != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    /* Both renderers emit the zone name in a UTF-8 body (JSON string,
+     * Prometheus label value), so refuse a name that is not valid UTF-8.
+     * Zones that are never exposed through stats keep any name. */
+    if (ngx_http_error_abuse_stats_valid_utf8(&value[1]) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "zone name \"%V\" is not valid UTF-8",
+                           &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    elcf->stats_zone = ngx_shared_memory_add(cf, &value[1], 0,
+                                             &ngx_http_error_abuse_module);
+    if (elcf->stats_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_error_abuse_stats_handler;
+
+    return NGX_CONF_OK;
+}
+
+
+/* Copy the counters and derive the gauges under ONE hold of the slab mutex,
+ * so every figure comes from one locked snapshot. blocked_clients uses nginx's
+ * cached time, like the enforcement paths, and is therefore approximate to the
+ * cache update cadence. nodes and blocked_clients need a walk of the LRU
+ * queue: O(nodes), the same cost as shield_ban_status, which the README tells
+ * operators to scrape at a sane interval. Rendering happens after unlock. */
+static ngx_int_t
+ngx_http_error_abuse_stats_snapshot(ngx_http_error_abuse_zone_t *zone,
+    ngx_http_error_abuse_stats_snapshot_t *snapshot)
+{
+    time_t                        now;
+    uint64_t                      size, nodes, blocked;
+    ngx_queue_t                  *q;
+    ngx_http_error_abuse_node_t  *ean;
+
+    nodes = 0;
+    blocked = 0;
+    now = ngx_time();
+
+    ngx_shmtx_lock(&zone->shpool->mutex);
+
+    snapshot->counters = zone->sh->stats;
+
+    size = (u_char *) zone->shpool->end - (u_char *) zone->shpool;
+    if (zone->shpool->pfree > size / ngx_pagesize) {
+        ngx_shmtx_unlock(&zone->shpool->mutex);
+        return NGX_ERROR;
+    }
+    snapshot->size = size;
+    snapshot->used = size - (uint64_t) zone->shpool->pfree * ngx_pagesize;
+
+    for (q = ngx_queue_head(&zone->sh->queue);
+         q != ngx_queue_sentinel(&zone->sh->queue);
+         q = ngx_queue_next(q))
+    {
+        ean = ngx_queue_data(q, ngx_http_error_abuse_node_t, queue);
+        nodes++;
+
+        /* An expired ban is not a ban: record() and is_blocked() clear it
+         * lazily, so compare against now like every decision path does. */
+        if (ean->blocked_until > now) {
+            blocked++;
+        }
+    }
+
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+
+    snapshot->nodes = nodes;
+    snapshot->blocked_clients = blocked;
+
+    return NGX_OK;
+}
+
+
+/* OpenMetrics only when Accept explicitly prefers it (ties go to OpenMetrics,
+ * wildcards never opt in); any malformed or over-budget Accept falls back to
+ * Prometheus 0.0.4. Repeated Accept fields share one budget. */
+static ngx_flag_t
+ngx_http_error_abuse_stats_openmetrics(ngx_http_request_t *r)
+{
+    size_t            bytes;
+    ngx_int_t         om_q, plain_q;
+    ngx_uint_t        i, items;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    om_q = 0;
+    plain_q = 0;
+    items = 0;
+    bytes = 0;
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len != sizeof("Accept") - 1
+            || ngx_strncasecmp(h[i].key.data, (u_char *) "Accept",
+                               sizeof("Accept") - 1) != 0)
+        {
+            continue;
+        }
+
+        if (h[i].value.len > NGX_HTTP_ERROR_ABUSE_NEGOTIATE_BYTES - bytes) {
+            return 0;
+        }
+        bytes += h[i].value.len;
+
+        if (ngx_http_error_abuse_accept(&h[i].value, &items, &om_q, &plain_q)
+            != NGX_OK)
+        {
+            return 0;
+        }
+    }
+
+    return om_q > 0 && om_q >= plain_q;
+}
+
+
+static ngx_int_t
+ngx_http_error_abuse_stats_handler(ngx_http_request_t *r)
+{
+    size_t                                  size;
+    u_char                                 *buf, *start, *last;
+    ngx_int_t                               rc;
+    ngx_buf_t                              *b;
+    ngx_uint_t                              format;
+    ngx_flag_t                              openmetrics;
+    ngx_chain_t                             out;
+    ngx_table_elt_t                        *vary, *allow;
+    ngx_http_error_abuse_zone_t            *zone;
+    ngx_http_error_abuse_loc_conf_t        *elcf;
+    ngx_http_error_abuse_stats_snapshot_t   snapshot;
+
+    if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+        /* RFC 9110 15.5.6: a 405 carries Allow. The special response keeps
+         * headers_out.headers, as ngx_http_dav_module relies on. */
+        allow = ngx_list_push(&r->headers_out.headers);
+        if (allow == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        allow->hash = 1;
+#if (nginx_version >= 1023000)
+        allow->next = NULL;
+#endif
+        ngx_str_set(&allow->key, "Allow");
+        ngx_str_set(&allow->value, "GET, HEAD");
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    elcf = ngx_http_get_module_loc_conf(r, ngx_http_error_abuse_module);
+
+    format = elcf->stats_format;
+    if (ngx_http_error_abuse_stats_query_format(&r->args, &format) != NGX_OK) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    /* Stock nginx initializes or reuses the zone in the master before workers
+     * serve requests; keep the pointer checks defensive anyway. */
+    if (elcf->stats_zone == NULL) {
+        return NGX_HTTP_SERVICE_UNAVAILABLE;
+    }
+
+    zone = elcf->stats_zone->data;
+    if (zone == NULL || zone->sh == NULL || zone->shpool == NULL) {
+        return NGX_HTTP_SERVICE_UNAVAILABLE;
+    }
+
+    if (ngx_http_error_abuse_stats_snapshot(zone, &snapshot) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (format == NGX_HTTP_ERROR_ABUSE_STATS_PROMETHEUS) {
+        openmetrics = ngx_http_error_abuse_stats_openmetrics(r);
+        size = ngx_http_error_abuse_stats_prometheus_size(&zone->name);
+
+    } else {
+        openmetrics = 0;
+        size = ngx_http_error_abuse_stats_json_size(&zone->name);
+    }
+
+    if (size == 0) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    buf = ngx_pnalloc(r->pool, size);
+    if (buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (format == NGX_HTTP_ERROR_ABUSE_STATS_PROMETHEUS) {
+        last = ngx_http_error_abuse_stats_prometheus(buf, buf + size,
+                                                     &zone->name, &snapshot,
+                                                     openmetrics, &start);
+        if (openmetrics) {
+            ngx_str_set(&r->headers_out.content_type,
+                        "application/openmetrics-text; version=1.0.0; "
+                        "charset=utf-8");
+        } else {
+            ngx_str_set(&r->headers_out.content_type,
+                        "text/plain; version=0.0.4; charset=utf-8");
+        }
+
+    } else {
+        start = buf;
+        last = ngx_http_error_abuse_stats_json(buf, buf + size, &zone->name,
+                                               &snapshot);
+        ngx_str_set(&r->headers_out.content_type, "application/json");
+    }
+
+    if (last == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* The representation depends on Accept whenever prometheus may be
+     * negotiated, so caches must key on it. */
+    vary = ngx_list_push(&r->headers_out.headers);
+    if (vary == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    vary->hash = 1;
+#if (nginx_version >= 1023000)
+    vary->next = NULL;
+#endif
+    ngx_str_set(&vary->key, "Vary");
+    ngx_str_set(&vary->value, "Accept");
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = last - start;
+    r->headers_out.content_type_len = r->headers_out.content_type.len;
+    r->headers_out.content_type_lowcase = NULL;
+
+    /* Allocate before sending the header: once a 200 with Content-Length
+     * is out, a 500 can no longer replace it. HEAD needs no body. */
+    b = NULL;
+    if (r->method != NGX_HTTP_HEAD) {
+        b = ngx_calloc_buf(r->pool);
+        if (b == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only || b == NULL) {
+        return rc;
+    }
+
+    b->pos = start;
+    b->last = last;
+    b->memory = 1;
+    b->last_buf = (r == r->main) ? 1 : 0;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
+}
 
 
 static ngx_int_t
@@ -4541,4 +5011,26 @@ ngx_http_error_abuse_variable_blocked_until(ngx_http_request_t *r,
 
     return ngx_http_error_abuse_set_variable(v, p,
         ngx_sprintf(p, "%T", ctx ? ctx->blocked_until : 0) - p);
+}
+
+/* Issue #86: "1" when this request matched the zone's rule -- its response
+ * status was counted, it was (or in dry-run would have been) blocked, or a
+ * dry-run location observed a tracked status. Empty otherwise, so
+ * `access_log ... if=$error_abuse_matched;` writes only matching requests. */
+static ngx_int_t
+ngx_http_error_abuse_variable_matched(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_error_abuse_req_ctx_t  *ctx;
+
+    ctx = ngx_http_error_abuse_get_req_ctx(r);
+    if (ctx != NULL
+        && (ctx->state == NGX_HTTP_ERROR_ABUSE_COUNTED
+            || ctx->state == NGX_HTTP_ERROR_ABUSE_BLOCKED
+            || ctx->state == NGX_HTTP_ERROR_ABUSE_DRY_RUN))
+    {
+        return ngx_http_error_abuse_set_variable(v, (u_char *) "1", 1);
+    }
+
+    return ngx_http_error_abuse_set_variable(v, (u_char *) "", 0);
 }

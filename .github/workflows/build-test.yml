@@ -1,4 +1,4 @@
-# sync-sha: 70345c8992b39d70de3be7c191a185c7f9eacc8412ec4138628679d43224a1e9
+# sync-sha: cd52b690cca8cd810090970039bd3c41deeac9f851bb41a162d55984fdaf036d
 name: Build and Test
 
 env:
@@ -116,7 +116,7 @@ jobs:
       # CACHING block and the action itself for why the build-tree layer is
       # exact-match only.
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: debug
           flavor: ${{ matrix.flavor }}
@@ -388,7 +388,7 @@ jobs:
       # Kept anyway: coverage.sh's own internal tooling (ci/tests/unit)
       # still benefits from a warm ccache.
       - name: Restore coverage build cache
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: coverage
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -464,7 +464,7 @@ jobs:
       # a PR run typically reuses the build job's warm tree on a persistent
       # self-hosted runner.
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}
