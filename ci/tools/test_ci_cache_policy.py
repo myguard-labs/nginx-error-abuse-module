@@ -107,6 +107,17 @@ class CachePolicy(unittest.TestCase):
             if "CC" in builder["env"]:
                 self.assertEqual(cache["env"]["CC"], builder["env"]["CC"])
 
+    def test_asan_artifact_retention_covers_retry_window(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/asan.yml").read_text())
+        upload = next(
+            s
+            for s in workflow["jobs"]["asan"]["steps"]
+            if s.get("id") == "asan-artifact"
+        )
+        retention = upload["with"]["retention-days"]
+        self.assertIs(type(retention), int)
+        self.assertGreaterEqual(retention, 31, "cover the 30-day rerun window")
+
     def test_same_run_plain_asan_producer_consumer(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/asan.yml").read_text())
         producer = workflow["jobs"]["asan"]
@@ -127,7 +138,8 @@ class CachePolicy(unittest.TestCase):
         self.assertEqual(
             download["with"]["artifact-ids"], "${{ needs.asan.outputs.artifact-id }}"
         )
-        self.assertNotIn("run-id", download["with"], "download must stay in this run")
+        for key in ("name", "pattern", "run-id"):
+            self.assertNotIn(key, download["with"], "download must use the same-run ID")
         verification = next(
             s
             for s in consumer["steps"]

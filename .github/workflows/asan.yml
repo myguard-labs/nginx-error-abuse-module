@@ -1,4 +1,4 @@
-# sync-sha: 98a317997d78bcf08af48196aff1b17652cec6c925b35d3fb25fd0ffb4006b9b
+# sync-sha: 9850088084a9abc9ad0b40be71086b13689ca5862349268ec3ef66e7be6a87f4
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml
@@ -100,7 +100,8 @@ jobs:
           name: asan-plain-${{ github.run_id }}-${{ github.run_attempt }}
           path: .build/asan-artifact/nginx
           if-no-files-found: error
-          retention-days: 1
+          # Reruns are available for 30 days; keep the artifact past that boundary.
+          retention-days: 31
 
       - name: Sweep stale test listeners
         run: |
