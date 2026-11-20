@@ -9,7 +9,10 @@ mkdir -p "$tmp/repo/ci/tools" "$tmp/repo/.github/scripts" "$tmp/repo/src" \
     "$tmp/bin" "$tmp/source/nginx-1.31.3"
 cp "$repo/ci/tools/"{ci-build,build-identity,ci-build-artifact}.sh "$tmp/repo/ci/tools/"
 cp "$repo/.github/scripts/fetch-verify.sh" "$tmp/repo/.github/scripts/"
-cp "$repo/.github/versions.env" "$tmp/repo/.github/"
+printf 'NGINX_MAINLINE=1.31.3\nNGINX_MAINLINE_SHA256=%s\nNGINX_STABLE=1.30.4\nNGINX_STABLE_SHA256=%s\nNGINX_VERSION=1.31.3\nNGINX_VERSION_SHA256=%s\n' \
+    "$(printf 'cache fixture pin' | sha256sum | cut -d' ' -f1)" \
+    "$(printf 'stable fixture pin' | sha256sum | cut -d' ' -f1)" \
+    "$(printf 'cache fixture pin' | sha256sum | cut -d' ' -f1)" > "$tmp/repo/.github/versions.env"
 : > "$tmp/repo/config"
 echo source-v1 > "$tmp/repo/src/module.c"
 cat > "$tmp/source/nginx-1.31.3/configure" <<'SH'
@@ -23,6 +26,7 @@ chmod +x "$tmp/source/nginx-1.31.3/configure"
 tar -czf "$tmp/source.tar.gz" -C "$tmp/source" nginx-1.31.3
 digest="$(sha256sum "$tmp/source.tar.gz" | cut -d' ' -f1)"
 sed -i -E "s/^(NGINX_MAINLINE_SHA256|NGINX_VERSION_SHA256)=.*/\1=$digest/" "$tmp/repo/.github/versions.env"
+cp "$tmp/repo/.github/versions.env" "$tmp/valid-versions.env"
 cat > "$tmp/bin/make" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -69,6 +73,15 @@ expect_failure() {
 identity() { CI_BUILD_IDENTITY_ONLY=1 bash ci/tools/ci-build.sh nginx 1.31.3 "${1:-asan}"; }
 import_artifact() { bash ci/tools/ci-build-artifact.sh import 1.31.3 "$tmp/artifact"; }
 changed() { [[ "$1" != "$2" ]] || fail "identity did not change: $3"; }
+
+sed -i -E 's/^(NGINX_MAINLINE_SHA256|NGINX_VERSION_SHA256)=.*/\1=malformed/' .github/versions.env
+if identity > "$tmp/pin-error" 2>&1; then fail 'malformed fixture pin unexpectedly succeeded'; fi
+grep -Fq 'invalid SHA-256 pin for nginx 1.31.3' "$tmp/pin-error" || {
+    cat "$tmp/pin-error" >&2
+    fail 'malformed fixture pin had the wrong diagnostic'
+}
+[[ ! -e .build && ! -e "$OPERATIONS" ]] || fail 'malformed fixture pin admitted build work'
+cp "$tmp/valid-versions.env" .github/versions.env
 
 # Hide only dpkg-query; all other host tools and fixture commands remain usable.
 mkdir "$tmp/no-dpkg"

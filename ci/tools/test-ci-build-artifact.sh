@@ -8,12 +8,28 @@ producer="$tmp/producer"
 consumer="$tmp/consumer workspace"
 mkdir -p "$producer/ci/tools" "$producer/.github" "$producer/src" "$tmp/consumer-tools"
 cp "$repo/ci/tools/"{ci-build,build-identity,ci-build-artifact}.sh "$producer/ci/tools/"
-cp "$repo/.github/versions.env" "$producer/.github/"
+printf 'NGINX_MAINLINE=1.31.3\nNGINX_MAINLINE_SHA256=%s\nNGINX_STABLE=1.30.4\nNGINX_STABLE_SHA256=%s\nNGINX_VERSION=1.31.3\nNGINX_VERSION_SHA256=%s\n' \
+    "$(printf 'artifact fixture pin' | sha256sum | cut -d' ' -f1)" \
+    "$(printf 'stable fixture pin' | sha256sum | cut -d' ' -f1)" \
+    "$(printf 'artifact fixture pin' | sha256sum | cut -d' ' -f1)" > "$producer/.github/versions.env"
+cp "$producer/.github/versions.env" "$tmp/valid-versions.env"
 printf 'module fixture\n' > "$producer/config"
 printf 'source fixture\n' > "$producer/src/module.c"
 export PATH=/usr/bin:/bin
 export BUILD_ROOT="$producer/.build" GITHUB_OUTPUT="$tmp/producer-outputs"
 cd "$producer"
+sed -i -E 's/^(NGINX_MAINLINE_SHA256|NGINX_VERSION_SHA256)=.*/\1=malformed/' .github/versions.env
+if CI_BUILD_IDENTITY_ONLY=1 bash ci/tools/ci-build.sh nginx 1.31.3 asan > "$tmp/pin-error" 2>&1; then
+    echo 'FAIL: malformed fixture pin unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -Fq 'invalid SHA-256 pin for nginx 1.31.3' "$tmp/pin-error" || {
+    cat "$tmp/pin-error" >&2
+    echo 'FAIL: malformed fixture pin had the wrong diagnostic' >&2
+    exit 1
+}
+[[ ! -e "$BUILD_ROOT/nginx-1.31.3-asan" ]] || { echo 'FAIL: malformed fixture pin created a build tree' >&2; exit 1; }
+cp "$tmp/valid-versions.env" .github/versions.env
 mkdir -p "$BUILD_ROOT/nginx-1.31.3-asan/objs"
 CI_BUILD_IDENTITY_ONLY=1 bash ci/tools/ci-build.sh nginx 1.31.3 asan \
     > "$BUILD_ROOT/nginx-1.31.3-asan/.build-identity"
