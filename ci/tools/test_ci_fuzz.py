@@ -277,6 +277,74 @@ class FuzzTests(unittest.TestCase):
             sum("-max_total_time=120" in call.args[0] for call in run.call_args_list), 3
         )
 
+    def test_regression_enumeration_errors_reject_before_campaigns(self):
+        directory = self.root / "regressions"
+        original = Path.iterdir
+
+        def denied(path):
+            if path == directory:
+                raise PermissionError("unreadable regression directory")
+            return original(path)
+
+        for caller in ("admission", "replay"):
+            with (
+                self.subTest(caller=caller),
+                mock.patch.object(Path, "iterdir", denied),
+                mock.patch.object(fuzz.subprocess, "run") as run,
+            ):
+                with self.assertRaisesRegex(PermissionError, "unreadable regression"):
+                    if caller == "admission":
+                        fuzz.check_budget(self.root, "120")
+                    else:
+                        with mock.patch.object(fuzz, "check_budget"):
+                            fuzz.run(self.root, "120")
+                run.assert_not_called()
+
+        shutil.rmtree(directory)
+        directory.touch()
+        for caller in ("admission", "replay"):
+            with (
+                self.subTest(caller=caller),
+                mock.patch.object(fuzz.subprocess, "run") as run,
+            ):
+                with self.assertRaises(NotADirectoryError):
+                    if caller == "admission":
+                        fuzz.check_budget(self.root, "120")
+                    else:
+                        with mock.patch.object(fuzz, "check_budget"):
+                            fuzz.run(self.root, "120")
+                run.assert_not_called()
+
+    def test_regression_missing_empty_and_fixture_count_and_replay(self):
+        directory = self.root / "regressions"
+        shutil.rmtree(directory)
+        for state in ("missing", "empty"):
+            if state == "empty":
+                directory.mkdir()
+            with (
+                self.subTest(state=state),
+                mock.patch.object(fuzz.subprocess, "run") as run,
+            ):
+                fuzz.check_budget(self.root, "5160")
+                fuzz.run(self.root, "120")
+                self.assertEqual(run.call_count, 3)
+
+        (directory / "snapshot-boundary.bin").touch()
+        (directory / "unknown.txt").touch()
+        with self.assertRaisesRegex(ValueError, "total job budget"):
+            fuzz.check_budget(self.root, "5160")
+        with mock.patch.object(fuzz.subprocess, "run") as run:
+            fuzz.run(self.root, "120")
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(
+            Path(run.call_args_list[0].args[0][1]).name, "snapshot-boundary.bin"
+        )
+        (directory / "unknown-boundary.bin").touch()
+        with mock.patch.object(fuzz.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "regression has no target"):
+                fuzz.run(self.root, "120")
+            run.assert_not_called()
+
     def test_regression_routing_uses_longest_registered_name(self):
         names = ("header", "header-list", "header-list-long")
         for name in names:

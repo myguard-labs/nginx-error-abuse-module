@@ -1,4 +1,4 @@
-# sync-sha: 9a23f7310e9771734d3948c65022d213fc32b6bf94f39183dc122627047dd677
+# sync-sha: 4dca3e3c6b1fa5b2748ed2fe9086e931b93bd6ddf8431cd09a294ba45b979d07
 name: Build cache
 description: Restore verified archives, compiler objects and exact trusted-main trees.
 
@@ -49,6 +49,8 @@ runs:
       run: |  # zizmor: ignore[github-env] -- CCACHE_DIR has a validated root and locally hashed leaf
         set -euo pipefail
         identity=$(CI_BUILD_CACHE_PREPARE_ONLY=1 bash ci/tools/ci-build.sh "$BUILD_FLAVOR" "$BUILD_VERSION" "$BUILD_MODE")
+        eligible=$(bash ci/tools/build-identity.sh --executable-cache-eligible)
+        echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
         scope=$(printf '%s\n' "$GITHUB_REPOSITORY" "$GITHUB_REF" | sha256sum | cut -d' ' -f1)
         echo "build=$identity" >> "$GITHUB_OUTPUT"
         echo "scope=$scope" >> "$GITHUB_OUTPUT"
@@ -107,6 +109,7 @@ runs:
     - name: Restore exact trusted-main executable tree
       id: executable
       if: >-
+        steps.identity.outputs.eligible == 'true' &&
         github.ref == 'refs/heads/main' &&
         (github.event_name == 'push' || github.event_name == 'schedule' ||
         github.event_name == 'workflow_dispatch')

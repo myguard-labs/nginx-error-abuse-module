@@ -161,6 +161,8 @@ def check(root):
     if jobs.get("codeql", {}).get("uses") != "./.github/workflows/codeql.yml":
         errors.append("lost monthly CodeQL")
     fuzz = jobs.get("fuzz", {})
+    if "continue-on-error" in fuzz and fuzz["continue-on-error"] is not False:
+        errors.append("fuzz job can suppress failure")
     if not healthy_fuzz_step_condition(fuzz):
         errors.append("fuzz job cannot run on healthy monthly run")
     commands = [step.get("run") for step in fuzz.get("steps", [])]
@@ -178,6 +180,12 @@ def check(root):
     ):
         errors.append("lost fuzz regression/discovery or shared build")
     for step in fuzz.get("steps", []):
+        if (
+            step.get("run") in required_fuzz
+            and "continue-on-error" in step
+            and step["continue-on-error"] is not False
+        ):
+            errors.append(f"fuzz step can suppress failure: {step['run']}")
         if step.get("run") in required_fuzz and not healthy_fuzz_step_condition(
             step, success_only=step.get("run") == discovery
         ):

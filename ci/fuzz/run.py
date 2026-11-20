@@ -22,6 +22,14 @@ TARGET_OVERHEAD_SECONDS = 120 + 2 * 60 + 600  # regression, exit grace, minimiza
 REPLAY_SECONDS = 60  # per fixture, replayed once in each pass
 
 
+def regression_fixtures(root):
+    try:
+        entries = list((root / "regressions").iterdir())
+    except FileNotFoundError:
+        return []
+    return sorted(entry for entry in entries if entry.match("*.bin"))
+
+
 def check_budget(root, seconds, runner_class="github-hosted"):
     duration(seconds)
     if runner_class not in RUNNER_BUDGETS:
@@ -31,7 +39,7 @@ def check_budget(root, seconds, runner_class="github-hosted"):
     count = len(list(root.glob("fuzz_*.c")))
     if not count:
         raise ValueError("no fuzz targets discovered")
-    replay_count = len(list((root / "regressions").glob("*.bin")))
+    replay_count = len(regression_fixtures(root))
     overhead = (
         JOB_OVERHEAD_SECONDS
         + count * TARGET_OVERHEAD_SECONDS
@@ -117,7 +125,7 @@ def run(root, seconds, merge=False, runner_class="github-hosted"):
     # prefix keeps overlapping, hyphenated target names unambiguous.
     names = sorted(selected, key=len, reverse=True)
     regressions = []
-    for fixture in sorted((root / "regressions").glob("*.bin")):
+    for fixture in regression_fixtures(root):
         if not fixture.is_file():
             raise ValueError(f"regression is not a file: {fixture.name}")
         name = next(

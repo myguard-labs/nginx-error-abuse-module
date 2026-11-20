@@ -114,6 +114,58 @@ class CadenceTests(WorkflowFixture):
             "lost fuzz regression/discovery or shared build", policy.check(self.root)
         )
 
+    def test_required_fuzz_failure_suppression(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_text()
+        for target in (
+            "job",
+            "--check-budget",
+            "ci/fuzz/build.sh",
+            "run.py 120",
+            "--merge",
+        ):
+            for value in (
+                "absent",
+                False,
+                True,
+                "${{ inputs.allow_failure }}",
+                "false",
+                0,
+                [],
+                None,
+            ):
+                with self.subTest(target=target, value=value):
+                    doc = yaml.safe_load(original)
+                    job = doc["jobs"]["fuzz"]
+                    obj = (
+                        job
+                        if target == "job"
+                        else next(
+                            step
+                            for step in job["steps"]
+                            if target in step.get("run", "")
+                        )
+                    )
+                    if value != "absent":
+                        obj["continue-on-error"] = value
+                    path.write_text(yaml.safe_dump(doc))
+                    errors = policy.check(self.root)
+                    if value == "absent" or value is False:
+                        self.assertEqual(errors, [])
+                    else:
+                        self.assertTrue(
+                            any("can suppress failure" in e for e in errors)
+                        )
+
+    def test_optional_fuzz_step_may_suppress_failure(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        doc = yaml.safe_load(path.read_text())
+        doc["jobs"]["fuzz"]["steps"].append(
+            {"run": "echo optional", "continue-on-error": True}
+        )
+        path.write_text(yaml.safe_dump(doc))
+        self.assertEqual(policy.check(self.root), [])
+
     def test_missing_runner_class_is_rejected_for_every_fuzz_phase(self):
         path = self.root / ".github/workflows/ci-deep.yml"
         original = path.read_text()

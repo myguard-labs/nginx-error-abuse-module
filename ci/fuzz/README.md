@@ -125,7 +125,8 @@ registered target name followed by `-` selects the replay binary, so
 suffixes fail before any replay or campaign; missing targets/corpora also fail
 visibly. Existing `snapshot-<suffix>.bin` names remain valid.
 
-The deep job has a separate **600-minute total admission budget**. Before building,
+The deep job has a total admission budget of **360 minutes on GitHub-hosted
+runners** and **600 minutes on self-hosted runners**. Before building,
 `python3 ci/fuzz/run.py "$FUZZ_SECS" --check-budget` counts all `fuzz_*.c`
 sources and regression fixtures, without needing binaries. Every normal runner
 invocation repeats the check before starting any replay or campaign. The requested
@@ -136,9 +137,11 @@ Admission reserves 3600 seconds for setup, build, uploads and runner overhead;
 for each target it includes the requested discovery duration, the default
 120-second regression campaign, 60 seconds of exit grace for each campaign, and
 600 seconds for minimization. Each fixture reserves 60 seconds in each of the
-two replay passes. Thus the current two targets and two fixtures accept the
-3600-second default and at most 15240 seconds per target; adding a target or
-fixture reduces that maximum automatically. The same conservative deep-job
-allowance applies to standalone invocations, including those without `--merge`.
-These are admission allowances, not measured execution guarantees: the workflow's
-600-minute timeout remains the hard deadline if a phase overruns its reserve.
+two replay passes. Thus, with the current two targets and two fixtures,
+GitHub-hosted runners accept the 3600-second default and at most 8040 seconds per
+target. Self-hosted runners accept the same default and at most 15240 seconds per
+target. Adding a target or fixture reduces each maximum automatically. The
+matching admission allowance applies to standalone invocations, including those
+without `--merge`. These are admission allowances, not measured execution
+guarantees: the workflow's 600-minute timeout remains an independent hard upper
+bound if a phase overruns its reserve.

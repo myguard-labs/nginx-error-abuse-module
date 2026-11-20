@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
+import test_ci_executable_cache
 import test_windows_snapshot
 import yaml
 
@@ -57,10 +58,11 @@ class CachePolicy(unittest.TestCase):
         self.assertIn("CI_BUILD_CACHE_PREPARE_ONLY=1", prepare["run"])
         self.assertEqual(
             restore["if"],
+            "steps.identity.outputs.eligible == 'true' && "
             "github.ref == 'refs/heads/main' && "
             "(github.event_name == 'push' || github.event_name == 'schedule' || "
             "github.event_name == 'workflow_dispatch')",
-            "executable restore/save requires the explicit trusted event/ref allowlist",
+            "executable restore/save requires eligibility and the trusted event/ref allowlist",
         )
         self.assertTrue(restore["uses"].startswith("actions/cache@"))
         self.assertNotIn(
@@ -199,6 +201,9 @@ class CompilerCachePreparation(unittest.TestCase):
             '[[ "$3" == "$BUILD_MODE" ]]\n'
             'printf "tree=fixture-executable-tree\\n" >> "$GITHUB_OUTPUT"\n'
             'printf "%s\\n" "${FIXTURE_IDENTITY:-expected-build-identity}"\n'
+        )
+        (tools / "build-identity.sh").write_text(
+            (ROOT / "ci/tools/build-identity.sh").read_text()
         )
         self.runner = self.root / "runner temp"
         self.runner.mkdir()
@@ -340,6 +345,7 @@ class CompilerCachePreparation(unittest.TestCase):
 
 def load_tests(loader, tests, _pattern):
     tests.addTests(loader.loadTestsFromModule(test_windows_snapshot))
+    tests.addTests(loader.loadTestsFromModule(test_ci_executable_cache))
     return tests
 
 
