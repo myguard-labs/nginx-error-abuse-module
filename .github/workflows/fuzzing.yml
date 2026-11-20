@@ -1,4 +1,4 @@
-# sync-sha: b37fa5b67fa9d81a6342f24a0e87e1f6ec970f23d465c76fcc9f62ce2d18078d
+# sync-sha: e146062db1bc0ce2f57f38fd2ed58728cd431e5d544fb77b0f8bf48a5a67398e
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 120s/target on the status-list
@@ -50,7 +50,7 @@ jobs:
 
       # cp7a: mostly the tarball + configure-skip stamp for mode=module.
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}

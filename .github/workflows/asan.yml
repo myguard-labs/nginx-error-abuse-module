@@ -1,4 +1,4 @@
-# sync-sha: 1b9d620f6c98e5c5253b500f42dd886710a26fc02fa25b2db4b3d26e320add4b
+# sync-sha: 9ac5680044bcdf7336ef14956c9e3c7e7766ff5d0dfa9596d76dca2ff50e223f
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml
@@ -74,7 +74,7 @@ jobs:
       # requirements) -- the action still restores ccache, the source
       # tarball and the (asan-only, exact-match) build tree.
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: asan
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -183,7 +183,7 @@ jobs:
       # requirements) -- the action still restores ccache, the source
       # tarball and the (asan-only, exact-match) build tree.
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: asan
           nginx-version: ${{ env.NGINX_VERSION }}

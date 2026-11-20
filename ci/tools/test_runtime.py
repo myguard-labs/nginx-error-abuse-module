@@ -748,6 +748,8 @@ http {{
                      statuses=404 interval=30s threshold=2 block=30s;
     error_abuse_zone zone=statban:1m key=$binary_remote_addr
                      statuses=404 interval=30s threshold=1 block=30s;
+    error_abuse_zone zone=statinherit:1m key=$binary_remote_addr
+                     statuses=404 interval=30s threshold=1 block=30s;
     error_abuse_zone zone=dryshared:1m key=$binary_remote_addr
                      statuses=404 interval=30s threshold=2 block=30s;
     error_abuse_zone zone=window:1m key=$binary_remote_addr
@@ -910,6 +912,17 @@ http {{
         location = /ea-stats-prom {{
             error_abuse_stats statz;
             error_abuse_stats_format prometheus;
+        }}
+        location /stats-inherit/ {{
+            error_abuse zone=statinherit status=429;
+            root {root}/empty;
+            location = /stats-inherit/metrics {{
+                error_abuse_stats statinherit;
+                error_abuse off;
+            }}
+            location = /stats-inherit/metrics-enforced {{
+                error_abuse_stats statinherit;
+            }}
         }}
 
         location = /var-ok {{
@@ -2943,6 +2956,7 @@ def expect_invalid_config(
     http_config: str,
     expected: str,
     forbidden: tuple[str, ...] = (),
+    encoding: str = "ascii",
 ) -> None:
     bad = root / name
     (bad / "conf").mkdir(parents=True)
@@ -2955,7 +2969,7 @@ http {{
 {http_config}
 }}
 """,
-        encoding="ascii",
+        encoding=encoding,
     )
     # Run the syntax check with the bare binary, never the leak-checker runner:
     # nginx's -t path intentionally never frees the cycle pool, so Valgrind
@@ -2971,6 +2985,7 @@ http {{
     result = subprocess.run(
         command,
         text=True,
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=20,
@@ -2993,6 +3008,7 @@ def expect_valid_config(
     runner: str,
     name: str,
     http_config: str,
+    encoding: str = "ascii",
 ) -> None:
     good = root / name
     (good / "conf").mkdir(parents=True)
@@ -3005,7 +3021,7 @@ http {{
 {http_config}
 }}
 """,
-        encoding="ascii",
+        encoding=encoding,
     )
     # Bare binary, never the leak-checker runner (see expect_invalid_config):
     # nginx -t leaves the cycle pool unfreed, so Valgrind's leak exit code
@@ -3021,6 +3037,7 @@ http {{
     result = subprocess.run(
         command,
         text=True,
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=20,
@@ -3162,6 +3179,27 @@ def test_valid_configs(
         "on-full-reject",
         "    error_abuse_zone zone=minimal:1m on_full=reject;",
     )
+    # A Latin-1 zone name is fine when stats never expose it, and a UTF-8
+    # name is fine with stats.
+    expect_valid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "latin1-zone-no-stats",
+        "    error_abuse_zone zone=zone\u00e9:1m key=$binary_remote_addr;",
+        encoding="latin-1",
+    )
+    expect_valid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "utf8-zone-stats",
+        """    error_abuse_zone zone=zone\u00e9:1m key=$binary_remote_addr;
+    server { location = /s { error_abuse_stats zone\u00e9; } }""",
+        encoding="utf-8",
+    )
 
 
 def http_call(
@@ -3283,6 +3321,22 @@ def test_stats_and_matched(port: int, root: pathlib.Path) -> None:
     ):
         raise AssertionError(f"OpenMetrics not negotiated: {headers}")
     _assert_prometheus(body.decode(), openmetrics=True)
+    _, headers, _ = http_call(
+        port,
+        "/ea-stats-prom",
+        headers={
+            "Accept": 'application/openmetrics-text;version="1\\.0.0";charset="U\\TF-8"'
+        },
+    )
+    if not headers.get("content-type", "").startswith("application/openmetrics-text"):
+        raise AssertionError(
+            f"quoted-pair Accept did not select OpenMetrics: {headers}"
+        )
+    _, headers, _ = http_call(
+        port, "/ea-stats-prom", headers={"Accept": "application/openmetrics-text,"}
+    )
+    if not headers.get("content-type", "").startswith("application/openmetrics-text"):
+        raise AssertionError(f"trailing empty Accept element dropped OM: {headers}")
     for accept in (
         "*/*",
         "text/plain, application/openmetrics-text;q=0.5",
@@ -3302,9 +3356,11 @@ def test_stats_and_matched(port: int, root: pathlib.Path) -> None:
         status, _, _ = http_call(port, f"/ea-stats?{query}")
         if status != 400:
             raise AssertionError(f"?{query}: expected 400, got {status}")
-    status, _, _ = http_call(port, "/ea-stats", method="POST")
-    if status != 405:
-        raise AssertionError(f"POST stats: expected 405, got {status}")
+    status, headers, _ = http_call(port, "/ea-stats", method="POST")
+    if status != 405 or headers.get("allow") != "GET, HEAD":
+        raise AssertionError(
+            f"POST stats: expected 405 + Allow, got {status} {headers}"
+        )
     status, headers, body = http_call(port, "/ea-stats", method="HEAD")
     if status != 200 or body or int(headers.get("content-length", "0")) <= 0:
         raise AssertionError(f"HEAD stats: {status} {headers} {body!r}")
@@ -3335,6 +3391,17 @@ def test_stats_and_matched(port: int, root: pathlib.Path) -> None:
     want = {"requests": 3, "matched": 1, "bans": 1, "blocked": 0, "would_block": 1}
     if any(ban[k] != v for k, v in want.items()):
         raise AssertionError(f"banned-client response counted as matched: {ban}")
+
+    # A stats location inherits error_abuse like any other location. The
+    # README tells operators to add "error_abuse off;" there; with it, a
+    # banned scraper still reads the counters and the scrape is not counted.
+    expect(port, "/stats-inherit/missing", 404)  # requests 1, matched 1, bans 1
+    expect(port, "/stats-inherit/metrics-enforced", 429)  # requests 2, blocked 1
+    status, _, body = http_call(port, "/stats-inherit/metrics")
+    inherited = json.loads(body) if status == 200 else {}
+    want = {"requests": 2, "matched": 1, "bans": 1, "blocked": 1}
+    if status != 200 or any(inherited.get(k) != v for k, v in want.items()):
+        raise AssertionError(f"error_abuse off stats location: {status} {body!r}")
 
     # Scrapes are not requests of the zone: counters are unchanged.
     _, _, body = http_call(port, "/ea-stats")
@@ -3367,10 +3434,55 @@ def test_stats_and_matched(port: int, root: pathlib.Path) -> None:
         raise AssertionError(f"/stats-ok logged without BLOCKED: {blocked_ok}")
 
 
+def test_stats_zone_utf8(
+    binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
+) -> None:
+    # Use Latin-1 only as a byte-preserving config writer for malformed UTF-8.
+    for name, raw in (
+        ("latin1-sequence", b"\xe9\xe0\xe8"),
+        ("continuation", b"\x80"),
+        ("overlong-two", b"\xc0\xaf"),
+        ("overlong-three", b"\xe0\x9f\xbf"),
+        ("overlong-four", b"\xf0\x8f\xbf\xbf"),
+        ("surrogate", b"\xed\xa0\x80"),
+        ("above-unicode", b"\xf4\x90\x80\x80"),
+        ("invalid-lead", b"\xf5\x80\x80\x80"),
+        ("bad-continuation", b"\xe2\x82A"),
+        ("truncated-two", b"\xc2"),
+        ("truncated-three", b"\xe2\x82"),
+        ("truncated-four", b"\xf0\x90\x80"),
+    ):
+        zone = "zone" + raw.decode("latin-1")
+        expect_invalid_config(
+            binary,
+            module,
+            root,
+            runner,
+            "stats-utf8-" + name,
+            f"""    error_abuse_zone zone={zone}:1m key=$binary_remote_addr;
+    server {{ location = /s {{ error_abuse_stats {zone}; }} }}""",
+            "is not valid UTF-8",
+            encoding="latin-1",
+        )
+    # Lowest/highest scalar values for each multibyte width, around surrogates.
+    zone = "zone\u0080\u07ff\u0800\ud7ff\ue000\uffff\U00010000\U0010ffff"
+    expect_valid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "stats-utf8-boundaries",
+        f"""    error_abuse_zone zone={zone}:1m key=$binary_remote_addr;
+    server {{ location = /s {{ error_abuse_stats {zone}; }} }}""",
+        encoding="utf-8",
+    )
+
+
 def test_invalid_configs(
     binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
 ) -> None:
     # error_abuse_stats attaches to a declared zone; it never creates one.
+    test_stats_zone_utf8(binary, module, root, runner)
     expect_invalid_config(
         binary,
         module,
@@ -3389,6 +3501,19 @@ def test_invalid_configs(
         """    error_abuse_zone zone=s:1m key=$binary_remote_addr;
     server { location = /s { error_abuse_stats s; error_abuse_stats s; } }""",
         "is duplicate",
+    )
+    # Stats bodies are UTF-8: a Latin-1 zone name is refused where stats
+    # expose it (the UTF-8 spelling is accepted in test_valid_configs).
+    expect_invalid_config(
+        binary,
+        module,
+        root,
+        runner,
+        "stats-latin1-zone",
+        """    error_abuse_zone zone=zone\u00e9:1m key=$binary_remote_addr;
+    server { location = /s { error_abuse_stats zone\u00e9; } }""",
+        "is not valid UTF-8",
+        encoding="latin-1",
     )
     expect_invalid_config(
         binary,

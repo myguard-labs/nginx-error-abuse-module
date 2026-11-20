@@ -57,6 +57,45 @@ query(const char *args, ngx_uint_t *format)
 
 
 static void
+case_utf8(void)
+{
+    static const char *valid[] = {
+        "", "zone", "\x7f", "\xc2\x80", "\xdf\xbf", "\xe0\xa0\x80",
+        "\xed\x9f\xbf", "\xee\x80\x80", "\xef\xbf\xbf",
+        "\xf0\x90\x80\x80", "\xf4\x8f\xbf\xbf"
+    };
+    static const char *invalid[] = {
+        "\xe9\xe0\xe8", "\x80", "\xbf", "\xc0\xaf", "\xc1\xbf",
+        "\xf5\x80\x80\x80", "\xff", "\xc2", "\xe2", "\xe2\x82",
+        "\xf0", "\xf0\x90", "\xf0\x90\x80", "\xc2\x7f", "\xc2\xc0",
+        "\xe2\x82\xc0", "\xf0\x90\x80\xff", "\xe0\x9f\xbf",
+        "\xed\xa0\x80", "\xed\xbf\xbf", "\xf0\x8f\xbf\xbf",
+        "\xf4\x90\x80\x80"
+    };
+    size_t     i;
+    ngx_str_t  v;
+
+    for (i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        v = str(valid[i]);
+        check(ngx_http_error_abuse_stats_valid_utf8(&v) == NGX_OK,
+              "valid UTF-8 scalar boundary accepted");
+    }
+    for (i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        v = str(invalid[i]);
+        check(ngx_http_error_abuse_stats_valid_utf8(&v) == NGX_ERROR,
+              "invalid UTF-8 sequence rejected");
+    }
+    /* Length, not the accessible suffix or a NUL terminator, bounds reads. */
+    v = str("\xf0\x90\x80\x80");
+    for (i = 1; i < 4; i++) {
+        v.len = i;
+        check(ngx_http_error_abuse_stats_valid_utf8(&v) == NGX_ERROR,
+              "UTF-8 continuation beyond supplied length is rejected");
+    }
+}
+
+
+static void
 case_query_format(void)
 {
     static u_char  big[NGX_HTTP_ERROR_ABUSE_NEGOTIATE_BYTES + 1];
@@ -108,12 +147,45 @@ case_accept(void)
     char        many[512];
     size_t      i;
     ngx_int_t   om, plain;
+    ngx_str_t   field;
+    ngx_uint_t  items;
 
     check(try_accept("application/openmetrics-text", &om, &plain) == NGX_OK
           && om == 1000 && plain == 0, "bare OpenMetrics media type");
     check(try_accept("Application/OpenMetrics-Text; Version=\"1.0.0\"; "
                  "charset=UTF-8; q=0.9", &om, &plain) == NGX_OK
           && om == 900, "case-insensitive, quoted version, charset, q");
+    check(try_accept("application/openmetrics-text;version=\"1\\.0.0\"",
+                 &om, &plain) == NGX_OK && om == 1000,
+          "quoted-pair version selects OpenMetrics");
+    check(try_accept("application/openmetrics-text;charset=\"U\\TF-8\"",
+                 &om, &plain) == NGX_OK && om == 1000,
+          "quoted-pair charset selects OpenMetrics");
+    check(try_accept("text/plain;version=\"0.0\\.4\"", &om, &plain)
+          == NGX_OK && plain == 1000, "quoted-pair Prometheus version");
+    check(try_accept("application/openmetrics-text;version=\"1.0.0\\",
+                 &om, &plain) == NGX_ERROR, "truncated quoted-pair rejected");
+    check(try_accept("application/openmetrics-text;charset=\"utf-8\\\"",
+                 &om, &plain) == NGX_ERROR, "escaped closing quote is not a terminator");
+    check(try_accept("application/openmetrics-text;version=\"1\\\x7f.0.0\"",
+                 &om, &plain) == NGX_ERROR, "quoted-pair control byte rejected");
+    check(try_accept("application/openmetrics-text;version=\"1.0.0x\"",
+                 &om, &plain) == NGX_OK && om == 0,
+          "quoted value suffix is not accepted");
+    check(try_accept("application/openmetrics-text;version=\"1.0\"",
+                 &om, &plain) == NGX_OK && om == 0,
+          "quoted value prefix is not accepted");
+    field = str("\\");
+    check(!ngx_http_error_abuse_accept_value(&field, "utf-8", 1),
+          "parameter comparison rejects truncated escape directly");
+    field = str("application/openmetrics-text;charset=\"utf\\-8\"");
+    om = plain = 0;
+    items = NGX_HTTP_ERROR_ABUSE_NEGOTIATE_ITEMS - 1;
+    check(ngx_http_error_abuse_accept(&field, &items, &om, &plain) == NGX_OK
+          && om == 1000 && items == NGX_HTTP_ERROR_ABUSE_NEGOTIATE_ITEMS,
+          "escaped parameter respects repeated-field shared item boundary");
+    check(ngx_http_error_abuse_accept(&field, &items, &om, &plain) == NGX_ERROR,
+          "repeated escaped parameter field exceeding shared budget rejected");
     check(try_accept("text/plain;q=0.5, application/openmetrics-text;q=0.4",
                  &om, &plain) == NGX_OK && om == 400 && plain == 500,
           "both types scored");
@@ -134,8 +206,14 @@ case_accept(void)
     check(try_accept("application/openmetrics-text;q=\"1\"", &om, &plain)
           == NGX_ERROR, "quoted q rejected");
     check(try_accept("text", &om, &plain) == NGX_ERROR, "missing subtype");
-    check(try_accept("text/plain,", &om, &plain) == NGX_ERROR,
-          "trailing comma rejected");
+    check(try_accept("application/openmetrics-text,", &om, &plain) == NGX_OK
+          && om == 1000, "trailing empty element skipped");
+    check(try_accept(" , ,text/plain;q=0.3 ,, ", &om, &plain) == NGX_OK
+          && plain == 300 && om == 0, "leading and inner empty elements");
+    check(try_accept(",", &om, &plain) == NGX_OK && om == 0 && plain == 0,
+          "list of only empty elements");
+    check(try_accept("text/plain;,", &om, &plain) == NGX_ERROR,
+          "empty parameter still rejected");
 
     many[0] = '\0';
     for (i = 0; i < NGX_HTTP_ERROR_ABUSE_NEGOTIATE_ITEMS; i++) {
@@ -144,6 +222,13 @@ case_accept(void)
     check(try_accept(many, &om, &plain) == NGX_OK, "item budget reached");
     strcat(many, ",a/b");
     check(try_accept(many, &om, &plain) == NGX_ERROR, "item budget exceeded");
+
+    many[0] = '\0';
+    for (i = 0; i <= NGX_HTTP_ERROR_ABUSE_NEGOTIATE_ITEMS; i++) {
+        strcat(many, ",");
+    }
+    check(try_accept(many, &om, &plain) == NGX_ERROR,
+          "empty elements spend the item budget");
 }
 
 
@@ -266,6 +351,7 @@ case_prometheus(void)
 int
 main(void)
 {
+    case_utf8();
     case_query_format();
     case_accept();
     case_json();

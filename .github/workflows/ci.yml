@@ -1,4 +1,4 @@
-# sync-sha: 4c19e129e019bec5f8bc1781e15c64e317ef21d64b57e61348bbb9463fb248af
+# sync-sha: 218f1063bb48870297d0d926581ab0baf1c1f54fbe0a4cb3f8988dcfe3eb4bd8
 name: CI
 
 # Single entry point orchestrator (cp4a). This is the ONLY workflow carrying a
@@ -59,46 +59,46 @@ jobs:
   build-test:
     permissions:
       contents: read
-    uses: ./.github/workflows/build-test.yml
+    uses: ./.github/workflows/build-test.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
 
   asan:
     needs: build-test
     if: ${{ !cancelled() }}
     permissions:
       contents: read
-    uses: ./.github/workflows/asan.yml
+    uses: ./.github/workflows/asan.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
 
   fuzzing:
     permissions:
       contents: read
-    uses: ./.github/workflows/fuzzing.yml
+    uses: ./.github/workflows/fuzzing.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
 
   valgrind:
     permissions:
       contents: read
-    uses: ./.github/workflows/valgrind.yml
+    uses: ./.github/workflows/valgrind.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
 
   security-scanners:
     needs: codeql
     if: ${{ !cancelled() }}
     permissions:
       contents: read
-    uses: ./.github/workflows/security-scanners.yml
+    uses: ./.github/workflows/security-scanners.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
 
   codeql:
     permissions:
       contents: read
       security-events: write # required so the CodeQL upload step can publish results
-    uses: ./.github/workflows/codeql.yml
+    uses: ./.github/workflows/codeql.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
 
   lint:
     needs: valgrind
     if: ${{ !cancelled() }}
     permissions:
       contents: read
-    uses: ./.github/workflows/lint.yml
+    uses: ./.github/workflows/lint.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
 
   windows:
     permissions:
       contents: read
-    uses: ./.github/workflows/windows.yml
+    uses: ./.github/workflows/windows.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax

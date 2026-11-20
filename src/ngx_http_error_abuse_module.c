@@ -2967,6 +2967,16 @@ ngx_http_error_abuse_stats(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     value = cf->args->elts;
 
+    /* Both renderers emit the zone name in a UTF-8 body (JSON string,
+     * Prometheus label value), so refuse a name that is not valid UTF-8.
+     * Zones that are never exposed through stats keep any name. */
+    if (ngx_http_error_abuse_stats_valid_utf8(&value[1]) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "zone name \"%V\" is not valid UTF-8",
+                           &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
     elcf->stats_zone = ngx_shared_memory_add(cf, &value[1], 0,
                                              &ngx_http_error_abuse_module);
     if (elcf->stats_zone == NULL) {
@@ -2981,10 +2991,11 @@ ngx_http_error_abuse_stats(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 /* Copy the counters and derive the gauges under ONE hold of the slab mutex,
- * so every figure in a response describes the same instant. nodes and
- * blocked_clients need a walk of the LRU queue: O(nodes), the same cost as
- * shield_ban_status, which the README tells operators to scrape at a sane
- * interval. Rendering happens after unlock. */
+ * so every figure comes from one locked snapshot. blocked_clients uses nginx's
+ * cached time, like the enforcement paths, and is therefore approximate to the
+ * cache update cadence. nodes and blocked_clients need a walk of the LRU
+ * queue: O(nodes), the same cost as shield_ban_status, which the README tells
+ * operators to scrape at a sane interval. Rendering happens after unlock. */
 static ngx_int_t
 ngx_http_error_abuse_stats_snapshot(ngx_http_error_abuse_zone_t *zone,
     ngx_http_error_abuse_stats_snapshot_t *snapshot)
@@ -3097,12 +3108,24 @@ ngx_http_error_abuse_stats_handler(ngx_http_request_t *r)
     ngx_uint_t                              format;
     ngx_flag_t                              openmetrics;
     ngx_chain_t                             out;
-    ngx_table_elt_t                        *vary;
+    ngx_table_elt_t                        *vary, *allow;
     ngx_http_error_abuse_zone_t            *zone;
     ngx_http_error_abuse_loc_conf_t        *elcf;
     ngx_http_error_abuse_stats_snapshot_t   snapshot;
 
     if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+        /* RFC 9110 15.5.6: a 405 carries Allow. The special response keeps
+         * headers_out.headers, as ngx_http_dav_module relies on. */
+        allow = ngx_list_push(&r->headers_out.headers);
+        if (allow == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        allow->hash = 1;
+#if (nginx_version >= 1023000)
+        allow->next = NULL;
+#endif
+        ngx_str_set(&allow->key, "Allow");
+        ngx_str_set(&allow->value, "GET, HEAD");
         return NGX_HTTP_NOT_ALLOWED;
     }
 
@@ -3193,14 +3216,19 @@ ngx_http_error_abuse_stats_handler(ngx_http_request_t *r)
     r->headers_out.content_type_len = r->headers_out.content_type.len;
     r->headers_out.content_type_lowcase = NULL;
 
-    rc = ngx_http_send_header(r);
-    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
-        return rc;
+    /* Allocate before sending the header: once a 200 with Content-Length
+     * is out, a 500 can no longer replace it. HEAD needs no body. */
+    b = NULL;
+    if (r->method != NGX_HTTP_HEAD) {
+        b = ngx_calloc_buf(r->pool);
+        if (b == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
-    b = ngx_calloc_buf(r->pool);
-    if (b == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only || b == NULL) {
+        return rc;
     }
 
     b->pos = start;

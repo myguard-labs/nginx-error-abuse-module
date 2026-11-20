@@ -27,6 +27,46 @@
 #define NGX_HTTP_ERROR_ABUSE_NEGOTIATE_PARAMS  16
 
 
+/* ngx_utf8_decode() is a decoder, not a strict UTF-8 validator. Check
+ * continuation bytes and scalar boundaries before exposing a zone name. */
+static ngx_int_t
+ngx_http_error_abuse_stats_valid_utf8(ngx_str_t *value)
+{
+    size_t   i, n;
+    u_char  *p, c;
+
+    p = value->data;
+    n = value->len;
+    while (n != 0) {
+        c = *p++;
+        n--;
+        if (c < 0x80) {
+            continue;
+        }
+        if (c < 0xc2 || c > 0xf4) {
+            return NGX_ERROR;
+        }
+        i = c < 0xe0 ? 1 : (c < 0xf0 ? 2 : 3);
+        if (n < i) {
+            return NGX_ERROR;
+        }
+        /* Exclude overlong forms, surrogates and values above U+10FFFF. */
+        if ((c == 0xe0 && *p < 0xa0) || (c == 0xed && *p > 0x9f)
+            || (c == 0xf0 && *p < 0x90) || (c == 0xf4 && *p > 0x8f))
+        {
+            return NGX_ERROR;
+        }
+        n -= i;
+        while (i-- != 0) {
+            if ((*p++ & 0xc0) != 0x80) {
+                return NGX_ERROR;
+            }
+        }
+    }
+    return NGX_OK;
+}
+
+
 /*
  * Counters stored in the zone's shared memory. Every field is updated with the
  * zone slab mutex held, inside critical sections the request path already
@@ -225,11 +265,38 @@ ngx_http_error_abuse_accept_space(u_char **p, u_char *end)
 }
 
 
+/* Compare a validated parameter without copying or modifying the header.
+ * Quoted pairs denote the escaped byte; token values have no escapes. */
+static ngx_flag_t
+ngx_http_error_abuse_accept_value(ngx_str_t *value, const char *expected,
+    ngx_flag_t quoted)
+{
+    size_t   i;
+    u_char   c;
+
+    i = 0;
+    while (i < value->len && *expected != '\0') {
+        c = value->data[i++];
+        if (quoted && c == '\\') {
+            if (i == value->len) {
+                return 0;
+            }
+            c = value->data[i++];
+        }
+        if (ngx_tolower(c) != (u_char) *expected++) {
+            return 0;
+        }
+    }
+    return i == value->len && *expected == '\0';
+}
+
+
 /* Parse one Accept field, sharing an item budget and best scores across
  * repeated fields. Any malformed or over-budget field makes the caller fall
- * back to Prometheus 0.0.4. Wildcards never opt into OpenMetrics. Unknown
- * media parameters do not match our representations; syntactically valid
- * accept extensions after q are ignored. */
+ * back to Prometheus 0.0.4. Empty list elements are skipped but spend the
+ * item budget. Wildcards never opt into OpenMetrics. Unknown media parameters
+ * do not match our representations; syntactically valid accept extensions
+ * after q are ignored. */
 static ngx_int_t
 ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
     ngx_int_t *openmetrics, ngx_int_t *plain)
@@ -252,6 +319,17 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
         }
 
         ngx_http_error_abuse_accept_space(&p, end);
+
+        /* RFC 9110 5.6.1: tolerate empty list elements. Each one still
+         * spends an item from the budget above. */
+        if (p == end) {
+            return NGX_OK;
+        }
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+
         start = p;
         while (p < end && ngx_http_error_abuse_accept_token(*p)) {
             p++;
@@ -345,20 +423,19 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
                     && ngx_strncasecmp(name.data, (u_char *) "version", 7)
                        == 0)
                 {
-                    supported &= (om && value.len == 5
-                                  && ngx_strncmp(value.data, "1.0.0", 5) == 0)
-                                 || (text && value.len == 5
-                                     && ngx_strncmp(value.data, "0.0.4", 5)
-                                        == 0);
+                    supported &= (om
+                                  && ngx_http_error_abuse_accept_value(
+                                         &value, "1.0.0", quoted))
+                                 || (text
+                                     && ngx_http_error_abuse_accept_value(
+                                            &value, "0.0.4", quoted));
 
                 } else if (name.len == 7
                            && ngx_strncasecmp(name.data,
                                               (u_char *) "charset", 7) == 0)
                 {
-                    supported &= value.len == 5
-                                 && ngx_strncasecmp(value.data,
-                                                    (u_char *) "utf-8", 5)
-                                    == 0;
+                    supported &= ngx_http_error_abuse_accept_value(&value,
+                                                          "utf-8", quoted);
 
                 } else {
                     supported = 0;
