@@ -53,7 +53,9 @@ export GITHUB_OUTPUT="$tmp/outputs"
 export BUILD_ROOT="$tmp/repo/.build"
 toolchain_overrides=(GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPATH
     C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH)
-unset "${toolchain_overrides[@]}"
+consumer_overrides=(NGX_ERROR_ABUSE_INCS NGX_ERROR_ABUSE_LIBS)
+cache_overrides=("${toolchain_overrides[@]}" "${consumer_overrides[@]}")
+unset "${cache_overrides[@]}"
 cd "$tmp/repo"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -77,15 +79,20 @@ portable="$(bash ci/tools/build-identity.sh --portable-asan 1.31.3)"
 for override in "${toolchain_overrides[@]}"; do
     export "$override=$tmp/toolchain with spaces/"
     changed "$before" "$(identity)" "$override"
+    export "$override="
+    changed "$before" "$(identity)" "empty-$override"
+    unset "$override"
+done
+for override in "${cache_overrides[@]}"; do
+    export "$override=$tmp/toolchain with spaces/"
     [[ "$(bash ci/tools/build-identity.sh --executable-cache-eligible)" == false ]] || fail "override eligible: $override"
     [[ "$(bash ci/tools/build-identity.sh --portable-asan 1.31.3)" == "$portable" ]] || fail "override changed portable identity: $override"
     export "$override="
-    changed "$before" "$(identity)" "empty-$override"
     [[ "$(bash ci/tools/build-identity.sh --executable-cache-eligible)" == false ]] || fail "empty override eligible: $override"
     [[ "$(bash ci/tools/build-identity.sh --portable-asan 1.31.3)" == "$portable" ]] || fail "empty override changed portable identity: $override"
     unset "$override"
 done
-echo 'ok: set and empty GCC search overrides disable reuse without contaminating portable inputs'
+echo 'ok: set and empty search/consumer overrides disable reuse without contaminating portable inputs'
 changed "$before" "$(identity debug)" mode
 changed "$before" "$(TEST_HARNESS=1 identity)" harness
 changed "$before" "$(CFLAGS=-DCHANGED identity)" environment-flags
@@ -215,7 +222,7 @@ done
 # override. Mutable directory contents cannot be proven by hashing path text.
 mkdir -p "$tmp/toolchain with spaces"
 printf 'toolchain-v1\n' > "$tmp/toolchain with spaces/cc1"
-for override in "${toolchain_overrides[@]}"; do
+for override in "${cache_overrides[@]}"; do
     prepare_restore
     export "$override=$tmp/toolchain with spaces/"
     expect_rebuild "$override-drift"
@@ -239,7 +246,7 @@ for prefix in "$tmp/missing-prefix/" ':'; do
     prepare_restore
     GCC_EXEC_PREFIX="$prefix" expect_rebuild GCC_EXEC_PREFIX-nonempty-boundary
 done
-for override in "${toolchain_overrides[@]}"; do
+for override in "${cache_overrides[@]}"; do
     prepare_restore
     export "$override="
     CI_BUILD_CACHE_IDENTITY="$(identity)"
@@ -253,7 +260,7 @@ cp "$OPERATIONS" "$tmp/before-unset-hit"
 bash ci/tools/ci-build.sh nginx 1.31.3 asan > "$tmp/unset-hit.out"
 cmp "$OPERATIONS" "$tmp/before-unset-hit" || fail 'unset overrides disabled exact hit'
 grep -Fq 'build-cache: trusted exact service hit; reuse' "$tmp/unset-hit.out" || fail 'unset overrides lost exact hit'
-echo 'ok: unset GCC search overrides preserve trusted exact hit (zero fetch/configure/make)'
+echo 'ok: unset search/consumer overrides preserve trusted exact hit (zero fetch/configure/make)'
 prepare_restore
 CI_BUILD_CACHE_HIT=false expect_rebuild service-miss
 prepare_restore

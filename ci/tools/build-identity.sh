@@ -19,14 +19,14 @@ if [[ "${1:-}" == --portable-asan ]]; then
     exit 0
 fi
 
-# GCC can select subprograms, headers and libraries from mutable directories.
-# Hashing the path text does not fingerprint those directories' contents, so
-# these overrides are unsupported for cross-run executable reuse. Even empty
-# overrides can change GCC's search paths, so only unset variables are eligible.
+# GCC and module overrides can select tools, headers and libraries from mutable
+# directories. Hashing path text does not fingerprint their contents, so these
+# overrides are unsupported for cross-run executable reuse, even when empty.
+# Only unset variables are eligible.
 toolchain_overrides=(GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPATH
     C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH)
 if [[ "${1:-}" == --executable-cache-eligible ]]; then
-    for override in "${toolchain_overrides[@]}"; do
+    for override in "${toolchain_overrides[@]}" NGX_ERROR_ABUSE_INCS NGX_ERROR_ABUSE_LIBS; do
         if [[ -v "$override" ]]; then
             printf 'false\n'
             exit 0
