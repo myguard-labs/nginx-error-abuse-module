@@ -74,7 +74,7 @@ class FuzzTests(unittest.TestCase):
         corpora = ("corpus", "corpus_accept", "corpus_statuses")
         for name in corpora:
             (self.root / name / "input.bin").write_bytes(b"input")
-            minimized = self.root / f"{name}-min"
+            minimized = self.root / "minimized" / name
             (minimized / "nested").mkdir(parents=True)
             (minimized / "nested/stale.bin").write_bytes(b"stale")
         expected_paths = set(self.root.iterdir())
@@ -88,7 +88,7 @@ class FuzzTests(unittest.TestCase):
                     pending, corpus = map(Path, args[2:4])
                     self.assertEqual(list(pending.iterdir()), [])
                     self.assertEqual(pending.parent.parent, self.root)
-                    self.assertNotEqual(pending, corpus.with_name(corpus.name + "-min"))
+                    self.assertNotEqual(pending, self.root / "minimized" / corpus.name)
                     self.assertEqual((corpus / "input.bin").read_bytes(), b"input")
                     destinations.append(pending)
                     (pending / "fresh.bin").write_bytes(payload)
@@ -97,7 +97,7 @@ class FuzzTests(unittest.TestCase):
                 fuzz.run(self.root, "120", True)
             self.assertEqual(run.call_count, 9)
             for name in corpora:
-                minimized = self.root / f"{name}-min"
+                minimized = self.root / "minimized" / name
                 self.assertEqual(list(minimized.iterdir()), [minimized / "fresh.bin"])
                 self.assertEqual((minimized / "fresh.bin").read_bytes(), payload)
             self.assertEqual(set(self.root.iterdir()), expected_paths)
@@ -108,15 +108,15 @@ class FuzzTests(unittest.TestCase):
         with mock.patch.object(fuzz.subprocess, "run"):
             fuzz.run(self.root, "120", True)
         for name in ("corpus", "corpus_accept", "corpus_statuses"):
-            minimized = self.root / f"{name}-min"
-            expected_paths.add(minimized)
+            minimized = self.root / "minimized" / name
+            expected_paths.add(self.root / "minimized")
             self.assertTrue(minimized.is_dir())
             self.assertEqual(list(minimized.iterdir()), [])
         self.assertEqual(set(self.root.iterdir()), expected_paths)
 
     def test_minimization_failure_preserves_previous_corpus_and_continues(self):
-        minimized = self.root / "corpus_accept-min"
-        minimized.mkdir()
+        minimized = self.root / "minimized/corpus_accept"
+        minimized.mkdir(parents=True)
         (minimized / "previous.bin").write_bytes(b"previous")
         for error in (
             subprocess.CalledProcessError(17, "merge"),
@@ -148,13 +148,15 @@ class FuzzTests(unittest.TestCase):
                     list(minimized.iterdir()), [minimized / "previous.bin"]
                 )
                 self.assertEqual((minimized / "previous.bin").read_bytes(), b"previous")
-                self.assertEqual(list(self.root.glob(".*-min-*")), [])
+                self.assertEqual(list(self.root.glob(".corpus*-*")), [])
                 for name in ("corpus", "corpus_statuses"):
-                    self.assertTrue((self.root / f"{name}-min/partial.bin").is_file())
+                    self.assertTrue(
+                        (self.root / "minimized" / name / "partial.bin").is_file()
+                    )
 
     def test_minimization_preparation_failure_preserves_previous_corpus(self):
-        minimized = self.root / "corpus_accept-min"
-        minimized.mkdir()
+        minimized = self.root / "minimized/corpus_accept"
+        minimized.mkdir(parents=True)
         (minimized / "previous.bin").write_bytes(b"previous")
         expected_paths = set(self.root.iterdir())
         with (
@@ -172,7 +174,7 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual(set(self.root.iterdir()), expected_paths)
 
     def test_minimization_publication_failure_restores_previous_corpus(self):
-        minimized = self.root / "corpus_accept-min"
+        minimized = self.root / "minimized/corpus_accept"
         original_rename = Path.rename
         for previous, stage in (
             (True, "backup"),
@@ -181,7 +183,7 @@ class FuzzTests(unittest.TestCase):
         ):
             with self.subTest(previous=previous, stage=stage):
                 if previous:
-                    minimized.mkdir(exist_ok=True)
+                    minimized.mkdir(parents=True, exist_ok=True)
                     (minimized / "previous.bin").write_bytes(b"previous")
                 else:
                     shutil.rmtree(minimized)
@@ -211,11 +213,11 @@ class FuzzTests(unittest.TestCase):
                     self.assertEqual(
                         (minimized / "previous.bin").read_bytes(), b"previous"
                     )
-                self.assertEqual(list(self.root.glob(".*-min-*")), [])
+                self.assertEqual(list(self.root.glob(".corpus*-*")), [])
 
     def test_minimization_failed_rollback_retains_recoverable_previous_output(self):
-        minimized = self.root / "corpus_accept-min"
-        minimized.mkdir()
+        minimized = self.root / "minimized/corpus_accept"
+        minimized.mkdir(parents=True)
         (minimized / "previous.bin").write_bytes(b"previous")
         original_rename = Path.rename
 
@@ -231,15 +233,15 @@ class FuzzTests(unittest.TestCase):
         ):
             fuzz.run(self.root, "120", True)
         self.assertEqual(run.call_count, 9)
-        workspaces = list(self.root.glob(".*-min-*"))
+        workspaces = list(self.root.glob(".corpus*-*"))
         self.assertEqual(len(workspaces), 1)
         self.assertEqual(
             (workspaces[0] / "previous/previous.bin").read_bytes(), b"previous"
         )
 
     def test_minimization_cleanup_failure_keeps_successful_output_and_propagates(self):
-        minimized = self.root / "corpus_accept-min"
-        minimized.mkdir()
+        minimized = self.root / "minimized/corpus_accept"
+        minimized.mkdir(parents=True)
         (minimized / "previous.bin").write_bytes(b"previous")
         original_rmtree = shutil.rmtree
 
@@ -248,7 +250,7 @@ class FuzzTests(unittest.TestCase):
                 (Path(args[2]) / "fresh.bin").write_bytes(b"fresh")
 
         def cleanup(path, *args, **kwargs):
-            if Path(path).name.startswith(".corpus_accept-min-"):
+            if Path(path).name.startswith(".corpus_accept-"):
                 raise PermissionError("workspace cleanup denied")
             return original_rmtree(path, *args, **kwargs)
 
@@ -261,7 +263,7 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual(run.call_count, 9)
         self.assertEqual((minimized / "fresh.bin").read_bytes(), b"fresh")
         self.assertEqual(list(minimized.iterdir()), [minimized / "fresh.bin"])
-        workspaces = list(self.root.glob(".*-min-*"))
+        workspaces = list(self.root.glob(".corpus*-*"))
         self.assertEqual(len(workspaces), 1)
         self.assertEqual(
             (workspaces[0] / "previous/previous.bin").read_bytes(), b"previous"
@@ -877,8 +879,8 @@ class FuzzMergeSanitizerTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.corpus = self.root / "corpus"
         self.corpus.mkdir()
-        self.minimized = self.root / "corpus-min"
-        self.minimized.mkdir()
+        self.minimized = self.root / "minimized/corpus"
+        self.minimized.mkdir(parents=True)
         (self.minimized / "previous.bin").write_bytes(b"previous")
         self.completed = []
         original_run = subprocess.run
@@ -904,7 +906,7 @@ class FuzzMergeSanitizerTests(unittest.TestCase):
         self.assertFalse((self.minimized / "previous.bin").exists())
         self.assertEqual(list(self.root.glob("crash-*")), [stale])
         self.assertEqual(stale.read_bytes(), b"unrelated")
-        self.assertEqual(list(self.root.glob(".*-min-*")), [])
+        self.assertEqual(list(self.root.glob(".corpus*-*")), [])
 
     def test_sanitizer_merge_retains_exact_reproducer_and_previous_output(self):
         for mixed in (False, True):
@@ -932,7 +934,7 @@ class FuzzMergeSanitizerTests(unittest.TestCase):
                 self.assertEqual(
                     (self.minimized / "previous.bin").read_bytes(), b"previous"
                 )
-                self.assertEqual(list(self.root.glob(".*-min-*")), [])
+                self.assertEqual(list(self.root.glob(".corpus*-*")), [])
 
 
 if __name__ == "__main__":

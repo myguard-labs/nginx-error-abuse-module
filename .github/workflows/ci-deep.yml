@@ -1,4 +1,4 @@
-# sync-sha: 970c63b1c3510e36ba65ed2264f7e67fc2082092b37064a7d62f59a81501ff77
+# sync-sha: 43d9db4313fbdbd5d74bea2e320f8aa49e74b108ce31bb561d4498bc512e1258
 name: CI Deep
 
 # Monthly/manual orchestrator: fuzz regression + discovery; MSVC then Memcheck;
@@ -151,7 +151,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/ci/fuzz/*-min
+          path: ${{ github.workspace }}/ci/fuzz/minimized/
           retention-days: 30
 
       - name: Notify Discord on failure

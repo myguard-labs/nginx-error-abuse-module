@@ -11,6 +11,7 @@ ci/fuzz/fuzz_snapshot
 ci/fuzz/fuzz_statuses
 ci/fuzz/crash-*
 ci/fuzz/*-min/
+ci/fuzz/minimized/
 # Test::Nginx runtime tree (regenerated per run)
 ci/t/servroot/
 # ci/tests/unit/run.sh's build output (source and run.sh stay tracked)

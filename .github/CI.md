@@ -50,7 +50,8 @@ MSVC job moves unchanged from `windows.yml` to `windows-msvc.yml`. Both 600s
 soaks, deep scanners, Discord scheduled-failure notifications, error exits and
 14-day scanner reports stay in CI Deep. Fuzz discovery retains sanitizer flags,
 replays all fixtures, runs every target for 120s then the full selected duration,
-merges each corpus, and keeps fast crash (14 days), deep crash and minimized
+merges each corpus into `ci/fuzz/minimized/<corpus-name>/`, and keeps fast
+crash (14 days), deep crash and minimized
 corpus (30 days) artifacts. New `fuzz_*.c` targets are automatically built and
 run; a missing corpus/binary or unroutable regression fails visibly. Manual
 `fuzz_seconds` remains strictly bounded to 1..86400; scheduled runs use 3600.

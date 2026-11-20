@@ -65,7 +65,9 @@ def targets(root):
 
 
 def minimize(binary, corpus, root):
-    minimized = corpus.with_name(corpus.name + "-min")
+    output_root = root / "minimized"
+    output_root.mkdir(exist_ok=True)
+    minimized = output_root / corpus.name
     workspace = Path(tempfile.mkdtemp(prefix=f".{minimized.name}-", dir=corpus.parent))
     pending = workspace / "new"
     previous = workspace / "previous"
