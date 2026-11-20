@@ -8,7 +8,6 @@ import tempfile
 import unittest
 
 import test_ci_executable_cache
-import test_windows_snapshot
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -344,7 +343,6 @@ class CompilerCachePreparation(unittest.TestCase):
 
 
 def load_tests(loader, tests, _pattern):
-    tests.addTests(loader.loadTestsFromModule(test_windows_snapshot))
     tests.addTests(loader.loadTestsFromModule(test_ci_executable_cache))
     return tests
 

@@ -3,6 +3,13 @@
 set -euo pipefail
 export LC_ALL=C
 
+hash_harness() {
+    if [[ "${TEST_HARNESS:-0}" == 1 ]]; then
+        sha256sum ci/t/harness/src/ngx_test_probe.c \
+            ci/t/harness/src/ngx_test_probe_arm.c ci/t/harness/src/ngx_test_probe.h
+    fi
+}
+
 if [[ "${1:-}" == --portable-asan ]]; then
     # Same-run consumers verify source inputs without inheriting the producer's
     # workspace, compiler, installed packages or optional build accelerators.
@@ -12,6 +19,7 @@ if [[ "${1:-}" == --portable-asan ]]; then
         sha256sum .github/versions.env ci/tools/ci-build.sh \
             ci/tools/build-identity.sh ci/tools/ci-build-artifact.sh config
         find -L src -type f -print0 | sort -z | xargs -0 -r sha256sum
+        hash_harness
         if [[ -d patches ]]; then
             find -L patches -type f -print0 | sort -z | xargs -0 -r sha256sum
         fi
@@ -73,6 +81,7 @@ fi
     sha256sum .github/versions.env ci/tools/ci-build.sh \
         ci/tools/build-identity.sh config
     find -L src -type f -print0 | sort -z | xargs -0 -r sha256sum
+    hash_harness
     if [[ -d patches ]]; then
         find -L patches -type f -print0 | sort -z | xargs -0 -r sha256sum
     fi

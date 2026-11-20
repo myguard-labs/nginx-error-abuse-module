@@ -11,7 +11,14 @@ from check_ci_graph import GraphError, graph, width
 
 ROOT = Path(__file__).resolve().parents[2]
 PR_JOBS = {
-    "build-test": {"validation", "build", "runtime", "coverage", "test-nginx"},
+    "build-test": {
+        "validation",
+        "build",
+        "runtime",
+        "coverage",
+        "test-nginx",
+        "snapshot-controls",
+    },
     "asan": {"asan", "asan-reload"},
     "valgrind": {"memcheck-lite"},
     "codeql": {"analyze"},

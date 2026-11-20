@@ -15,6 +15,10 @@ printf 'NGINX_MAINLINE=1.31.3\nNGINX_MAINLINE_SHA256=%s\nNGINX_STABLE=1.30.4\nNG
     "$(printf 'cache fixture pin' | sha256sum | cut -d' ' -f1)" > "$tmp/repo/.github/versions.env"
 : > "$tmp/repo/config"
 echo source-v1 > "$tmp/repo/src/module.c"
+mkdir -p "$tmp/repo/ci/t/harness/src"
+for file in ngx_test_probe.c ngx_test_probe_arm.c ngx_test_probe.h; do
+    printf 'harness fixture\n' > "$tmp/repo/ci/t/harness/src/$file"
+done
 cat > "$tmp/source/nginx-1.31.3/configure" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -133,6 +137,20 @@ for override in "${cache_overrides[@]}"; do
 done
 echo 'ok: set and empty search/consumer overrides disable reuse without contaminating portable inputs'
 changed "$before" "$(identity debug)" mode
+harness_full="$(TEST_HARNESS=1 identity)"
+harness_portable="$(TEST_HARNESS=1 bash ci/tools/build-identity.sh --portable-asan 1.31.3)"
+for file in ci/t/harness/src/ngx_test_probe.c ci/t/harness/src/ngx_test_probe_arm.c ci/t/harness/src/ngx_test_probe.h; do
+    cp "$file" "$tmp/harness-saved"
+    printf 'changed\n' >> "$file"
+    changed "$harness_full" "$(TEST_HARNESS=1 identity)" "harness:$file"
+    changed "$harness_portable" "$(TEST_HARNESS=1 bash ci/tools/build-identity.sh --portable-asan 1.31.3)" "portable-harness:$file"
+    [[ "$before" == "$(identity)" ]] || fail "disabled harness affected identity: $file"
+    cp "$tmp/harness-saved" "$file"
+done
+mv ci/t/harness/src/ngx_test_probe.h "$tmp/harness-header"
+if TEST_HARNESS=1 identity > "$tmp/missing-harness" 2>&1; then fail 'missing harness accepted'; fi
+if TEST_HARNESS=1 bash ci/tools/build-identity.sh --portable-asan 1.31.3 > "$tmp/missing-harness" 2>&1; then fail 'missing portable harness accepted'; fi
+mv "$tmp/harness-header" ci/t/harness/src/ngx_test_probe.h
 changed "$before" "$(TEST_HARNESS=1 identity)" harness
 changed "$before" "$(CFLAGS=-DCHANGED identity)" environment-flags
 echo source-v2 >> src/module.c

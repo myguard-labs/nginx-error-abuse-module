@@ -15,6 +15,10 @@ printf 'NGINX_MAINLINE=1.31.3\nNGINX_MAINLINE_SHA256=%s\nNGINX_STABLE=1.30.4\nNG
 cp "$producer/.github/versions.env" "$tmp/valid-versions.env"
 printf 'module fixture\n' > "$producer/config"
 printf 'source fixture\n' > "$producer/src/module.c"
+mkdir -p "$producer/ci/t/harness/src"
+for file in ngx_test_probe.c ngx_test_probe_arm.c ngx_test_probe.h; do
+    printf 'harness fixture\n' > "$producer/ci/t/harness/src/$file"
+done
 export PATH=/usr/bin:/bin
 export BUILD_ROOT="$producer/.build" GITHUB_OUTPUT="$tmp/producer-outputs"
 cd "$producer"

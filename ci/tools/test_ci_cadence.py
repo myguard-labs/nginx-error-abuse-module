@@ -32,6 +32,17 @@ class CadenceTests(WorkflowFixture):
     def test_real_contract(self):
         self.assertEqual(policy.check(self.root), [])
 
+    def test_snapshot_controls_are_required(self):
+        self.replace(
+            "build-test.yml", "  snapshot-controls:\n", "  removed-snapshot-controls:\n"
+        )
+        self.assertTrue(
+            any(
+                "lost or unexpected PR target: build-test" in error
+                for error in policy.check(self.root)
+            )
+        )
+
     def test_each_workflow_parsed_once_per_check(self):
         expected = set((self.root / ".github/workflows").glob("*.y*ml"))
         with (
