@@ -26,15 +26,21 @@ cd "$ROOT" || exit 2
 
 rc=0
 
-# case <expected-exit> <description> -- command...
+# case <expected-exit> <description> [--expect <output-substring>] -- command...
 case_() {
-    local want="$1" desc="$2"; shift 2
+    local want="$1" desc="$2" expected=""; shift 2
+    if [ "${1:-}" = --expect ]; then
+        expected="$2"; shift 2
+    fi
+    [ "${1:-}" = -- ] && shift
     local out got
     out="$("$@" 2>&1)"; got=$?
-    if [ "$got" -eq "$want" ]; then
+    if [ "$got" -eq "$want" ] && { [ -z "$expected" ] || [[ "$out" == *"$expected"* ]]; }; then
         echo "ok   $desc (exit $got)"
     else
-        echo "FAIL $desc: expected exit $want, got $got" >&2
+        echo "FAIL $desc: expected exit $want" >&2
+        [ -z "$expected" ] || echo "     and output containing: $expected" >&2
+        echo "     got exit $got" >&2
         echo "$out" | sed 's/^/       | /' >&2
         rc=1
     fi
@@ -126,9 +132,26 @@ case_ 1 "policy docs: nested fuzz README rejects dead workflow link" \
     env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
     python3 ci/linter/workflow_policy.py docs
 cp ci/fuzz/README.md "$docs_tmp/ci/fuzz/README.md"
-sed -i 's#uses: ./\.github/workflows/fuzzing\.yml#uses: ./\.github/workflows/missing.yml#' \
-    "$docs_tmp/.github/workflows/ci.yml"
-case_ 1 "policy docs: PR gate must call reusable fuzz workflow" \
+cat >> "$docs_tmp/.github/workflows/ci.yml" <<'YAML'
+  renamed_campaign:
+    uses: ./.github/workflows/fuzzing.yml
+YAML
+case_ 1 "policy docs: PR gate rejects renamed monthly fuzz workflow" \
+    --expect "ci.yml must not call monthly/manual fuzzing on PRs" -- \
+    env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
+    python3 ci/linter/workflow_policy.py docs
+cp .github/workflows/ci.yml "$docs_tmp/.github/workflows/ci.yml"
+cat >> "$docs_tmp/.github/workflows/ci.yml" <<'YAML'
+  fuzzing:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unrelated
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unrelated
+YAML
+case_ 0 "policy docs: unrelated fuzz-named jobs are accepted" \
     env "WORKFLOW_POLICY_ROOT=$docs_tmp" \
     python3 ci/linter/workflow_policy.py docs
 rm -rf "$docs_tmp"

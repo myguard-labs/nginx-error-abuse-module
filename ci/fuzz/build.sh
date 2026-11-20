@@ -87,6 +87,11 @@ if [ -n "$ARG" ] && [ ! -d "$ARG" ]; then
     build_one fuzz_snapshot.c "$ARG"
 else
     DIR="${ARG:-$FUZZ_DIR}"
-    build_one fuzz_snapshot.c "$DIR/fuzz_snapshot"
-    build_one fuzz_statuses.c "$DIR/fuzz_statuses"
+    shopt -s nullglob
+    sources=("$FUZZ_DIR"/fuzz_*.c)
+    [ "${#sources[@]}" -gt 0 ] || { echo "no fuzz target sources" >&2; exit 1; }
+    for source in "${sources[@]}"; do
+        target="${source##*/}"
+        build_one "$target" "$DIR/${target%.c}"
+    done
 fi

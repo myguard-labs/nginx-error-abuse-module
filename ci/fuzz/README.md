@@ -30,7 +30,7 @@ exactly the truncation / over-read bug class the Perl suite cannot reach.
 
 ## The contract under test
 
-```
+```text
 validate_snapshot() == NGX_OK  =>  every byte load() later reads is < last
 ```
 
@@ -99,11 +99,13 @@ A crash drops a `crash-*` reproducer. Replay it with:
 ## CI
 
 [`.github/workflows/fuzzing.yml`](../../.github/workflows/fuzzing.yml) is the
-reusable PR member called by `ci.yml`; the long campaign belongs to
+manual regression diagnostic; the monthly regression and long campaign belong to
 [`ci-deep.yml`](../../.github/workflows/ci-deep.yml):
 
-- **PR** — 2-min bounded regression run on every pull request through `ci.yml`
-- **Deep monthly** — long discovery run on the 4th, with corpus upload
+- **PR** — deterministic parser/runtime tests and sanitizers remain in `ci.yml`;
+  fuzz campaigns run monthly/manual
+- **Deep monthly** — regression replay + 120s/target, then 3600s/target discovery
+  on the 4th, sharing one sanitizer build, with crash/corpus upload
 - **Manual** — `workflow_dispatch` on either workflow (the deep workflow accepts
   a custom duration)
 
@@ -111,3 +113,32 @@ ASAN+UBSAN are compiled in, so memory and undefined-behaviour bugs abort the
 run and fail the job. The harness also traps if the validator ever returns a
 value other than `NGX_OK`/`NGX_ERROR`, or breaks its lockstep contract with
 `load()`.
+
+`build.sh` and `run.py` discover every `fuzz_*.c`, including future targets.
+Each target requires a matching executable and `corpus_<name>/` directory;
+`fuzz_snapshot` retains `corpus/`. `fuzz_statuses` retains `fuzz.dict`;
+other targets may provide `<name>.dict`. Regression fixtures use
+`regressions/<full-target-name>-<suffix>.bin` with a nonempty suffix. The longest
+registered target name followed by `-` selects the replay binary, so
+`header-list-boundary.bin` selects `fuzz_header-list` when both `header` and
+`header-list` are registered. Bare target names, unknown prefixes and missing
+suffixes fail before any replay or campaign; missing targets/corpora also fail
+visibly. Existing `snapshot-<suffix>.bin` names remain valid.
+
+The deep job has a separate **600-minute total admission budget**. Before building,
+`python3 ci/fuzz/run.py "$FUZZ_SECS" --check-budget` counts all `fuzz_*.c`
+sources and regression fixtures, without needing binaries. Every normal runner
+invocation repeats the check before starting any replay or campaign. The requested
+per-target duration remains unchanged; an oversized request fails with the target
+count, required total and maximum discovery duration.
+
+Admission reserves 3600 seconds for setup, build, uploads and runner overhead;
+for each target it includes the requested discovery duration, the default
+120-second regression campaign, 60 seconds of exit grace for each campaign, and
+600 seconds for minimization. Each fixture reserves 60 seconds in each of the
+two replay passes. Thus the current two targets and two fixtures accept the
+3600-second default and at most 15240 seconds per target; adding a target or
+fixture reduces that maximum automatically. The same conservative deep-job
+allowance applies to standalone invocations, including those without `--merge`.
+These are admission allowances, not measured execution guarantees: the workflow's
+600-minute timeout remains the hard deadline if a phase overruns its reserve.

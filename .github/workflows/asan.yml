@@ -1,4 +1,4 @@
-# sync-sha: 9ac5680044bcdf7336ef14956c9e3c7e7766ff5d0dfa9596d76dca2ff50e223f
+# sync-sha: 98a317997d78bcf08af48196aff1b17652cec6c925b35d3fb25fd0ffb4006b9b
 name: A/UBSan
 
 # ASan/UBSan request-storm soak on every PR/push, extracted from build-test.yml
@@ -37,6 +37,12 @@ jobs:
     name: ASan and UBSan
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.asan-artifact.outputs.artifact-id }}
+      build-identity: ${{ steps.asan-identity.outputs.identity }}
+      binary-sha256: ${{ steps.asan-identity.outputs.sha256 }}
+      artifact-identity: ${{ steps.asan-identity.outputs.artifact-identity }}
+      artifact-sha256: ${{ steps.asan-identity.outputs.artifact-sha256 }}
     env:
       # Own band, disjoint from build-test.yml:runtime and this file's
       # asan-reload job -- all three can land on the same self-hosted runner
@@ -69,18 +75,32 @@ jobs:
             build-essential curl libhiredis-dev libpcre2-dev redis-server \
             zlib1g-dev
 
-      # cp7a: mold and eatmydata are both SKIPPED under this mode by
-      # ci-build.sh itself (sanitizer runtime ordering / linker
-      # requirements) -- the action still restores ccache, the source
-      # tarball and the (asan-only, exact-match) build tree.
+      # Compiler objects are isolated from PR runs; source archives are verified.
       - name: Restore build caches
+        id: build-cache
         uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: asan
           nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Build with sanitizers
+        env:
+          CI_BUILD_CACHE_HIT: ${{ steps.build-cache.outputs.exact-hit }}
+          CI_BUILD_CACHE_IDENTITY: ${{ steps.build-cache.outputs.identity }}
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
+
+      - name: Identify plain ASan artifact
+        id: asan-identity
+        run: bash ci/tools/ci-build-artifact.sh export "$NGINX_VERSION" .build/asan-artifact
+
+      - name: Upload plain ASan artifact
+        id: asan-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: asan-plain-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/asan-artifact/nginx
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Sweep stale test listeners
         run: |
@@ -153,6 +173,9 @@ jobs:
         run: bash ci/t/prober/run.sh nginx "$NGINX_VERSION"
 
   asan-reload:
+    needs: asan
+    # Keep reload diagnostics after a post-upload failure, but stop on cancellation.
+    if: ${{ !cancelled() && needs.asan.outputs.artifact-id != '' }}
     name: ASan multi-worker + reload
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
@@ -176,20 +199,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential curl libhiredis-dev libpcre2-dev redis-server \
-            zlib1g-dev
+            zlib1g-dev ccache mold eatmydata
 
-      # cp7a: mold and eatmydata are both SKIPPED under this mode by
-      # ci-build.sh itself (sanitizer runtime ordering / linker
-      # requirements) -- the action still restores ccache, the source
-      # tarball and the (asan-only, exact-match) build tree.
-      - name: Restore build caches
-        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
+      # Current-run ID from the producer, not a name-only/cross-run lookup.
+      - name: Download plain ASan artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          mode: asan
-          nginx-version: ${{ env.NGINX_VERSION }}
+          artifact-ids: ${{ needs.asan.outputs.artifact-id }}
+          path: .build/asan-download
+          merge-multiple: true
 
-      - name: Build with sanitizers
-        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
+      - name: Verify plain ASan artifact
+        env:
+          EXPECTED_BUILD_IDENTITY: ${{ needs.asan.outputs.build-identity }}
+          EXPECTED_BINARY_SHA256: ${{ needs.asan.outputs.binary-sha256 }}
+          EXPECTED_ARTIFACT_IDENTITY: ${{ needs.asan.outputs.artifact-identity }}
+          EXPECTED_ARTIFACT_SHA256: ${{ needs.asan.outputs.artifact-sha256 }}
+        run: bash ci/tools/ci-build-artifact.sh import "$NGINX_VERSION" .build/asan-download
 
       # CI-3: exercise the master + multi-worker lifecycle (reload overlap,
       # worker shutdown, helper-process init) under ASan/UBSan — the paths the

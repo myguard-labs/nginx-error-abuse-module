@@ -14,16 +14,17 @@
 
 | Workflow | What it gates |
 |---|---|
-| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the eight members below |
+| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the seven PR members below |
 | `build-test.yml` | build, `.so` dlopen, bad-config rejection, `-Werror`, Test::Nginx runtime suite |
 | `security-scanners.yml` | flawfinder, clang-tidy, Semgrep |
-| `fuzzing.yml` | recorded-regression replay, then a fresh time-boxed libFuzzer run against the parse targets |
+| `fuzzing.yml` | manual regression diagnostic; replay all recorded regressions then fuzz all discovered targets for 120s |
 | `valgrind.yml` | memcheck soak |
 | `codeql.yml` | CodeQL over the module TU |
 | `asan.yml` | ASan+UBSan request-storm soak (static `--add-module` build), single-process + multi-worker/reload lanes |
 | `lint.yml` | `ci/linter/` — shellcheck, ruff, perlcritic, yamllint/actionlint/zizmor, nginx-convention and repo-policy checks; same entry point as `.githooks/pre-commit` |
-| `windows.yml` | MSVC and MinGW-w64 static builds; native persistence, restart and two-worker ownership controls under MSVC |
-| `ci-deep.yml` | monthly schedule; long fuzz + memcheck + helgrind sweep, not a PR-lane member |
+| `windows.yml` | MinGW-w64 static build on PRs |
+| `windows-msvc.yml` | monthly/manual MSVC build, directive, persistence, restart and two-worker ownership controls |
+| `ci-deep.yml` | monthly/manual four-slot sweep: fuzz regression + long campaign, MSVC, Memcheck, Helgrind, deep scanners and CodeQL |
 
 ### CI caching
 

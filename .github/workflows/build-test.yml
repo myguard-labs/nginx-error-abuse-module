@@ -1,4 +1,4 @@
-# sync-sha: cd52b690cca8cd810090970039bd3c41deeac9f851bb41a162d55984fdaf036d
+# sync-sha: 310f992e2f1dd64626d874b33ee2072994a02e40c8b1c66c704749f3030a8780
 name: Build and Test
 
 env:
@@ -34,13 +34,24 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck libhiredis-dev shellcheck
+          sudo apt-get install -y cppcheck libhiredis-dev python3-yaml shellcheck
 
       - name: Validate scripts and source
         run: |
           bash -n ci/tools/ci-build.sh
           bash -n ci/tools/test-ci-build-source.sh
-          shellcheck ci/tools/ci-build.sh ci/tools/test-ci-build-source.sh
+          bash -n ci/tools/test-ci-build-cache.sh
+          bash -n ci/tools/test-ci-build-cache-containment.sh
+          bash -n ci/tools/test-ci-build-artifact.sh
+          shellcheck ci/tools/ci-build.sh ci/tools/build-identity.sh ci/tools/ci-build-artifact.sh ci/tools/test-ci-build-source.sh ci/tools/test-ci-build-cache.sh ci/tools/test-ci-build-cache-containment.sh ci/tools/test-ci-build-artifact.sh
+          bash ci/tools/test-ci-build-cache-containment.sh
+          bash ci/tools/test-ci-build-artifact.sh
+          python3 ci/tools/test_ci_cache_policy.py
+          python3 ci/tools/check_ci_graph.py
+          python3 ci/tools/test_ci_graph.py
+          python3 ci/tools/check_ci_cadence.py
+          python3 ci/tools/test_ci_cadence.py
+          python3 ci/tools/test_ci_fuzz.py
           bash ci/tools/test-ci-build-source.sh
           # The runtime driver's path is assembled from two variables rather
           # than written as one contiguous string anywhere in this step
@@ -111,12 +122,14 @@ jobs:
           sudo apt-get install -y \
             build-essential clang curl libhiredis-dev libpcre2-dev zlib1g-dev
 
-      # cp7a: ccache/mold/eatmydata presence + the source tarball, ccache and
-      # build-tree caches for THIS mode (debug). See ci/tools/ci-build.sh's
-      # CACHING block and the action itself for why the build-tree layer is
-      # exact-match only.
+      # ccache/mold/eatmydata presence, verified source archive and compatible
+      # compiler-object cache for this mode (debug). See ci/tools/ci-build.sh's
+      # CACHING block and the action for the executable-cache trust boundary.
       - name: Restore build caches
+        id: build-cache
         uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
+        env:
+          CC: ${{ matrix.cc }}
         with:
           mode: debug
           flavor: ${{ matrix.flavor }}
@@ -124,6 +137,8 @@ jobs:
 
       - name: Build server and dynamic module
         env:
+          CI_BUILD_CACHE_HIT: ${{ steps.build-cache.outputs.exact-hit }}
+          CI_BUILD_CACHE_IDENTITY: ${{ steps.build-cache.outputs.identity }}
           CC: ${{ matrix.cc }}
           # Passed through env, not interpolated directly with ${{ }}: that
           # expands BEFORE the shell runs, so zizmor reads it as template
@@ -352,6 +367,8 @@ jobs:
         run: bash ci/t/prober/run.sh nginx "$NGINX_VERSION"
 
   coverage:
+    needs: test-nginx
+    if: ${{ !cancelled() }}
     name: Coverage report
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
@@ -460,10 +477,10 @@ jobs:
           # Test::Nginx from CPAN instead (cpanminus is available via apt).
           sudo cpanm --notest --quiet Test::Nginx
 
-      # cp7a: same caching as the build job, keyed on the same mode (debug) --
-      # a PR run typically reuses the build job's warm tree on a persistent
-      # self-hosted runner.
+      # Exact main-ref debug trees may be reused after a fresh service restore.
+      # PR runs rebuild; old persistent-runner trees grant no provenance.
       - name: Restore build caches
+        id: build-cache
         uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: debug
@@ -471,6 +488,9 @@ jobs:
 
       # CI-6: run the Test::Nginx smoke suite against the built dynamic module.
       - name: Build dynamic module
+        env:
+          CI_BUILD_CACHE_HIT: ${{ steps.build-cache.outputs.exact-hit }}
+          CI_BUILD_CACHE_IDENTITY: ${{ steps.build-cache.outputs.identity }}
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION"
 
       # Verify BEFORE the bind, never after: max-port.sh proves the band is

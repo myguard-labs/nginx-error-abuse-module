@@ -47,20 +47,16 @@
 #                        writes+fsyncs (probe files, autoconf.err, Makefile
 #                        fragments) that gain nothing from durability --
 #                        objs/ is scratch, rebuilt from src/ on any failure.
-#                        `make`'s real compiled objects are what the
-#                        build-tree cache stores and later runs restore, so
-#                        that stays un-wrapped -- durability matters there.
-#   5. build tree     -- .build/<dir>-<mode>, skips configure+make when a
-#                        prior tree with an IDENTICAL configure invocation is
-#                        already present. Cached in CI via
-#                        .github/actions/build-cache, keyed on mode + version
-#                        + hashFiles(ci-build.sh, config, src/**) -- EXACT
-#                        MATCH ONLY, no restore-keys ladder (see that file
-#                        for why: a "close" build tree is the wrong tree).
-#   6. source tarball -- keyed on version alone (an upstream release tarball
-#                        never changes), sha256-verified after restore so a
-#                        poisoned or corrupted cache entry is caught, not
-#                        silently built.
+#                        `make` stays un-wrapped so build outputs retain
+#                        normal write semantics.
+#   5. source tarball -- digest-verified after every restore/download.
+#
+# Executable trees require a fresh exact Actions service restore on main from
+# a push, schedule or manual run. The action deletes disk state BEFORE restore,
+# uses an exact ref/input key without fallback, and forwards its hit and identity
+# only to the matching build step. A colocated identity alone grants no trust.
+# Other runs extract pinned source anew; ccache reuses compatible compilation.
+# Same-run consumers use producer-bound ci-build-artifact.sh artifacts.
 #
 # Compilation caches are opt-out via NO_CACHE=1, so a job can force a
 # from-scratch build without editing this script. Source verification is never
@@ -158,32 +154,12 @@ fi
 # asan/coverage job, so every mode (not just coverage) gets its own dir.
 # TEST_HARNESS=1 gets its own suffix for the same reason: it is an ADDITIVE
 # flag on top of any mode (see the CC_OPT append below), not a mode of its
-# own, but the shared .github/actions/build-cache key is keyed on mode alone
-# -- without a distinct suffix a harness-enabled debug tree and a plain debug
-# tree would collide on the SAME cache key and tree path, and whichever job
-# ran last would silently overwrite the other's objects.
+# own. Without a distinct suffix a harness-enabled debug tree and a plain
+# debug tree would overwrite each other's outputs. The exact build identity
+# below also includes this flag and the resulting configure arguments.
 DIR="${TARBALL_DIR}-${MODE}"
 if [ "${TEST_HARNESS:-0}" = "1" ]; then
     DIR="${DIR}-harness"
-fi
-
-mkdir -p "$ROOT"
-
-# --- source tarball, sha256-verified after restore --------------------------
-# Verification is outside the NO_CACHE condition on purpose. fetch-verify.sh
-# checks a restored archive before accepting a cache hit and checks a fresh
-# download before returning, so neither path can reach tar with unpinned bytes.
-if [ "$NO_CACHE" = "1" ]; then
-    rm -f "$ROOT/${TARBALL_DIR}.tar.gz"
-fi
-bash "$MODULE_DIR/.github/scripts/fetch-verify.sh" \
-    "$URL" "$EXPECTED_SHA256" "$ROOT/${TARBALL_DIR}.tar.gz"
-
-if [ "$NO_CACHE" = "1" ]; then
-    rm -rf "${ROOT:?}/${DIR:?}"
-fi
-if [ ! -d "$ROOT/$DIR" ]; then
-    tar -xzf "$ROOT/${TARBALL_DIR}.tar.gz" -C "$ROOT" --transform "s/^${TARBALL_DIR}/${DIR}/"
 fi
 
 CC_OPT="-DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
@@ -265,10 +241,6 @@ if [ "$NO_CACHE" != "1" ] && command -v ccache >/dev/null 2>&1; then
     # flags are part of CC_OPT/LD_OPT, which ccache also hashes, so an asan
     # object can never be served to a debug build (or vice versa) -- belt and
     # braces alongside the per-mode tree.
-    export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
-    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
-    export CCACHE_COMPILERCHECK=content
-    ccache --set-config=max_size="$CCACHE_MAXSIZE" 2>/dev/null || true
 fi
 # --- mold ---------------------------------------------------------------
 # Skipped under asan: the sanitizer runtimes want the default linker.
@@ -277,15 +249,72 @@ if [ "$NO_CACHE" != "1" ] && [ "$MODE" != "asan" ] \
     LD_OPT="$LD_OPT -fuse-ld=mold"
 fi
 
-cd "$ROOT/$DIR"
-
-# --- configure skip -------------------------------------------------------
-# configure is several seconds of SERIAL shell that ccache cannot touch.
-# Skip it when the resulting objs/Makefile was produced by an identical
-# invocation. Keying on the exact argv (not just version+mode) is what makes
-# this safe: change a flag, change the stamp, get a reconfigure.
 CONF_ARGS="--with-compat --with-debug --with-threads --with-http_realip_module --with-cc=${WITH_CC} --with-cc-opt=${CC_OPT} --with-ld-opt=${LD_OPT} ${ADD_MODULE}"
-STAMP="objs/.conf-stamp"
+BUILD_IDENTITY="$(bash "$MODULE_DIR/ci/tools/build-identity.sh" "$BASE_CC" \
+    "$FLAVOR" "$VERSION" "$EXPECTED_SHA256" "$MODE" "${TEST_HARNESS:-0}" "$CONF_ARGS")"
+if [[ "${CI_BUILD_IDENTITY_ONLY:-0}" == "1" ]]; then
+    printf '%s\n' "$BUILD_IDENTITY"
+    exit 0
+fi
+
+# This phase runs before the Actions cache lookup, even when restore is denied.
+# It cannot preserve a forged tree left behind by a persistent runner's old job.
+if [[ "${CI_BUILD_CACHE_PREPARE_ONLY:-0}" == "1" ]]; then
+    rm -rf "${ROOT:?}/${DIR:?}"
+    printf 'tree=%s\n' "$ROOT/$DIR" >> "${GITHUB_OUTPUT:?missing GITHUB_OUTPUT}"
+    printf '%s\n' "$BUILD_IDENTITY"
+    exit 0
+fi
+
+# Match the action's explicit producer allowlist. PR/PR-target runs, tags and
+# non-main refs may never execute a cross-run tree, even with a claimed hit.
+TRUSTED_CACHE=0
+case "${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
+    push:refs/heads/main|schedule:refs/heads/main|workflow_dispatch:refs/heads/main)
+        TRUSTED_CACHE=1 ;;
+esac
+if [[ "$NO_CACHE" != "1" && "$TRUSTED_CACHE" == "1" \
+    && "${CI_BUILD_CACHE_HIT:-}" == "true" \
+    && "$(bash "$MODULE_DIR/ci/tools/build-identity.sh" --executable-cache-eligible)" == true \
+    && "${CI_BUILD_CACHE_IDENTITY:-}" == "$BUILD_IDENTITY" \
+    && -f "$ROOT/$DIR/.build-identity" && ! -L "$ROOT/$DIR/.build-identity" \
+    && "$(cat "$ROOT/$DIR/.build-identity")" == "$BUILD_IDENTITY" \
+    && -f "$ROOT/$DIR/configure" && -f "$ROOT/$DIR/objs/Makefile" ]]; then
+    complete=1
+    if [[ "$MODE" != "asan" && "$MODE" != "coverage" ]]; then
+        output="$ROOT/$DIR/objs/ngx_http_error_abuse_module.so"
+        [[ -s "$output" && ! -L "$output" ]] || complete=0
+    fi
+    case "$MODE" in
+        debug|asan|coverage)
+            output="$ROOT/$DIR/objs/$BINARY"
+            [[ -s "$output" && -x "$output" && ! -L "$output" ]] || complete=0 ;;
+    esac
+    if [[ "$complete" == "1" ]]; then
+        printf 'build-cache: trusted exact service hit; reuse %s (identity=%s)\n' "$ROOT/$DIR" "$BUILD_IDENTITY"
+        exit 0
+    fi
+fi
+echo 'build-cache: rebuild (no eligible exact service hit with complete matching identity)'
+
+if [[ "$NO_CACHE" != "1" ]] && command -v ccache >/dev/null 2>&1; then
+    export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
+    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
+    export CCACHE_COMPILERCHECK=content
+    ccache --set-config=max_size="$CCACHE_MAXSIZE" 2>/dev/null || true
+fi
+
+mkdir -p "$ROOT"
+# Source archives are verified before extraction. Rejected executable trees
+# are discarded regardless of stamps, including on persistent runners.
+if [[ "$NO_CACHE" == "1" ]]; then
+    rm -f "$ROOT/${TARBALL_DIR}.tar.gz"
+fi
+bash "$MODULE_DIR/.github/scripts/fetch-verify.sh" \
+    "$URL" "$EXPECTED_SHA256" "$ROOT/${TARBALL_DIR}.tar.gz"
+rm -rf "${ROOT:?}/${DIR:?}"
+tar -xzf "$ROOT/${TARBALL_DIR}.tar.gz" -C "$ROOT" --transform "s/^${TARBALL_DIR}/${DIR}/"
+cd "$ROOT/$DIR"
 
 # --- eatmydata ------------------------------------------------------------
 # Wraps ./configure ONLY -- see the CACHING block header for why `make` and
@@ -301,22 +330,16 @@ if [ "$NO_CACHE" != "1" ] && [ "$MODE" != "asan" ] \
     EATMYDATA="eatmydata"
 fi
 
-if [ "$NO_CACHE" != "1" ] && [ -f objs/Makefile ] && [ -f "$STAMP" ] \
-   && [ "$(cat "$STAMP")" = "$CONF_ARGS" ]; then
-    echo "configure: cached (identical flags) -- skipping"
-else
-    # shellcheck disable=SC2086
-    $EATMYDATA ./configure \
-        --with-compat \
-        --with-debug \
-        --with-threads \
-        --with-http_realip_module \
-        --with-cc="$WITH_CC" \
-        --with-cc-opt="$CC_OPT" \
-        --with-ld-opt="$LD_OPT" \
-        "$ADD_MODULE"
-    printf '%s' "$CONF_ARGS" > "$STAMP"
-fi
+# shellcheck disable=SC2086
+$EATMYDATA ./configure \
+    --with-compat \
+    --with-debug \
+    --with-threads \
+    --with-http_realip_module \
+    --with-cc="$WITH_CC" \
+    --with-cc-opt="$CC_OPT" \
+    --with-ld-opt="$LD_OPT" \
+    "$ADD_MODULE"
 
 if [ "$MODE" != "asan" ] && [ "$MODE" != "coverage" ]; then
     make -j"$(nproc)" modules
@@ -347,3 +370,6 @@ if [ "$NO_CACHE" != "1" ] && command -v ccache >/dev/null 2>&1; then
     echo "--- ccache"
     ccache --show-stats 2>/dev/null | grep -Ei 'hits|misses|cache size' || true
 fi
+
+# Publish only after every requested make target succeeded.
+printf '%s\n' "$BUILD_IDENTITY" > .build-identity

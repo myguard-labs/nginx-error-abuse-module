@@ -1,103 +1,30 @@
-# sync-sha: 67b85c2033383359226a1cdec7d4cc241a7aaa77481144d5325cfcd14d180410
+# sync-sha: 9a23f7310e9771734d3948c65022d213fc32b6bf94f39183dc122627047dd677
 name: Build cache
-description: >-
-  Restore the ccache + nginx source/build caches for one build mode. Hybrid by
-  design: on a PERSISTENT self-hosted runner the on-disk dirs are already warm
-  and this is nearly a no-op; on an ephemeral or hosted runner actions/cache
-  repopulates them. Keep both paths -- see the "Why hybrid" note below.
+description: Restore verified archives, compiler objects and exact trusted-main trees.
 
 inputs:
   mode:
-    description: "Build mode: debug | asan | module | coverage. MUST match the ci-build.sh arg."
+    description: "Build mode, matching ci-build.sh."
     required: true
   nginx-version:
-    description: "pinned source version, e.g. 1.31.3"
+    description: "Pinned source version."
     required: true
   flavor:
-    description: "nginx (default) | angie -- MUST match the ci-build.sh arg."
+    description: "nginx or angie, matching ci-build.sh."
     required: false
     default: "nginx"
+
+outputs:
+  exact-hit:
+    description: Fresh exact executable-tree service restore, absent on denied runs.
+    value: ${{ steps.executable.outputs.cache-hit }}
+  identity:
+    description: Expected build identity calculated before restore.
+    value: ${{ steps.identity.outputs.build }}
 
 runs:
   using: composite
   steps:
-    # Why hybrid:
-    #   The self-hosted runners are persistent incus containers today, so
-    #   ~/.cache/ccache and .build/ survive between jobs on disk -- the fastest
-    #   possible cache, with no upload/download at all. But that is a property
-    #   of the CURRENT runner topology, not a guarantee, and hosted runners
-    #   (codeql.yml uses ubuntu-latest) never had it.
-    #
-    #   actions/cache is therefore the FALLBACK, not the primary. On a warm
-    #   persistent runner it costs one cheap key lookup; on an ephemeral one it
-    #   is the only thing standing between you and a cold build every job.
-    #   Deleting it "because the runners are persistent" is how this degrades
-    #   silently the day that stops being true.
-    #
-    # BEFORE YOU "FIX" A CACHE MISS ON A PR -- read this.
-    #   GitHub scopes caches BY REF. A PR run writes to refs/pull/N/merge, an
-    #   isolated scope; a branch run writes to refs/heads/<branch>. Neither can
-    #   read the other's entries. Only caches on the DEFAULT branch are
-    #   inherited by every other ref.
-    #
-    #   Consequence, and it is not a bug: the FIRST run of a new PR always
-    #   misses everything below. It has no scope to read from until main has
-    #   populated one via a push-to-main run. Re-running on the same ref (or
-    #   after the PR's own first run wrote its own scope) hits normally.
-
-    # ccache is keyed by CONTENT (CCACHE_COMPILERCHECK=content in ci-build.sh),
-    # so a toolchain or flag change invalidates individual objects on its own.
-    # The restore-keys ladder is safe here: a stale ccache can only ever cause a
-    # miss, never a wrong object -- the opposite of the build-tree cache below.
-    #
-    # github.sha is deliberately in the primary key even though it can never hit
-    # on the run that writes it: actions/cache only SAVES when the primary key
-    # missed, so a stable primary key would freeze the cache at its first
-    # contents and never fold in newly-compiled objects. A per-commit primary +
-    # a restore-keys ladder is the documented way to get a rolling cache.
-    - name: Restore ccache
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ~/.cache/ccache
-        key: ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ github.sha }}
-        restore-keys: |
-          ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-
-          ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-
-
-    # No restore-keys ladder: a "close" tarball is the wrong tarball. Include
-    # versions.env so replacing a digest for an unchanged version cannot keep
-    # restoring an archive from the old trust decision.
-    - name: Cache source tarball
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: .build/${{ inputs.flavor }}-${{ inputs.nginx-version }}.tar.gz
-        key: src-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ hashFiles('.github/versions.env') }}
-
-    # THE DANGEROUS ONE. The build tree holds compiled objects, and
-    # debug/asan/coverage/module objects are NOT interchangeable -- restoring a
-    # debug objs/ into an asan job yields a green sanitizer job that checks
-    # nothing.
-    #
-    # Two defences, deliberately redundant:
-    #   1. `mode` is in the key AND in the tree path (.build/nginx-<ver>-<mode>).
-    #   2. NO restore-keys ladder. A prefix match could hand this job a tree
-    #      built from different flags; an exact-match-or-nothing key means the
-    #      worst case is a cold build, never a wrong one.
-    # If you add restore-keys here to "improve the hit rate", you have
-    # reintroduced the bug. Don't.
-    - name: Cache build tree (exact-match only -- see comment)
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: .build/${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ inputs.mode }}
-        key: >-
-          buildtree-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ hashFiles('.github/versions.env', 'ci/tools/ci-build.sh', 'config', 'src/**') }}
-
-    # Package layer: check-before-install, NOT an actions/cache layer, and
-    # deliberately still not one -- actions/cache cannot safely cache
-    # /var/lib/dpkg, which is system-wide and shared by every job on the same
-    # persistent runner. `command -v` (not `dpkg -s`, which exits 0 even for a
-    # package left in "rc" state with its binary gone) skips the install only
-    # when the tool is actually usable.
     - name: Ensure ccache, mold and eatmydata are present
       shell: bash
       run: |
@@ -111,3 +38,79 @@ runs:
           sudo apt-get install -y "${need[@]}"
         fi
         ccache --version | head -1
+
+    - name: Prepare clean executable target and isolate compiler cache
+      id: identity
+      shell: bash
+      env:
+        BUILD_MODE: ${{ inputs.mode }}
+        BUILD_FLAVOR: ${{ inputs.flavor }}
+        BUILD_VERSION: ${{ inputs.nginx-version }}
+      run: |  # zizmor: ignore[github-env] -- CCACHE_DIR has a validated root and locally hashed leaf
+        set -euo pipefail
+        identity=$(CI_BUILD_CACHE_PREPARE_ONLY=1 bash ci/tools/ci-build.sh "$BUILD_FLAVOR" "$BUILD_VERSION" "$BUILD_MODE")
+        scope=$(printf '%s\n' "$GITHUB_REPOSITORY" "$GITHUB_REF" | sha256sum | cut -d' ' -f1)
+        echo "build=$identity" >> "$GITHUB_OUTPUT"
+        echo "scope=$scope" >> "$GITHUB_OUTPUT"
+        # Start empty even on persistent runners. PRs neither restore nor save
+        # compiler objects: ref-scoped Actions entries cannot cross into pushes,
+        # and no on-disk cache from an earlier job is accepted implicitly.
+        # Cache service versions include the path: keep it stable across runs,
+        # including compatible-object fallbacks after the build identity changes.
+        # Require a canonical absolute parent so cleanup cannot traverse a link,
+        # escape via .., or inject another GITHUB_ENV/output entry.
+        runner_temp=${RUNNER_TEMP:-}
+        if [[ "$runner_temp" != /* || "$runner_temp" == / ||
+              "$runner_temp" == *$'\n'* || "$runner_temp" == *$'\r'* ]] ||
+           [[ ! -d "$runner_temp" || "$runner_temp" != "$(realpath -e -- "$runner_temp")" ]]; then
+          echo "invalid RUNNER_TEMP for compiler cache" >&2
+          exit 2
+        fi
+        variant=$(printf '%s\0' "$BUILD_MODE" "$BUILD_FLAVOR" "$BUILD_VERSION" | sha256sum | cut -d' ' -f1)
+        cache_dir="$runner_temp/ea-ccache-$scope-$variant"
+        if [[ -L "$cache_dir" || ( -e "$cache_dir" && ! -d "$cache_dir" ) ]]; then
+          echo "unsafe compiler cache target" >&2
+          exit 2
+        fi
+        # Remove only this ref/variant's disk state; rm does not follow links
+        # inside the old directory. Other repositories and variants stay intact.
+        rm -rf -- "$cache_dir"
+        mkdir -m 700 -- "$cache_dir"
+        echo "CCACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
+        echo "path=$cache_dir" >> "$GITHUB_OUTPUT"
+
+    - name: Restore trusted-ref ccache
+      if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.identity.outputs.path }}
+        key: ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.identity.outputs.scope }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ steps.identity.outputs.build }}-${{ github.sha }}
+        # The wider fallback is compiler objects only: ccache checks compiler
+        # content, source/header bytes and flags for each object. It preserves
+        # compatible core objects after a module edit, within this trusted ref
+        # and variant. Executable trees never use a prefix fallback.
+        restore-keys: |
+          ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.identity.outputs.scope }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ steps.identity.outputs.build }}-
+          ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.identity.outputs.scope }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-
+
+    # Every restored archive is SHA-256 verified by fetch-verify.sh before tar.
+    - name: Cache source tarball
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .build/${{ inputs.flavor }}-${{ inputs.nginx-version }}.tar.gz
+        key: src-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ hashFiles('.github/versions.env') }}
+
+    # Only these events on the default branch may produce/consume executable
+    # caches. PR merge refs can shadow default-branch keys, so PRs are denied.
+    # The target was deleted above: no old disk tree can impersonate a restore.
+    # No prefix fallback: every executable byte requires the exact input key.
+    - name: Restore exact trusted-main executable tree
+      id: executable
+      if: >-
+        github.ref == 'refs/heads/main' &&
+        (github.event_name == 'push' || github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch')
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.identity.outputs.tree }}
+        key: executable-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.identity.outputs.scope }}-${{ steps.identity.outputs.build }}

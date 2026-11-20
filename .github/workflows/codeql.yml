@@ -1,4 +1,4 @@
-# sync-sha: 1cd025af72a0654a0da6f3f93ab3c6a7f97f9bdb8bd66f72c430b36fcdd517cd
+# sync-sha: b52c7dc0115967709bf7d8156bddc3e9e1deefbdf889f1aa2e8ddea28b735155
 name: CodeQL
 
 env:
@@ -10,9 +10,6 @@ env:
   # that claims to be the single source of truth was ignored.
 
 on:
-  schedule:
-    # Monthly, day 4 @ 04:47 UTC (staggered per repo like ci-deep).
-    - cron: "47 4 4 * *"
   workflow_dispatch: {}
   workflow_call: {}
 

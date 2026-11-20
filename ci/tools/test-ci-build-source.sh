@@ -17,7 +17,9 @@ WORK="$TMP/repo"
 FIXTURES="$TMP/fixtures"
 FAKEBIN="$TMP/bin"
 mkdir -p "$WORK/ci/tools" "$WORK/.github/scripts" "$FIXTURES" "$FAKEBIN"
-cp "$REPO_ROOT/ci/tools/ci-build.sh" "$WORK/ci/tools/"
+cp "$REPO_ROOT/ci/tools/ci-build.sh" "$REPO_ROOT/ci/tools/build-identity.sh" "$WORK/ci/tools/"
+mkdir -p "$WORK/src"
+: > "$WORK/config"
 cp "$REPO_ROOT/.github/scripts/fetch-verify.sh" "$WORK/.github/scripts/"
 
 make_archive() {

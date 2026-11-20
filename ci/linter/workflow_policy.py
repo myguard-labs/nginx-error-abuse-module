@@ -557,15 +557,15 @@ def check_docs() -> int:
         fuzz_data = load(fuzz_workflow)
         deep_data = load(deep_workflow)
         ci_jobs = ci_data.get("jobs") or {}
-        fuzz_job = ci_jobs.get("fuzzing") if isinstance(ci_jobs, dict) else None
         ci_events = events(ci_data)
         if "pull_request" not in ci_events:
             errors.append("ci.yml must retain the pull_request entry point")
-        if "pull_request" in ci_events and not (
-            isinstance(fuzz_job, dict)
-            and fuzz_job.get("uses") == "./.github/workflows/fuzzing.yml"
+        if isinstance(ci_jobs, dict) and any(
+            isinstance(job, dict)
+            and job.get("uses") == "./.github/workflows/fuzzing.yml"
+            for job in ci_jobs.values()
         ):
-            errors.append("ci.yml must call fuzzing.yml from its pull-request gate")
+            errors.append("ci.yml must not call monthly/manual fuzzing on PRs")
         fuzz_events = events(fuzz_data)
         if "workflow_call" not in fuzz_events or fuzz_events & {
             "push",
