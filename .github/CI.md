@@ -90,6 +90,13 @@ There is no automatic bump workflow: update the file with
 
 ## Local commands
 
+Local `ci/tools/ci-build.sh` runs require Debian dpkg tooling with `dpkg-query`
+on `PATH` and a readable package database. The installed package fingerprint is
+required for every local build, including `CI_BUILD_IDENTITY_ONLY=1` and
+`NO_CACHE=1`; these modes fail before fetching or building if the probe is
+unavailable or fails. Importing a verified producer artifact with
+`ci/tools/ci-build-artifact.sh import` does not probe the consumer's packages.
+
 ```bash
 # Build nginx mainline and the dynamic module.
 source .github/versions.env

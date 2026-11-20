@@ -70,6 +70,32 @@ identity() { CI_BUILD_IDENTITY_ONLY=1 bash ci/tools/ci-build.sh nginx 1.31.3 "${
 import_artifact() { bash ci/tools/ci-build-artifact.sh import 1.31.3 "$tmp/artifact"; }
 changed() { [[ "$1" != "$2" ]] || fail "identity did not change: $3"; }
 
+# Hide only dpkg-query; all other host tools and fixture commands remain usable.
+mkdir "$tmp/no-dpkg"
+for tool in /usr/bin/*; do
+    [[ "${tool##*/}" == dpkg-query ]] && continue
+    ln -s "$tool" "$tmp/no-dpkg/${tool##*/}"
+done
+for tool in "$tmp/bin/"*; do
+    ln -sf "$tool" "$tmp/no-dpkg/${tool##*/}"
+done
+missing_dpkg='build-identity: dpkg-query is required; install Debian dpkg tooling and ensure dpkg-query is on PATH'
+failed_dpkg='build-identity: dpkg-query failed; verify the Debian package database is readable'
+expect_package_failure() {
+    local probe_path="$1" message="$2" operations_before=''
+    shift 2
+    if [[ -e "$OPERATIONS" ]]; then operations_before="$(cat "$OPERATIONS")"; fi
+    PATH="$probe_path" expect_failure "$message" "$@"
+    if grep -Eq 'command not found|build-cache: trusted exact service hit; reuse|^[0-9a-f]{64}$' "$tmp/error"; then
+        fail 'package probe emitted command-not-found, identity or executable cache hit'
+    fi
+    [[ "$(cat "$OPERATIONS" 2>/dev/null || true)" == "$operations_before" ]] || fail 'package probe fetched/configured/built'
+}
+expect_package_failure "$tmp/no-dpkg" "$missing_dpkg" identity
+NO_CACHE=1 expect_package_failure "$tmp/no-dpkg" "$missing_dpkg" identity
+NO_CACHE=1 expect_package_failure "$tmp/no-dpkg" "$missing_dpkg" bash ci/tools/ci-build.sh nginx 1.31.3 asan
+[[ ! -e .build ]] || fail 'missing dpkg-query created a build tree'
+
 before="$(identity)"
 [[ "$before" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid build identity'
 [[ ! -e .build && ! -e "$OPERATIONS" ]] || fail 'identity probe built or fetched'
@@ -117,9 +143,10 @@ printf '#!/bin/sh\necho dependency=changed:arch\n' > "$tmp/bin/dpkg-query"
 chmod +x "$tmp/bin/dpkg-query"
 changed "$before" "$(identity)" dependencies
 rm "$tmp/bin/dpkg-query"
-printf '#!/bin/sh\necho dependency-query-failed >&2\nexit 2\n' > "$tmp/bin/dpkg-query"
+printf '#!/bin/sh\necho partial-package-output\necho dependency-query-failed >&2\nexit 2\n' > "$tmp/bin/dpkg-query"
 chmod +x "$tmp/bin/dpkg-query"
-expect_failure 'dependency-query-failed' identity
+expect_package_failure "$PATH" "$failed_dpkg" identity
+NO_CACHE=1 expect_package_failure "$PATH" "$failed_dpkg" bash ci/tools/ci-build.sh nginx 1.31.3 asan
 rm "$tmp/bin/dpkg-query"
 echo 'ok: deterministic identity and source/patch/pin/compiler/arch/dependency/config isolation'
 
@@ -261,6 +288,17 @@ bash ci/tools/ci-build.sh nginx 1.31.3 asan > "$tmp/unset-hit.out"
 cmp "$OPERATIONS" "$tmp/before-unset-hit" || fail 'unset overrides disabled exact hit'
 grep -Fq 'build-cache: trusted exact service hit; reuse' "$tmp/unset-hit.out" || fail 'unset overrides lost exact hit'
 echo 'ok: unset search/consumer overrides preserve trusted exact hit (zero fetch/configure/make)'
+# Neither an exact service hit nor artifact export may bypass host identity.
+expect_package_failure "$tmp/no-dpkg" "$missing_dpkg" bash ci/tools/ci-build.sh nginx 1.31.3 asan
+expect_package_failure "$tmp/no-dpkg" "$missing_dpkg" bash ci/tools/ci-build-artifact.sh export 1.31.3 "$tmp/rejected-artifact"
+printf '#!/bin/sh\necho partial-package-output\nexit 2\n' > "$tmp/bin/dpkg-query"
+chmod +x "$tmp/bin/dpkg-query"
+expect_package_failure "$PATH" "$failed_dpkg" bash ci/tools/ci-build.sh nginx 1.31.3 asan
+expect_package_failure "$PATH" "$failed_dpkg" bash ci/tools/ci-build-artifact.sh export 1.31.3 "$tmp/rejected-artifact"
+# Producer-bound consumers deliberately avoid probing the consumer host.
+PATH="$tmp/no-dpkg" import_artifact
+import_artifact
+rm "$tmp/bin/dpkg-query"
 prepare_restore
 CI_BUILD_CACHE_HIT=false expect_rebuild service-miss
 prepare_restore

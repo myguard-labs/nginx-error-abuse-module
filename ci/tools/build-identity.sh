@@ -38,6 +38,16 @@ fi
 
 compiler="${1:?compiler}"
 shift
+# Local identities always fingerprint installed Debian packages, including
+# identity-only and NO_CACHE builds. Portable artifact consumers exit above.
+if ! command -v dpkg-query >/dev/null 2>&1; then
+    echo 'build-identity: dpkg-query is required; install Debian dpkg tooling and ensure dpkg-query is on PATH' >&2
+    exit 2
+fi
+if ! packages="$(dpkg-query -W -f='${binary:Package}=${Version}:${Architecture}\n' 2>/dev/null)"; then
+    echo 'build-identity: dpkg-query failed; verify the Debian package database is readable' >&2
+    exit 2
+fi
 {
     printf 'build-identity-v1\0%s\0' "$PWD" "$@"
     printf '%s\0' "${CFLAGS:-}" "${CPPFLAGS:-}" "${LDFLAGS:-}" \
@@ -53,7 +63,7 @@ shift
     "$compiler" -dumpmachine
     # Include the installed headers/libraries and linker, rather than assuming
     # that equal runner labels imply equal dependency/toolchain versions.
-    dpkg-query -W -f='${binary:Package}=${Version}:${Architecture}\n' | sort
+    printf '%s\n' "$packages" | sort
     ld --version
     for tool in ccache mold; do
         if command -v "$tool" >/dev/null 2>&1; then
