@@ -139,8 +139,9 @@ def check(root):
         job = pr["jobs"].get(caller, {})
         expected = f"./.github/workflows/{caller}.yml"
         # build-test is named the same as its caller; no conditional green stub.
+        entry = caller in {"build-test", "lint"}
         if job.get("uses") != expected or (
-            "if" in job and job["if"] != "${{ !cancelled() }}"
+            (not entry or "if" in job) and job.get("if") != "${{ !cancelled() }}"
         ):
             errors.append(f"missing PR gate: {caller}")
         if caller in {"build-test", "lint"} and "needs" in job:
@@ -159,6 +160,8 @@ def check(root):
     ]
     if len(basic) != 1 or basic[0].get("continue-on-error", False) is not False:
         errors.append("required basic.t step can suppress failure")
+    if len(basic) == 1 and not healthy_fuzz_step_condition(basic[0]):
+        errors.append("required basic.t step cannot run")
     events = deep.get("on", deep.get(True, {}))
     if (
         not isinstance(events, dict)
@@ -253,12 +256,20 @@ def check(root):
         re.DOTALL,
     ) or not healthy_fuzz_step_condition(selectors[0]):
         errors.append("lost full fuzz duration")
+    if (
+        len(selectors) == 1
+        and preflight in commands
+        and fuzz["steps"].index(selectors[0]) > commands.index(preflight)
+    ):
+        errors.append("fuzz duration selected after budget preflight")
     for name, variable in (("memcheck", "USE_VALGRIND"), ("helgrind", "USE_HELGRIND")):
         soaks = [
             step
             for step in jobs.get(name, {}).get("steps", [])
             if re.search(
-                r'ci/tools/soak.sh\s+\\\s+"[^"\n]+" 600 4', str(step.get("run", ""))
+                r'^bash ci/tools/soak\.sh \\\n[ \t]*"[^"\n]+" 600 4[ \t]*$',
+                str(step.get("run", "")),
+                re.MULTILINE,
             )
         ]
         if not soaks:

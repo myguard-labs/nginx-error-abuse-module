@@ -127,7 +127,8 @@ visibly. Existing `snapshot-<suffix>.bin` names remain valid.
 
 The deep job has a total admission budget of **360 minutes on GitHub-hosted
 runners** and **600 minutes on self-hosted runners**. Before building,
-`python3 ci/fuzz/run.py "$FUZZ_SECS" --check-budget` counts all `fuzz_*.c`
+`python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT"
+--check-budget` counts all `fuzz_*.c`
 sources and regression fixtures, without needing binaries. Every normal runner
 invocation repeats the check before starting any replay or campaign. The requested
 per-target duration remains unchanged; an oversized request fails with the target

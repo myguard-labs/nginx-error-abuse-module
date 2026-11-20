@@ -19,6 +19,7 @@ def duration(value):
 RUNNER_BUDGETS = {"github-hosted": 360 * 60, "self-hosted": 600 * 60}
 JOB_OVERHEAD_SECONDS = 60 * 60  # setup, build, artifact upload and runner overhead
 TARGET_OVERHEAD_SECONDS = 120 + 2 * 60 + 600  # regression, exit grace, minimization
+MERGE_SECONDS = 600
 REPLAY_SECONDS = 60  # per fixture, replayed once in each pass
 
 
@@ -96,6 +97,7 @@ def minimize(binary, corpus, root):
             ],
             check=True,
             cwd=root,
+            timeout=MERGE_SECONDS,
         )
         # libFuzzer may retry a crashing merge worker and still exit zero.
         # Only this invocation's artifacts count; retain them for failure upload.
@@ -137,8 +139,17 @@ def run(root, seconds, merge=False, runner_class="github-hosted"):
     failures = []
     for binary, fixture in regressions:
         try:
-            subprocess.run([str(binary), str(fixture)], check=True, cwd=root)
-        except (OSError, subprocess.CalledProcessError) as exc:
+            subprocess.run(
+                [str(binary), str(fixture)],
+                check=True,
+                cwd=root,
+                timeout=REPLAY_SECONDS,
+            )
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             failures.append(exc)
     for binary, corpus, dictionary in selected.values():
         args = [
@@ -153,7 +164,11 @@ def run(root, seconds, merge=False, runner_class="github-hosted"):
             subprocess.run([*args, str(corpus)], check=True, cwd=root)
             if merge:
                 minimize(binary, corpus, root)
-        except (OSError, subprocess.CalledProcessError) as exc:
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             failures.append(exc)
     if failures:
         raise failures[0]
@@ -178,7 +193,12 @@ def main():
             check_budget(root, args.seconds, args.runner_class)
         else:
             run(root, args.seconds, args.merge, args.runner_class)
-    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+    except (
+        ValueError,
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         parser.exit(1, f"fuzz campaign failed: {exc}\n")
 
 

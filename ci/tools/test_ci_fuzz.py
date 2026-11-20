@@ -37,6 +37,52 @@ class FuzzTests(unittest.TestCase):
             (self.root / f"regressions/{name}-boundary.bin").touch()
         (self.root / "fuzz.dict").touch()
 
+    def test_documented_budget_command_matches_workflow(self):
+        repo = Path(__file__).resolve().parents[2]
+        command = 'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget'
+        documented = (repo / "ci/fuzz/README.md").read_text(encoding="utf-8")
+        self.assertIn(f"`{command}`", " ".join(documented.split()))
+
+    def test_replay_and_merge_timeout_continues_later_targets(self):
+        for phase in ("replay", "merge"):
+            with self.subTest(phase=phase):
+                error = subprocess.TimeoutExpired(
+                    phase, 60 if phase == "replay" else 600
+                )
+
+                def execute(args, phase=phase, error=error, **kwargs):
+                    if "-merge=1" in args:
+                        self.assertEqual(kwargs.get("timeout"), 600)
+                        if phase == "merge" and Path(args[0]).name == "fuzz_accept":
+                            raise error
+                    elif args[-1].endswith(".bin") and phase == "replay":
+                        self.assertEqual(kwargs.get("timeout"), 60)
+                        if Path(args[0]).name == "fuzz_accept":
+                            raise error
+
+                with (
+                    mock.patch.object(
+                        fuzz.subprocess, "run", side_effect=execute
+                    ) as run,
+                    self.assertRaises(subprocess.TimeoutExpired) as raised,
+                ):
+                    fuzz.run(self.root, "120", True)
+                self.assertIs(raised.exception, error)
+                self.assertEqual(run.call_count, 9)
+                self.assertEqual(Path(run.call_args.args[0][0]).name, "fuzz_statuses")
+                self.assertEqual(list(self.root.glob(".corpus*-*")), [])
+
+    def test_timeout_cli_reports_failure(self):
+        with (
+            mock.patch.object(
+                fuzz, "run", side_effect=subprocess.TimeoutExpired("replay", 60)
+            ),
+            mock.patch.object(sys, "argv", ["run.py", "120"]),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            fuzz.main()
+        self.assertEqual(raised.exception.code, 1)
+
     def test_all_targets_replay_full_duration_dictionary_and_merge(self):
         with mock.patch.object(fuzz.subprocess, "run") as run:
             fuzz.run(self.root, "3600", True)
@@ -81,7 +127,7 @@ class FuzzTests(unittest.TestCase):
         destinations = []
         for payload in (b"first", b"second"):
 
-            def execute(args, *, check, cwd, payload=payload):
+            def execute(args, *, check, cwd, payload=payload, **_kwargs):
                 self.assertTrue(check)
                 self.assertEqual(cwd, self.root)
                 if "-merge=1" in args:
@@ -977,9 +1023,8 @@ class FuzzMergeSanitizerTests(unittest.TestCase):
         original_run = subprocess.run
 
         def execute(*args, **kwargs):
-            result = original_run(
-                *args, **kwargs, capture_output=True, text=True, timeout=30
-            )
+            kwargs["timeout"] = 30  # Bound this single-input sanitizer diagnostic.
+            result = original_run(*args, **kwargs, capture_output=True, text=True)
             self.completed.append(result)
             return result
 

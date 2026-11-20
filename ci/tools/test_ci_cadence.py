@@ -27,16 +27,80 @@ class WorkflowFixture(unittest.TestCase):
 
     def replace(self, name, before, after):
         path = self.root / ".github/workflows" / name
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         self.assertIn(before, text)
-        path.write_text(text.replace(before, after))
+        path.write_text(text.replace(before, after), encoding="utf-8")
 
 
 class CadenceTests(WorkflowFixture):
     def update_workflow(self, name, update):
         doc = policy.load(self.root, name)
         update(doc)
-        (self.root / ".github/workflows" / name).write_text(yaml.safe_dump(doc))
+        (self.root / ".github/workflows" / name).write_text(
+            yaml.safe_dump(doc), encoding="utf-8"
+        )
+
+    def test_later_pr_callers_require_cancellation_guard(self):
+        for caller in policy.PR_JOBS.keys() - {"build-test", "lint"}:
+            with self.subTest(caller=caller):
+                path = self.root / ".github/workflows/ci.yml"
+                original = path.read_bytes()
+                self.update_workflow(
+                    "ci.yml", lambda doc, caller=caller: doc["jobs"][caller].pop("if")
+                )
+                self.assertIn(f"missing PR gate: {caller}", policy.check(self.root))
+                path.write_bytes(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_basic_test_disabled_condition_rejected(self):
+        for condition in (False, "false", "${{ false }}", "failure()", None):
+            with self.subTest(condition=condition):
+                self.update_workflow(
+                    "build-test.yml",
+                    lambda doc, condition=condition: next(
+                        step
+                        for step in doc["jobs"]["test-nginx"]["steps"]
+                        if step.get("name") == "Run ci/t/basic.t"
+                    ).update({"if": condition}),
+                )
+                self.assertIn(
+                    "required basic.t step cannot run", policy.check(self.root)
+                )
+
+    def test_selector_must_precede_budget(self):
+        def update(doc):
+            steps = doc["jobs"]["fuzz"]["steps"]
+            selector = next(
+                step for step in steps if step.get("name") == "Select fuzz duration"
+            )
+            steps.remove(selector)
+            preflight = next(
+                i
+                for i, step in enumerate(steps)
+                if step.get("name") == "Check total fuzz job budget"
+            )
+            steps.insert(preflight + 1, selector)
+
+        self.update_workflow("ci-deep.yml", update)
+        self.assertIn(
+            "fuzz duration selected after budget preflight", policy.check(self.root)
+        )
+
+    def test_comment_only_soak_rejected(self):
+        for name in ("memcheck", "helgrind"):
+
+            def update(doc, name=name):
+                step = next(
+                    step
+                    for step in doc["jobs"][name]["steps"]
+                    if "ci/tools/soak.sh" in step.get("run", "")
+                )
+                step["run"] = "\n".join(
+                    "# " + line for line in step["run"].splitlines()
+                )
+
+            self.update_workflow("ci-deep.yml", update)
+            self.assertIn(f"lost {name} full duration", policy.check(self.root))
 
     def test_pr_target_event_rejected(self):
         self.update_workflow(
@@ -86,7 +150,7 @@ class CadenceTests(WorkflowFixture):
 
     def test_soak_modes_and_healthy_execution(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         for name, variable in (
             ("memcheck", "USE_VALGRIND"),
             ("helgrind", "USE_HELGRIND"),
@@ -107,7 +171,7 @@ class CadenceTests(WorkflowFixture):
                         ).update({field: value}),
                     )
                     self.assertIn(error, policy.check(self.root))
-                    path.write_text(original)
+                    path.write_text(original, encoding="utf-8")
         self.assertEqual(
             policy.check(self.root), []
         )  # failure-only notifications remain valid
@@ -193,7 +257,7 @@ class CadenceTests(WorkflowFixture):
 
     def test_required_msvc_steps_must_run_when_healthy(self):
         name = "windows-msvc.yml"
-        original = (self.root / ".github/workflows" / name).read_text()
+        original = (self.root / ".github/workflows" / name).read_text(encoding="utf-8")
         required = (
             "Build",
             "Verify module and configuration controls",
@@ -214,12 +278,14 @@ class CadenceTests(WorkflowFixture):
                         f"MSVC native control cannot run: {control}",
                         policy.check(self.root),
                     )
-                    (self.root / ".github/workflows" / name).write_text(original)
+                    (self.root / ".github/workflows" / name).write_text(
+                        original, encoding="utf-8"
+                    )
         self.assertEqual(policy.check(self.root), [])
 
     def test_budget_and_discovery_cannot_override_selected_duration(self):
         name = "ci-deep.yml"
-        original = (self.root / ".github/workflows" / name).read_text()
+        original = (self.root / ".github/workflows" / name).read_text(encoding="utf-8")
         for phase in ("Check total fuzz job budget", "Fuzz each target"):
             for duration in ("60", "3600", "${{ inputs.fuzz_seconds }}"):
                 with self.subTest(phase=phase, duration=duration):
@@ -235,7 +301,9 @@ class CadenceTests(WorkflowFixture):
                         "fuzz phase overrides selected duration",
                         policy.check(self.root),
                     )
-                    (self.root / ".github/workflows" / name).write_text(original)
+                    (self.root / ".github/workflows" / name).write_text(
+                        original, encoding="utf-8"
+                    )
         self.assertEqual(policy.check(self.root), [])
 
     def test_pr_trigger_requires_main_without_source_filters(self):
@@ -302,13 +370,13 @@ class CadenceTests(WorkflowFixture):
 
     def test_public_load_is_fresh_and_preserves_errors(self):
         path = self.root / ".github/workflows/extra.yml"
-        path.write_text("value: first\n")
+        path.write_text("value: first\n", encoding="utf-8")
         first = policy.load(self.root, path.name)
         first["value"] = "caller mutation"
         self.assertEqual(policy.load(self.root, path.name), {"value": "first"})
-        path.write_text("value: second\n")
+        path.write_text("value: second\n", encoding="utf-8")
         self.assertEqual(policy.load(self.root, path.name), {"value": "second"})
-        path.write_text("invalid: [")
+        path.write_text("invalid: [", encoding="utf-8")
         with self.assertRaises(yaml.YAMLError):
             policy.load(self.root, path.name)
         path.unlink()
@@ -317,29 +385,32 @@ class CadenceTests(WorkflowFixture):
 
     def test_check_rejects_cached_recursive_and_escaping_calls(self):
         path = self.root / ".github/workflows/ci.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         outside = self.root / "outside.yml"
-        outside.write_text("jobs:\n  leaf:\n    runs-on: ubuntu-latest\n")
+        outside.write_text(
+            "jobs:\n  leaf:\n    runs-on: ubuntu-latest\n", encoding="utf-8"
+        )
         (path.parent / "escape.yml").symlink_to(outside)
         for target in ("ci.yml", "../outside.yml", "escape.yml"):
             with self.subTest(target=target):
                 path.write_text(
-                    original + f"\n  extra:\n    uses: ./.github/workflows/{target}\n"
+                    original + f"\n  extra:\n    uses: ./.github/workflows/{target}\n",
+                    encoding="utf-8",
                 )
                 with self.assertRaisesRegex(
                     policy.GraphError, "^invalid or recursive workflow call$"
                 ):
                     policy.check(self.root)
-        path.write_text(original)
+        path.write_text(original, encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_check_graph_load_errors_recover_on_next_invocation(self):
         path = self.root / ".github/workflows/build-test.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         for malformed in (True, False):
             with self.subTest(malformed=malformed):
                 if malformed:
-                    path.write_text("invalid: [")
+                    path.write_text("invalid: [", encoding="utf-8")
                 else:
                     path.unlink()
                 with self.assertRaises(policy.GraphError) as error:
@@ -351,14 +422,14 @@ class CadenceTests(WorkflowFixture):
                     error.exception.__cause__,
                     yaml.YAMLError if malformed else FileNotFoundError,
                 )
-                path.write_text(original)
+                path.write_text(original, encoding="utf-8")
                 self.assertEqual(policy.check(self.root), [])
 
     def set_events(self, name, events):
         path = self.root / ".github/workflows" / name
-        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
         doc["on"] = events
-        path.write_text(yaml.safe_dump(doc))
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     def test_primary_pr_event_forms_and_exact_names(self):
         for event in (
@@ -382,7 +453,9 @@ class CadenceTests(WorkflowFixture):
 
     def test_additional_pr_event_forms_and_exact_names(self):
         path = self.root / ".github/workflows/extra.yaml"
-        path.write_text("jobs:\n  ordinary:\n    runs-on: ubuntu-latest\n")
+        path.write_text(
+            "jobs:\n  ordinary:\n    runs-on: ubuntu-latest\n", encoding="utf-8"
+        )
         for event in (
             "pull_request",
             "pull_request_target",
@@ -421,7 +494,9 @@ class CadenceTests(WorkflowFixture):
 
     def test_malformed_event_shapes_fail_closed(self):
         for name in ("ci.yml", "codeql.yml", "ci-deep.yml"):
-            original = (self.root / ".github/workflows" / name).read_text()
+            original = (self.root / ".github/workflows" / name).read_text(
+                encoding="utf-8"
+            )
             for events in (
                 None,
                 False,
@@ -434,7 +509,9 @@ class CadenceTests(WorkflowFixture):
                     self.set_events(name, events)
                     with mock.patch.object(policy, "ROOT", self.root):
                         self.assertEqual(policy.main(), 2)
-                    (self.root / ".github/workflows" / name).write_text(original)
+                    (self.root / ".github/workflows" / name).write_text(
+                        original, encoding="utf-8"
+                    )
 
     def test_lost_pr_gate(self):
         self.replace("ci.yml", "  codeql:", "  renamed-codeql:")
@@ -449,7 +526,7 @@ class CadenceTests(WorkflowFixture):
 
     def test_required_fuzz_failure_suppression(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         for target in (
             "job",
             "--check-budget",
@@ -481,7 +558,7 @@ class CadenceTests(WorkflowFixture):
                     )
                     if value != "absent":
                         obj["continue-on-error"] = value
-                    path.write_text(yaml.safe_dump(doc))
+                    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
                     errors = policy.check(self.root)
                     if value == "absent" or value is False:
                         self.assertEqual(errors, [])
@@ -492,16 +569,16 @@ class CadenceTests(WorkflowFixture):
 
     def test_optional_fuzz_step_may_suppress_failure(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
         doc["jobs"]["fuzz"]["steps"].append(
             {"run": "echo optional", "continue-on-error": True}
         )
-        path.write_text(yaml.safe_dump(doc))
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_missing_runner_class_is_rejected_for_every_fuzz_phase(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         for command in (
             'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget',
             'python3 ci/fuzz/run.py 120 --runner-class "$RUNNER_ENVIRONMENT"',
@@ -512,18 +589,19 @@ class CadenceTests(WorkflowFixture):
                     original.replace(
                         command,
                         command.replace(' --runner-class "$RUNNER_ENVIRONMENT"', ""),
-                    )
+                    ),
+                    encoding="utf-8",
                 )
                 self.assertIn(
                     "lost fuzz regression/discovery or shared build",
                     policy.check(self.root),
                 )
-        path.write_text(original)
+        path.write_text(original, encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_budget_preflight_after_build_is_rejected(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         doc = yaml.load(original, Loader=WorkflowLoader)
         steps = doc["jobs"]["fuzz"]["steps"]
         preflight = next(
@@ -536,11 +614,11 @@ class CadenceTests(WorkflowFixture):
             if step.get("name") == "Build fuzz targets"
         )
         steps.insert(build + 1, preflight)
-        path.write_text(yaml.safe_dump(doc))
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
         self.assertIn(
             "lost fuzz regression/discovery or shared build", policy.check(self.root)
         )
-        path.write_text(original)
+        path.write_text(original, encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_lost_native_control(self):
@@ -571,20 +649,23 @@ class CadenceTests(WorkflowFixture):
     def test_direct_pr_entry_is_rejected(self):
         path = self.root / ".github/workflows/extra.yml"
         path.write_text(
-            "on: [pull_request]\njobs:\n  fuzz:\n    uses: ./.github/workflows/fuzzing.yml\n"
+            "on: [pull_request]\njobs:\n  fuzz:\n    uses: ./.github/workflows/fuzzing.yml\n",
+            encoding="utf-8",
         )
         errors = policy.check(self.root)
         self.assertIn("additional PR entry point: extra.yml", errors)
         self.assertTrue(any("PR-reachable fuzz/MSVC" in e for e in errors))
         path.write_text(
-            "on: pull_request_target\njobs:\n  msvc:\n    uses: ./.github/workflows/windows-msvc.yml\n"
+            "on: pull_request_target\njobs:\n  msvc:\n    uses: ./.github/workflows/windows-msvc.yml\n",
+            encoding="utf-8",
         )
         self.assertIn("additional PR entry point: extra.yml", policy.check(self.root))
 
     def test_additional_plain_pr_entry(self):
         path = self.root / ".github/workflows/extra.yaml"
         path.write_text(
-            "on: [pull_request]\njobs:\n  ordinary:\n    runs-on: ubuntu-latest\n"
+            "on: [pull_request]\njobs:\n  ordinary:\n    runs-on: ubuntu-latest\n",
+            encoding="utf-8",
         )
         self.assertIn("additional PR entry point: extra.yaml", policy.check(self.root))
 
@@ -595,7 +676,7 @@ class CadenceTests(WorkflowFixture):
 
     def test_monthly_fifth_leaf(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        with path.open("a") as stream:
+        with path.open("a", encoding="utf-8") as stream:
             stream.write("\n  fifth:\n    runs-on: ubuntu-latest\n")
         self.assertIn("ci-deep.yml: fifth concurrent leaf", policy.check(self.root))
 
@@ -627,7 +708,9 @@ class CadenceTests(WorkflowFixture):
         )
         self.replace("ci.yml", "  pull_request:", "  push:")
         # Unexpected serial work does not exceed width but must be rejected.
-        with (self.root / ".github/workflows/ci-deep.yml").open("a") as stream:
+        with (self.root / ".github/workflows/ci-deep.yml").open(
+            "a", encoding="utf-8"
+        ) as stream:
             stream.write("\n  extra:\n    needs: codeql\n    runs-on: ubuntu-latest\n")
         errors = policy.check(self.root)
         for expected in (
@@ -650,18 +733,97 @@ class CadenceTests(WorkflowFixture):
             self.assertEqual(policy.main(), 0)
             self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
             self.assertEqual(policy.main(), 1)
-            (self.root / ".github/workflows/ci-deep.yml").write_text("invalid: [")
+            (self.root / ".github/workflows/ci-deep.yml").write_text(
+                "invalid: [", encoding="utf-8"
+            )
             self.assertEqual(policy.main(), 2)
             (self.root / ".github/workflows/ci-deep.yml").unlink()
             self.assertEqual(policy.main(), 2)
 
 
+class StagedCadenceTests(WorkflowFixture):
+    def setUp(self):
+        super().setUp()
+        source = policy.ROOT
+        for name in (
+            "ci/linter/lib.sh",
+            "ci/linter/lint-ci-monthly.sh",
+            "ci/tools/check_ci_cadence.py",
+            "ci/tools/check_ci_graph.py",
+        ):
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / name, target)
+        self.git("init", "-q")
+        self.git("add", ".")
+        self.git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        )
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", *args], cwd=self.root, check=True, capture_output=True
+        )
+
+    def lint(self, mode="staged"):
+        index = self.root / ".git/index"
+        before = index.read_bytes()
+        result = subprocess.run(
+            ["bash", "ci/linter/lint-ci-monthly.sh"],
+            cwd=self.root,
+            env=dict(os.environ, LINT_MODE=mode),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(index.read_bytes(), before, "lint changed the raw index")
+        return result
+
+    def test_no_staged_workflow_skips_dirty_graph(self):
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        result = self.lint()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"no staged workflow", result.stdout)
+        self.assertEqual(self.lint("all").returncode, 1)
+
+    def test_complete_staged_graph_ignores_unstaged_corruption(self):
+        path = self.root / ".github/workflows/ci.yml"
+        path.write_bytes(path.read_bytes() + b"\n# staged change\n")
+        self.git("add", str(path))
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        result = self.lint()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lint("all").returncode, 1)
+
+    def test_staged_defect_cannot_be_hidden_by_worktree_fix(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_bytes()
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        self.git("add", str(path))
+        path.write_bytes(original)
+        result = self.lint()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"lost full fuzz duration", result.stderr)
+        self.assertEqual(self.lint("all").returncode, 0)
+
+    def test_staged_workflow_deletion_is_checked(self):
+        self.git("rm", ".github/workflows/windows.yml")
+        self.assertEqual(self.lint().returncode, 2)
+
+
 class HealthyPRConditionTests(WorkflowFixture):
     def set_job_condition(self, caller, name, condition):
         path = self.root / ".github/workflows" / f"{caller}.yml"
-        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
         doc["jobs"][name]["if"] = condition
-        path.write_text(yaml.safe_dump(doc))
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     def test_primary_runtime_failure_only_rejected(self):
         for condition in ("failure()", "${{ failure() }}"):
@@ -677,13 +839,13 @@ class HealthyPRConditionTests(WorkflowFixture):
             for name in sorted(children):
                 with self.subTest(caller=caller, name=name):
                     path = self.root / ".github/workflows" / f"{caller}.yml"
-                    original = path.read_text()
+                    original = path.read_text(encoding="utf-8")
                     self.set_job_condition(caller, name, "${{ failure() }}")
                     self.assertEqual(
                         policy.check(self.root),
                         [f"PR target cannot run on healthy PR: {caller}/{name}"],
                     )
-                    path.write_text(original)
+                    path.write_text(original, encoding="utf-8")
 
     def test_supported_healthy_conditions(self):
         for condition in (
@@ -718,7 +880,7 @@ class HealthyPRConditionTests(WorkflowFixture):
 
     def test_artifact_condition_requires_producer_dependency(self):
         path = self.root / ".github/workflows/asan.yml"
-        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
         reload = doc["jobs"]["asan-reload"]
         for needs in (None, [], "asan", ["asan"]):
             with self.subTest(needs=needs):
@@ -730,7 +892,7 @@ class HealthyPRConditionTests(WorkflowFixture):
                     needs in ("asan", ["asan"]),
                 )
         reload["needs"] = ["asan"]
-        path.write_text(yaml.safe_dump(doc))
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_false_and_malformed_child_conditions_fail_closed(self):
@@ -752,12 +914,12 @@ class HealthyPRConditionTests(WorkflowFixture):
 class FuzzJobAndOrderTests(WorkflowFixture):
     def test_fuzz_job_failure_guard_rejected(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         for condition in ("failure()", "${{ failure() }}"):
             with self.subTest(condition=condition):
                 doc = yaml.load(original, Loader=WorkflowLoader)
                 doc["jobs"]["fuzz"]["if"] = condition
-                path.write_text(yaml.safe_dump(doc))
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
                 self.assertEqual(
                     policy.check(self.root),
                     ["fuzz job cannot run on healthy monthly run"],
@@ -765,7 +927,7 @@ class FuzzJobAndOrderTests(WorkflowFixture):
 
     def test_fuzz_job_supported_and_unsupported_guards(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         for condition in (
             "success()",
             "always()",
@@ -775,7 +937,7 @@ class FuzzJobAndOrderTests(WorkflowFixture):
             with self.subTest(condition=condition):
                 doc = yaml.load(original, Loader=WorkflowLoader)
                 doc["jobs"]["fuzz"]["if"] = condition
-                path.write_text(yaml.safe_dump(doc))
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
                 self.assertEqual(policy.check(self.root), [])
         for condition in (
             False,
@@ -788,17 +950,17 @@ class FuzzJobAndOrderTests(WorkflowFixture):
             with self.subTest(condition=condition):
                 doc = yaml.load(original, Loader=WorkflowLoader)
                 doc["jobs"]["fuzz"]["if"] = condition
-                path.write_text(yaml.safe_dump(doc))
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
                 with self.assertRaisesRegex(
                     policy.GraphError, "unsupported job condition"
                 ):
                     policy.check(self.root)
-        path.write_text(original)
+        path.write_text(original, encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_fuzz_phase_order_and_cardinality(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         commands = FuzzStepConditionTests.COMMANDS
         ordered = (commands[3], commands[0], commands[1], commands[2])
         for action in ("swap01", "swap12", "swap23", "missing", "duplicate"):
@@ -821,12 +983,12 @@ class FuzzJobAndOrderTests(WorkflowFixture):
                     steps.pop(indices[2])
                 else:
                     steps.insert(indices[2], dict(steps[indices[2]]))
-                path.write_text(yaml.safe_dump(doc))
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
                 self.assertIn(
                     "lost fuzz regression/discovery or shared build",
                     policy.check(self.root),
                 )
-        path.write_text(original)
+        path.write_text(original, encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
 
@@ -840,24 +1002,24 @@ class FuzzStepConditionTests(WorkflowFixture):
 
     def set_step_condition(self, command, condition):
         path = self.root / ".github/workflows/ci-deep.yml"
-        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
         for step in doc["jobs"]["fuzz"]["steps"]:
             if step.get("run") == command:
                 step["if"] = condition
-        path.write_text(yaml.safe_dump(doc))
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     def test_disabled_fuzz_phases_rejected(self):
         for command in self.COMMANDS:
             for condition in (False, "false", "${{ false }}", "failure()"):
                 with self.subTest(command=command, condition=condition):
                     path = self.root / ".github/workflows/ci-deep.yml"
-                    original = path.read_text()
+                    original = path.read_text(encoding="utf-8")
                     self.set_step_condition(command, condition)
                     self.assertEqual(
                         policy.check(self.root),
                         [f"fuzz step cannot run on healthy monthly run: {command}"],
                     )
-                    path.write_text(original)
+                    path.write_text(original, encoding="utf-8")
 
     def test_supported_fuzz_conditions(self):
         for command in self.COMMANDS:
@@ -902,12 +1064,12 @@ class FuzzStepConditionTests(WorkflowFixture):
 
     def test_absent_condition_allowed_for_each_phase(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
         for step in doc["jobs"]["fuzz"]["steps"]:
             if step.get("run") in self.COMMANDS:
                 with self.subTest(command=step["run"]):
                     step.pop("if", None)
-                    path.write_text(yaml.safe_dump(doc))
+                    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
                     self.assertEqual(policy.check(self.root), [])
 
     def test_malformed_and_unsupported_fuzz_conditions_rejected(self):

@@ -481,9 +481,13 @@ class GraphTests(unittest.TestCase):
 
     def test_real_reload_diagnostics_condition(self):
         root = Path(__file__).resolve().parents[2]
-        jobs = check_ci_graph.yaml.safe_load(
-            (root / ".github/workflows/asan.yml").read_text()
-        )["jobs"]
+        with mock.patch.object(
+            check_ci_graph, "load_workflow", wraps=check_ci_graph.load_workflow
+        ) as load:
+            jobs = check_ci_graph.load_workflow(root / ".github/workflows/asan.yml")[
+                "jobs"
+            ]
+        load.assert_called_once_with(root / ".github/workflows/asan.yml")
         self.assertEqual(jobs["asan-reload"]["needs"], "asan")
         condition = jobs["asan-reload"].get("if", "success()")
         condition = condition.removeprefix("${{").removesuffix("}}").strip()
