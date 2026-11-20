@@ -67,13 +67,27 @@ def minimize(binary, corpus, root):
     pending = workspace / "new"
     previous = workspace / "previous"
     published = False
+    artifacts = None
     try:
         pending.mkdir()
+        artifacts = Path(
+            tempfile.mkdtemp(prefix=f"crash-merge-{binary.name}-", dir=root)
+        )
         subprocess.run(
-            [str(binary), "-merge=1", str(pending), str(corpus)],
+            [
+                str(binary),
+                "-merge=1",
+                str(pending),
+                str(corpus),
+                f"-artifact_prefix={artifacts}/",
+            ],
             check=True,
             cwd=root,
         )
+        # libFuzzer may retry a crashing merge worker and still exit zero.
+        # Only this invocation's artifacts count; retain them for failure upload.
+        if any(artifacts.iterdir()):
+            raise OSError(f"merge produced crash artifacts: {artifacts}")
         if minimized.exists() or minimized.is_symlink():
             minimized.rename(previous)
         try:
@@ -84,6 +98,8 @@ def minimize(binary, corpus, root):
             raise
         published = True
     finally:
+        if artifacts is not None and not any(artifacts.iterdir()):
+            artifacts.rmdir()
         # A failed rollback retains the previous corpus for recovery.
         if published or not (previous.exists() or previous.is_symlink()):
             shutil.rmtree(workspace)

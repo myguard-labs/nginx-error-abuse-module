@@ -1,4 +1,4 @@
-# sync-sha: 310f992e2f1dd64626d874b33ee2072994a02e40c8b1c66c704749f3030a8780
+# sync-sha: 79e13d3e6c2f4fe69967e66ce8fe3c253b35fb2bdf974c57419b51167542d0aa
 name: Build and Test
 
 env:
@@ -34,7 +34,7 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck libhiredis-dev python3-yaml shellcheck
+          sudo apt-get install -y clang cppcheck libclang-rt-dev libhiredis-dev python3-yaml shellcheck
 
       - name: Validate scripts and source
         run: |

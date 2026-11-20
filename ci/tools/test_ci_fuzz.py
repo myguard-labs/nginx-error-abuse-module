@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic fuzz orchestration controls; no actual fuzz campaign is run."""
+"""Fuzz orchestration controls, including a bounded real ASan merge probe."""
 
 import argparse
 import importlib.util
@@ -85,7 +85,7 @@ class FuzzTests(unittest.TestCase):
                 self.assertTrue(check)
                 self.assertEqual(cwd, self.root)
                 if "-merge=1" in args:
-                    pending, corpus = map(Path, args[2:])
+                    pending, corpus = map(Path, args[2:4])
                     self.assertEqual(list(pending.iterdir()), [])
                     self.assertEqual(pending.parent.parent, self.root)
                     self.assertNotEqual(pending, corpus.with_name(corpus.name + "-min"))
@@ -445,6 +445,56 @@ class FuzzTests(unittest.TestCase):
             runpy.run_path(str(Path(fuzz.__file__)), run_name="__main__")
         self.assertEqual(exit_.exception.code, 2)
 
+    def test_validation_installs_bounded_asan_probe_toolchain(self):
+        repo = Path(__file__).resolve().parents[2]
+        workflow = yaml.safe_load(
+            (repo / ".github/workflows/build-test.yml").read_text()
+        )
+        steps = workflow["jobs"]["validation"]["steps"]
+        install_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step["name"] == "Install validation tools"
+        )
+        validate_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step["name"] == "Validate scripts and source"
+        )
+        self.assertLess(install_index, validate_index)
+        validate = steps[validate_index]["run"]
+        invocation = "python3 ci/tools/test_ci_fuzz.py"
+        self.assertIn(invocation, validate)
+
+        def assert_toolchain_packages(document):
+            steps = document["jobs"]["validation"]["steps"]
+            install = next(
+                step["run"]
+                for step in steps
+                if step["name"] == "Install validation tools"
+            )
+            install_command = next(
+                line for line in install.splitlines() if "apt-get install" in line
+            )
+            packages = install_command.split("-y", 1)[1].split()
+            for package in ("clang", "libclang-rt-dev"):
+                self.assertIn(package, packages)
+
+        assert_toolchain_packages(workflow)
+        for missing_package in ("clang", "libclang-rt-dev"):
+            fixture = yaml.safe_load(yaml.safe_dump(workflow))
+            install_step = next(
+                step
+                for step in fixture["jobs"]["validation"]["steps"]
+                if step["name"] == "Install validation tools"
+            )
+            install_step["run"] = install_step["run"].replace(f" {missing_package}", "")
+            with (
+                self.subTest(missing_package=missing_package),
+                self.assertRaises(AssertionError),
+            ):
+                assert_toolchain_packages(fixture)
+
     def test_workflow_duration_selection(self):
         repo = Path(__file__).resolve().parents[2]
         doc = yaml.safe_load((repo / ".github/workflows/ci-deep.yml").read_text())
@@ -689,6 +739,100 @@ class FuzzTests(unittest.TestCase):
             self.assertRaises(subprocess.CalledProcessError),
         ):
             fuzz.run(self.root, "120")
+
+
+class FuzzMergeSanitizerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.build = Path(cls.tmp.name)
+        source = cls.build / "merge_probe.c"
+        source.write_text(
+            "#include <stdint.h>\n#include <stddef.h>\n"
+            "int LLVMFuzzerTestOneInput(const uint8_t *p, size_t n) {\n"
+            "  if (n && p[0] == 'B') { volatile int *q = (int *)0; *q = 1; }\n"
+            "  return 0;\n}\n"
+        )
+        cls.binary = cls.build / "merge_probe"
+        subprocess.run(
+            [
+                "clang",
+                "-g",
+                "-O1",
+                "-fsanitize=fuzzer,address",
+                str(source),
+                "-o",
+                str(cls.binary),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.corpus = self.root / "corpus"
+        self.corpus.mkdir()
+        self.minimized = self.root / "corpus-min"
+        self.minimized.mkdir()
+        (self.minimized / "previous.bin").write_bytes(b"previous")
+        self.completed = []
+        original_run = subprocess.run
+
+        def execute(*args, **kwargs):
+            result = original_run(
+                *args, **kwargs, capture_output=True, text=True, timeout=30
+            )
+            self.completed.append(result)
+            return result
+
+        patcher = mock.patch.object(fuzz.subprocess, "run", side_effect=execute)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_safe_merge_ignores_preexisting_crashes(self):
+        stale = self.root / "crash-unrelated"
+        stale.write_bytes(b"unrelated")
+        (self.corpus / "good").write_bytes(b"AA")
+        fuzz.minimize(self.binary, self.corpus, self.root)
+        self.assertEqual(self.completed[0].returncode, 0)
+        self.assertIn(b"AA", [p.read_bytes() for p in self.minimized.iterdir()])
+        self.assertFalse((self.minimized / "previous.bin").exists())
+        self.assertEqual(list(self.root.glob("crash-*")), [stale])
+        self.assertEqual(stale.read_bytes(), b"unrelated")
+        self.assertEqual(list(self.root.glob(".*-min-*")), [])
+
+    def test_sanitizer_merge_retains_exact_reproducer_and_previous_output(self):
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                (self.corpus / "bad").write_bytes(b"B")
+                if mixed:
+                    (self.corpus / "good").write_bytes(b"AA")
+                previous_artifacts = set(self.root.glob("crash-*"))
+                with self.assertRaisesRegex(OSError, "merge produced crash artifacts"):
+                    fuzz.minimize(self.binary, self.corpus, self.root)
+                self.assertEqual(self.completed[-1].returncode, 0)
+                self.assertIn("ERROR: AddressSanitizer:", self.completed[-1].stderr)
+                if mixed:
+                    self.assertIn(
+                        "MERGE-OUTER: successful in 2 attempt(s)",
+                        self.completed[-1].stderr,
+                    )
+                artifacts = set(self.root.glob("crash-*")) - previous_artifacts
+                self.assertEqual(len(artifacts), 1)
+                retained = [p for d in artifacts for p in d.rglob("*") if p.is_file()]
+                self.assertEqual([p.read_bytes() for p in retained], [b"B"])
+                self.assertEqual(
+                    list(self.minimized.iterdir()), [self.minimized / "previous.bin"]
+                )
+                self.assertEqual(
+                    (self.minimized / "previous.bin").read_bytes(), b"previous"
+                )
+                self.assertEqual(list(self.root.glob(".*-min-*")), [])
 
 
 if __name__ == "__main__":
