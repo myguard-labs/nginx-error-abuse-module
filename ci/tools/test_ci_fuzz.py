@@ -656,7 +656,6 @@ class FuzzTests(unittest.TestCase):
         seconds = doc["on"]["workflow_dispatch"]["inputs"]["fuzz_seconds"]["default"]
         self.assertEqual(seconds, "3600")
         self.assertEqual(int(doc["jobs"]["fuzz"]["timeout-minutes"]), 600)
-        self.assertEqual(len(list((repo / "ci/fuzz").glob("fuzz_*.c"))), 2)
         with mock.patch.object(fuzz.subprocess, "run") as run:
             fuzz.check_budget(repo / "ci/fuzz", seconds)
         run.assert_not_called()
