@@ -507,6 +507,20 @@ class FuzzTests(unittest.TestCase):
             ):
                 assert_toolchain_packages(fixture)
 
+    def test_validation_runs_namespace_controls(self):
+        repo = Path(__file__).resolve().parents[2]
+        workflow = yaml.safe_load(
+            (repo / ".github/workflows/build-test.yml").read_text()
+        )
+        validate = next(
+            step["run"]
+            for step in workflow["jobs"]["validation"]["steps"]
+            if step["name"] == "Validate scripts and source"
+        )
+        self.assertIn(
+            "python3 -m unittest ci.tools.test_fuzz_namespace", validate.splitlines()
+        )
+
     def test_workflow_duration_selection(self):
         repo = Path(__file__).resolve().parents[2]
         doc = yaml.safe_load((repo / ".github/workflows/ci-deep.yml").read_text())

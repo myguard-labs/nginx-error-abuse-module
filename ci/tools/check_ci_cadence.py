@@ -50,7 +50,7 @@ def healthy_pr_condition(caller, name, job):
     )
 
 
-def healthy_fuzz_step_condition(step):
+def healthy_fuzz_step_condition(step, *, success_only=False):
     """Recognize a bounded healthy-run grammar, not every Actions expression."""
     condition = step.get("if", "success()")
     if isinstance(condition, bool):
@@ -63,9 +63,12 @@ def healthy_fuzz_step_condition(step):
     # Permit redundant grouping around a single supported status/literal.
     while condition.startswith("(") and condition.endswith(")"):
         condition = condition[1:-1].strip()
+    pattern = r"success\s*\(\s*\)|true"
+    if not success_only:
+        pattern += r"|always\s*\(\s*\)|!\s*cancelled\s*\(\s*\)"
     return (
         re.fullmatch(
-            r"(?:success|always)\s*\(\s*\)|!\s*cancelled\s*\(\s*\)|true",
+            pattern,
             condition,
             re.IGNORECASE,
         )
@@ -175,7 +178,9 @@ def check(root):
     ):
         errors.append("lost fuzz regression/discovery or shared build")
     for step in fuzz.get("steps", []):
-        if step.get("run") in required_fuzz and not healthy_fuzz_step_condition(step):
+        if step.get("run") in required_fuzz and not healthy_fuzz_step_condition(
+            step, success_only=step.get("run") == discovery
+        ):
             errors.append(f"fuzz step cannot run on healthy monthly run: {step['run']}")
     if "FUZZ_SECS=3600" not in script(fuzz):
         errors.append("lost full fuzz duration")

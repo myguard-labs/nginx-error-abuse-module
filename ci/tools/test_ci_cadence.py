@@ -492,9 +492,28 @@ class FuzzStepConditionTests(WorkflowFixture):
                 "(success())",
                 "${{ (( always ( ) )) }}",
             ):
+                if (
+                    command == self.COMMANDS[2]
+                    and isinstance(condition, str)
+                    and (
+                        "cancelled" in condition.lower()
+                        or "always" in condition.lower()
+                    )
+                ):
+                    continue
                 with self.subTest(command=command, condition=condition):
                     self.set_step_condition(command, condition)
                     self.assertEqual(policy.check(self.root), [])
+
+    def test_discovery_rejects_failure_permitting_conditions(self):
+        command = self.COMMANDS[2]
+        for condition in ("!cancelled()", "${{ !cancelled() }}", "always()"):
+            with self.subTest(condition=condition):
+                self.set_step_condition(command, condition)
+                self.assertEqual(
+                    policy.check(self.root),
+                    [f"fuzz step cannot run on healthy monthly run: {command}"],
+                )
 
     def test_absent_condition_allowed_for_each_phase(self):
         path = self.root / ".github/workflows/ci-deep.yml"
@@ -534,7 +553,7 @@ class FuzzStepConditionTests(WorkflowFixture):
                 with mock.patch.object(policy, "ROOT", self.root):
                     self.assertEqual(policy.main(), 1)
 
-    def test_current_defaults_and_discovery_cancellation_guard(self):
+    def test_current_defaults_and_discovery_success_guard(self):
         doc = policy.load(self.root, "ci-deep.yml")
         conditions = {
             step["run"]: step.get("if", "success()")
@@ -546,7 +565,7 @@ class FuzzStepConditionTests(WorkflowFixture):
             {
                 self.COMMANDS[0]: "success()",
                 self.COMMANDS[1]: "success()",
-                self.COMMANDS[2]: "${{ !cancelled() }}",
+                self.COMMANDS[2]: "success()",
                 self.COMMANDS[3]: "success()",
             },
         )
