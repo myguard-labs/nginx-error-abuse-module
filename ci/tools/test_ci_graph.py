@@ -171,6 +171,62 @@ class GraphTests(unittest.TestCase):
     def test_real_graph(self):
         self.assertLessEqual(len(width(graph(Path(__file__).resolve().parents[2]))), 4)
 
+    def test_optional_loader_preserves_expansion_and_standalone_freshness(self):
+        self.write(
+            "ci.yml",
+            "jobs:\n  call:\n    uses: ./.github/workflows/child.yml\n"
+            "    strategy:\n      matrix:\n        slot: [one, two]\n",
+        )
+        self.write("child.yml", "jobs:\n  leaf:\n    runs-on: ubuntu-latest\n")
+        expected = {"call[0]/leaf[0]": set(), "call[1]/leaf[0]": set()}
+        loader = mock.Mock(
+            side_effect=lambda path: check_ci_graph.yaml.safe_load(path.read_text())
+        )
+        self.assertEqual(graph(self.root, document_loader=loader), expected)
+        self.assertEqual(
+            [call.args[0].name for call in loader.call_args_list],
+            ["ci.yml", "child.yml", "child.yml"],
+        )
+        self.assertEqual(graph(self.root), expected)
+        self.write("child.yml", "jobs:\n  changed:\n    runs-on: ubuntu-latest\n")
+        self.assertEqual(
+            graph(self.root),
+            {"call[0]/changed[0]": set(), "call[1]/changed[0]": set()},
+        )
+
+    def test_loader_cannot_bypass_confinement_or_recursion(self):
+        document = {"jobs": {"call": {"uses": "./.github/workflows/ci.yml"}}}
+        loader = mock.Mock(return_value=document)
+        with self.assertRaisesRegex(GraphError, "^invalid or recursive workflow call$"):
+            graph(self.root, document_loader=loader)
+        loader.assert_called_once_with(self.workflows / "ci.yml")
+        for entry in ("outside.yml", ".github/workflows/../../outside.yml"):
+            with self.subTest(entry=entry):
+                loader.reset_mock()
+                with self.assertRaisesRegex(
+                    GraphError, "^invalid or recursive workflow call$"
+                ):
+                    graph(self.root, entry, document_loader=loader)
+                loader.assert_not_called()
+
+    def test_loader_preserves_load_error_wrapping(self):
+        def loader(path):
+            return check_ci_graph.yaml.safe_load(path.read_text())
+
+        for body in (None, "invalid: [", "null", "other: value"):
+            with self.subTest(body=body):
+                if body is not None:
+                    self.write("ci.yml", body)
+                with self.assertRaises(GraphError) as standalone:
+                    graph(self.root)
+                with self.assertRaises(GraphError) as shared:
+                    graph(self.root, document_loader=loader)
+                self.assertEqual(str(shared.exception), str(standalone.exception))
+                self.assertEqual(
+                    type(shared.exception.__cause__),
+                    type(standalone.exception.__cause__),
+                )
+
     def test_four_and_injected_fifth_leaf(self):
         self.write(
             "ci.yml",

@@ -77,31 +77,47 @@ def healthy_fuzz_step_condition(step, *, success_only=False):
 
 
 def check(root):
+    # Documents live only for this invocation; traversal and validation still run
+    # for every call. Failed reads/parses never enter the cache.
+    documents = {}
+
+    def document(path):
+        key = path.resolve()
+        if key not in documents:
+            documents[key] = yaml.safe_load(path.read_text())
+        return documents[key]
+
+    def workflow(name):
+        return document(root / ".github/workflows" / name)
+
     errors = []
-    pr = load(root, "ci.yml")
-    deep = load(root, "ci-deep.yml")
+    pr = workflow("ci.yml")
+    deep = workflow("ci-deep.yml")
     for entry in ("ci.yml", "ci-deep.yml"):
-        if len(width(graph(root, ".github/workflows/" + entry))) > 4:
+        expanded = graph(root, ".github/workflows/" + entry, document_loader=document)
+        if len(width(expanded)) > 4:
             errors.append(f"{entry}: fifth concurrent leaf")
     # Expand every call, including nested/matrix calls. A renamed caller cannot
     # hide fuzz or MSVC; command signatures also reject an inline transplant.
-    leaves = graph(root)
+    leaves = graph(root, document_loader=document)
     for path in sorted((root / ".github/workflows").glob("*.y*ml")):
         if path.name == "ci.yml":
             continue
-        doc = yaml.safe_load(path.read_text())
+        doc = document(path)
         triggers = event_names(doc)
         if any(event in triggers for event in ("pull_request", "pull_request_target")):
             errors.append(f"additional PR entry point: {path.name}")
             # Also inspect every independently PR-reachable leaf, not only ci.yml.
-            for leaf in graph(root, str(path.relative_to(root))):
+            for leaf in graph(
+                root, str(path.relative_to(root)), document_loader=document
+            ):
                 if re.search(r"fuzz|msvc", path.name + leaf, re.IGNORECASE):
                     errors.append(f"PR-reachable fuzz/MSVC: {path.name}/{leaf}")
     for leaf in leaves:
         parts = re.findall(r"([^/]+?)\[\d+\]", leaf)
         name = "ci.yml"
         for part in parts:
-            job = load(root, name)["jobs"][part]
+            job = workflow(name)["jobs"][part]
             if "uses" in job:
                 name = Path(job["uses"]).name
         if re.search(r"fuzz|msvc", leaf + name, re.IGNORECASE) or re.search(
@@ -120,7 +136,7 @@ def check(root):
             and job["if"] != "${{ !cancelled() }}"
         ):
             errors.append(f"missing PR gate: {caller}")
-        children = load(root, f"{caller}.yml")["jobs"]
+        children = workflow(f"{caller}.yml")["jobs"]
         actual = set(children)
         if actual != required:
             errors.append(f"lost or unexpected PR target: {caller}: {actual}")
@@ -134,7 +150,7 @@ def check(root):
         or events.get("schedule") != [{"cron": "30 3 4 * *"}]
     ):
         errors.append("monthly/manual trigger contract")
-    codeql = load(root, "codeql.yml")
+    codeql = workflow("codeql.yml")
     if "schedule" in event_names(codeql):
         errors.append("duplicate CodeQL schedule")
     jobs = deep["jobs"]
@@ -142,7 +158,7 @@ def check(root):
         errors.append("lost or unexpected monthly target")
     if jobs.get("msvc", {}).get("uses") != "./.github/workflows/windows-msvc.yml":
         errors.append("missing monthly MSVC")
-    msvc = load(root, "windows-msvc.yml")["jobs"]
+    msvc = workflow("windows-msvc.yml")["jobs"]
     required_steps = {
         "Build",
         "Verify module and configuration controls",

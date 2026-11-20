@@ -60,7 +60,7 @@ def matrix_size(job):
     return count
 
 
-def graph(root, entry=".github/workflows/ci.yml"):
+def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
     root = Path(root).resolve()
     edges = {}
 
@@ -69,7 +69,11 @@ def graph(root, entry=".github/workflows/ci.yml"):
         if not path.is_relative_to(root / ".github/workflows") or path in stack:
             raise GraphError("invalid or recursive workflow call")
         try:
-            doc = yaml.safe_load(path.read_text())
+            doc = (
+                yaml.safe_load(path.read_text())
+                if document_loader is None
+                else document_loader(path)
+            )
             jobs = doc["jobs"]
         except (OSError, yaml.YAMLError, KeyError, TypeError) as exc:
             raise GraphError(f"cannot load {path}: {exc}") from exc

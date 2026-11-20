@@ -32,6 +32,79 @@ class CadenceTests(WorkflowFixture):
     def test_real_contract(self):
         self.assertEqual(policy.check(self.root), [])
 
+    def test_each_workflow_parsed_once_per_check(self):
+        expected = set((self.root / ".github/workflows").glob("*.y*ml"))
+        with (
+            mock.patch.object(yaml, "safe_load", wraps=yaml.safe_load) as parse,
+            mock.patch.object(
+                Path, "read_text", autospec=True, side_effect=Path.read_text
+            ) as read,
+        ):
+            self.assertEqual(policy.check(self.root), [])
+        paths = [call.args[0] for call in read.call_args_list]
+        self.assertEqual(set(paths), expected)
+        self.assertEqual(parse.call_count, len(expected), "one parse per workflow")
+        self.assertEqual(len(paths), len(expected), "one read per workflow")
+
+    def test_check_reloads_changed_workflow(self):
+        self.assertEqual(policy.check(self.root), [])
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        self.assertEqual(policy.check(self.root), ["lost full fuzz duration"])
+
+    def test_public_load_is_fresh_and_preserves_errors(self):
+        path = self.root / ".github/workflows/extra.yml"
+        path.write_text("value: first\n")
+        first = policy.load(self.root, path.name)
+        first["value"] = "caller mutation"
+        self.assertEqual(policy.load(self.root, path.name), {"value": "first"})
+        path.write_text("value: second\n")
+        self.assertEqual(policy.load(self.root, path.name), {"value": "second"})
+        path.write_text("invalid: [")
+        with self.assertRaises(yaml.YAMLError):
+            policy.load(self.root, path.name)
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            policy.load(self.root, path.name)
+
+    def test_check_rejects_cached_recursive_and_escaping_calls(self):
+        path = self.root / ".github/workflows/ci.yml"
+        original = path.read_text()
+        outside = self.root / "outside.yml"
+        outside.write_text("jobs:\n  leaf:\n    runs-on: ubuntu-latest\n")
+        (path.parent / "escape.yml").symlink_to(outside)
+        for target in ("ci.yml", "../outside.yml", "escape.yml"):
+            with self.subTest(target=target):
+                path.write_text(
+                    original + f"\n  extra:\n    uses: ./.github/workflows/{target}\n"
+                )
+                with self.assertRaisesRegex(
+                    policy.GraphError, "^invalid or recursive workflow call$"
+                ):
+                    policy.check(self.root)
+        path.write_text(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_check_graph_load_errors_recover_on_next_invocation(self):
+        path = self.root / ".github/workflows/build-test.yml"
+        original = path.read_text()
+        for malformed in (True, False):
+            with self.subTest(malformed=malformed):
+                if malformed:
+                    path.write_text("invalid: [")
+                else:
+                    path.unlink()
+                with self.assertRaises(policy.GraphError) as error:
+                    policy.check(self.root)
+                self.assertTrue(
+                    str(error.exception).startswith(f"cannot load {path}: ")
+                )
+                self.assertIsInstance(
+                    error.exception.__cause__,
+                    yaml.YAMLError if malformed else FileNotFoundError,
+                )
+                path.write_text(original)
+                self.assertEqual(policy.check(self.root), [])
+
     def set_events(self, name, events):
         path = self.root / ".github/workflows" / name
         doc = yaml.safe_load(path.read_text())
