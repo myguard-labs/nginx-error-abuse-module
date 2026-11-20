@@ -1,4 +1,4 @@
-# sync-sha: 510f12abf54465e7a9e3f60478a9bd9ae685be16240e32c65bf74acb87ce8826
+# sync-sha: 4d898c99ce66f460cb146a739dbd1ff48a64c3794c117bf3068bcce6aa67fb03
 name: Windows MSVC
 
 on:
@@ -267,13 +267,17 @@ jobs:
             if ((Status) -ne 404 -or (Status) -ne 404) {
               throw 'requests before the threshold did not return 404'
             }
+            $snapshotReady = $false
             foreach ($i in 1..40) {
-              if ((Test-Path $snapshot) -and (Get-Item $snapshot).Length -gt 24) {
-                break
+              try {
+                $snapshotReady = (Get-Item -LiteralPath $snapshot -ErrorAction Stop).Length -gt 24
+              } catch {
+                # Windows replacement can briefly hide or lock the snapshot.
               }
+              if ($snapshotReady) { break }
               Start-Sleep -Milliseconds 250
             }
-            if (-not (Test-Path $snapshot) -or (Get-Item $snapshot).Length -le 24) {
+            if (-not $snapshotReady) {
               throw 'populated snapshot was not written'
             }
             $owners = @(Select-String -Path logs/error.log -SimpleMatch `
