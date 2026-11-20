@@ -341,6 +341,16 @@ class FuzzTests(unittest.TestCase):
                 finally:
                     fixture.unlink()
 
+    def test_regression_directory_fails_before_any_execution(self):
+        fixture = self.root / "regressions" / "snapshot-extra.bin"
+        fixture.mkdir()
+        with (
+            mock.patch.object(fuzz.subprocess, "run") as run,
+            self.assertRaisesRegex(ValueError, "regression is not a file"),
+        ):
+            fuzz.run(self.root, "120")
+        run.assert_not_called()
+
     def test_duration_boundaries_and_errors(self):
         for value in ("1", "3600", "86400", "00001"):
             self.assertEqual(fuzz.duration(value), value)

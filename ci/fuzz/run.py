@@ -118,6 +118,8 @@ def run(root, seconds, merge=False, runner_class="github-hosted"):
     names = sorted(selected, key=len, reverse=True)
     regressions = []
     for fixture in sorted((root / "regressions").glob("*.bin")):
+        if not fixture.is_file():
+            raise ValueError(f"regression is not a file: {fixture.name}")
         name = next(
             (name for name in names if fixture.name.startswith(f"{name}-")), None
         )
