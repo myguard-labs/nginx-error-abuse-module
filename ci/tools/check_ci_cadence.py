@@ -158,18 +158,18 @@ def check(root):
         errors.append("lost monthly CodeQL")
     fuzz = jobs.get("fuzz", {})
     commands = [step.get("run") for step in fuzz.get("steps", [])]
-    if (
-        commands.count('bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"') != 1
-        or "python3 ci/fuzz/run.py 120" not in commands
-        or 'python3 ci/fuzz/run.py "$FUZZ_SECS" --merge' not in commands
+    build = 'bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"'
+    preflight = 'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget'
+    regression = 'python3 ci/fuzz/run.py 120 --runner-class "$RUNNER_ENVIRONMENT"'
+    discovery = 'python3 ci/fuzz/run.py "$FUZZ_SECS" --merge --runner-class "$RUNNER_ENVIRONMENT"'
+    required_fuzz = (preflight, build, regression, discovery)
+    if any(commands.count(command) != 1 for command in required_fuzz) or (
+        all(command in commands for command in required_fuzz)
+        and commands.index(preflight) > commands.index(build)
     ):
         errors.append("lost fuzz regression/discovery or shared build")
     for step in fuzz.get("steps", []):
-        if step.get("run") in {
-            'bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"',
-            "python3 ci/fuzz/run.py 120",
-            'python3 ci/fuzz/run.py "$FUZZ_SECS" --merge',
-        } and not healthy_fuzz_step_condition(step):
+        if step.get("run") in required_fuzz and not healthy_fuzz_step_condition(step):
             errors.append(f"fuzz step cannot run on healthy monthly run: {step['run']}")
     if "FUZZ_SECS=3600" not in script(fuzz):
         errors.append("lost full fuzz duration")

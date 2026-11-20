@@ -15,15 +15,18 @@ def duration(value):
     return value
 
 
-# Admission allowances for ci-deep's 600-minute job, including both passes.
-# The workflow timeout remains the hard deadline if a phase exceeds its reserve.
-JOB_BUDGET_SECONDS = 600 * 60
+# Admission allowances include both passes and the runner-specific job limit.
+RUNNER_BUDGETS = {"github-hosted": 360 * 60, "self-hosted": 600 * 60}
 JOB_OVERHEAD_SECONDS = 60 * 60  # setup, build, artifact upload and runner overhead
 TARGET_OVERHEAD_SECONDS = 120 + 2 * 60 + 600  # regression, exit grace, minimization
 REPLAY_SECONDS = 60  # per fixture, replayed once in each pass
 
 
-def check_budget(root, seconds):
+def check_budget(root, seconds, runner_class="github-hosted"):
+    duration(seconds)
+    if runner_class not in RUNNER_BUDGETS:
+        raise ValueError(f"unknown runner class: {runner_class}")
+    budget = RUNNER_BUDGETS[runner_class]
     # Count source files so the workflow can reject excess before building.
     count = len(list(root.glob("fuzz_*.c")))
     if not count:
@@ -35,11 +38,11 @@ def check_budget(root, seconds):
         + 2 * replay_count * REPLAY_SECONDS
     )
     required = overhead + count * int(seconds)
-    if required > JOB_BUDGET_SECONDS:
-        maximum = max(0, (JOB_BUDGET_SECONDS - overhead) // count)
+    if required > budget:
+        maximum = max(0, (budget - overhead) // count)
         raise ValueError(
             f"total job budget exceeded: {required}s required for {count} targets "
-            f"including regression and overhead; limit {JOB_BUDGET_SECONDS}s; "
+            f"including regression and overhead; limit {budget}s; "
             f"maximum discovery duration is {maximum}s/target"
         )
 
@@ -105,7 +108,8 @@ def minimize(binary, corpus, root):
             shutil.rmtree(workspace)
 
 
-def run(root, seconds, merge=False):
+def run(root, seconds, merge=False, runner_class="github-hosted"):
+    check_budget(root, seconds, runner_class)
     selected = targets(root)
     # Validate all routing before replay or campaigns. The longest registered
     # prefix keeps overlapping, hyphenated target names unambiguous.
@@ -118,7 +122,6 @@ def run(root, seconds, merge=False):
         if name is None or fixture.stem in selected or fixture.name == f"{name}-.bin":
             raise ValueError(f"regression has no target: {fixture.name}")
         regressions.append((selected[name][0], fixture))
-    check_budget(root, seconds)
     failures = []
     for binary, fixture in regressions:
         try:
@@ -149,6 +152,9 @@ def main():
     parser.add_argument("seconds", type=duration)
     parser.add_argument("--merge", action="store_true")
     parser.add_argument(
+        "--runner-class", choices=RUNNER_BUDGETS, default="github-hosted"
+    )
+    parser.add_argument(
         "--check-budget",
         action="store_true",
         help="validate the complete deep-job allowance from sources without running targets",
@@ -157,9 +163,9 @@ def main():
     try:
         root = Path(__file__).resolve().parent
         if args.check_budget:
-            check_budget(root, args.seconds)
+            check_budget(root, args.seconds, args.runner_class)
         else:
-            run(root, args.seconds, args.merge)
+            run(root, args.seconds, args.merge, args.runner_class)
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"fuzz campaign failed: {exc}\n")
 

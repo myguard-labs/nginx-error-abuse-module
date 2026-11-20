@@ -1,4 +1,4 @@
-# sync-sha: f1971d0223cea2445b4e2be00b2715041e6c8f5cb4408348c3093e3f42860124
+# sync-sha: 970c63b1c3510e36ba65ed2264f7e67fc2082092b37064a7d62f59a81501ff77
 name: CI Deep
 
 # Monthly/manual orchestrator: fuzz regression + discovery; MSVC then Memcheck;
@@ -115,20 +115,20 @@ jobs:
             printf 'FUZZ_SECS=3600\n' >> "$GITHUB_ENV"
           fi
 
-      # Includes both serial passes, every discovered target, fixture replay,
-      # minimization and setup/upload allowances within this 600-minute job.
+      # Includes both passes, targets, replay, minimization and setup/upload
+      # within the actual runner class limit.
       - name: Check total fuzz job budget
-        run: python3 ci/fuzz/run.py "$FUZZ_SECS" --check-budget
+        run: python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget
 
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
       - name: Fuzz regression (120s/target)
-        run: python3 ci/fuzz/run.py 120
+        run: python3 ci/fuzz/run.py 120 --runner-class "$RUNNER_ENVIRONMENT"
 
       - name: Fuzz each target
         if: ${{ !cancelled() }}
-        run: python3 ci/fuzz/run.py "$FUZZ_SECS" --merge
+        run: python3 ci/fuzz/run.py "$FUZZ_SECS" --merge --runner-class "$RUNNER_ENVIRONMENT"
 
       - name: Upload regression crash artifacts
         if: failure()

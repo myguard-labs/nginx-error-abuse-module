@@ -114,6 +114,50 @@ class CadenceTests(WorkflowFixture):
             "lost fuzz regression/discovery or shared build", policy.check(self.root)
         )
 
+    def test_missing_runner_class_is_rejected_for_every_fuzz_phase(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_text()
+        for command in (
+            'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget',
+            'python3 ci/fuzz/run.py 120 --runner-class "$RUNNER_ENVIRONMENT"',
+            'python3 ci/fuzz/run.py "$FUZZ_SECS" --merge --runner-class "$RUNNER_ENVIRONMENT"',
+        ):
+            with self.subTest(command=command):
+                path.write_text(
+                    original.replace(
+                        command,
+                        command.replace(' --runner-class "$RUNNER_ENVIRONMENT"', ""),
+                    )
+                )
+                self.assertIn(
+                    "lost fuzz regression/discovery or shared build",
+                    policy.check(self.root),
+                )
+        path.write_text(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_budget_preflight_after_build_is_rejected(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_text()
+        doc = yaml.safe_load(original)
+        steps = doc["jobs"]["fuzz"]["steps"]
+        preflight = next(
+            step for step in steps if step.get("name") == "Check total fuzz job budget"
+        )
+        steps.remove(preflight)
+        build = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Build fuzz targets"
+        )
+        steps.insert(build + 1, preflight)
+        path.write_text(yaml.safe_dump(doc))
+        self.assertIn(
+            "lost fuzz regression/discovery or shared build", policy.check(self.root)
+        )
+        path.write_text(original)
+        self.assertEqual(policy.check(self.root), [])
+
     def test_lost_native_control(self):
         self.replace(
             "windows-msvc.yml",
@@ -323,8 +367,9 @@ class HealthyPRConditionTests(WorkflowFixture):
 class FuzzStepConditionTests(WorkflowFixture):
     COMMANDS = (
         'bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"',
-        "python3 ci/fuzz/run.py 120",
-        'python3 ci/fuzz/run.py "$FUZZ_SECS" --merge',
+        'python3 ci/fuzz/run.py 120 --runner-class "$RUNNER_ENVIRONMENT"',
+        'python3 ci/fuzz/run.py "$FUZZ_SECS" --merge --runner-class "$RUNNER_ENVIRONMENT"',
+        'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget',
     )
 
     def set_step_condition(self, command, condition):
@@ -421,6 +466,7 @@ class FuzzStepConditionTests(WorkflowFixture):
                 self.COMMANDS[0]: "success()",
                 self.COMMANDS[1]: "success()",
                 self.COMMANDS[2]: "${{ !cancelled() }}",
+                self.COMMANDS[3]: "success()",
             },
         )
         self.assertEqual(policy.check(self.root), [])

@@ -548,6 +548,94 @@ class FuzzTests(unittest.TestCase):
         (self.root / "fuzz_accept.c").unlink()
         (self.root / "regressions/accept-boundary.bin").unlink()
 
+    def test_runner_class_budget_boundaries_and_invalid_inputs(self):
+        self.budget_pair()
+        for fixture in (self.root / "regressions").glob("*.bin"):
+            fixture.unlink()
+        for runner, accepted, rejected in (
+            ("github-hosted", "8160", "8161"),
+            ("self-hosted", "15360", "15361"),
+        ):
+            for seconds in ("3600", accepted):
+                with self.subTest(runner=runner, seconds=seconds):
+                    fuzz.check_budget(self.root, seconds, runner)
+            with (
+                self.subTest(runner=runner, seconds=rejected),
+                mock.patch.object(fuzz.subprocess, "run") as run,
+                self.assertRaisesRegex(ValueError, "total job budget"),
+            ):
+                fuzz.run(self.root, rejected, runner_class=runner)
+            run.assert_not_called()
+        for runner, seconds in (
+            ("unknown", "3600"),
+            ("GitHub-hosted", "3600"),
+            ("", "3600"),
+            ("self-hosted", "1\nPATH=x"),
+        ):
+            with (
+                self.subTest(runner=runner, seconds=seconds),
+                mock.patch.object(fuzz.subprocess, "run") as run,
+                self.assertRaises((ValueError, argparse.ArgumentTypeError)),
+            ):
+                fuzz.run(self.root, seconds, runner_class=runner)
+            run.assert_not_called()
+
+    def test_workflow_runner_class_budget_is_forwarded_before_build(self):
+        repo = Path(__file__).resolve().parents[2]
+        doc = yaml.safe_load((repo / ".github/workflows/ci-deep.yml").read_text())
+        steps = doc["jobs"]["fuzz"]["steps"]
+        command = next(
+            s["run"] for s in steps if s["name"] == "Check total fuzz job budget"
+        )
+        for name in (
+            "Check total fuzz job budget",
+            "Fuzz regression (120s/target)",
+            "Fuzz each target",
+        ):
+            step = next(s for s in steps if s["name"] == name)
+            self.assertIn('--runner-class "$RUNNER_ENVIRONMENT"', step["run"])
+        fixture = self.root / "ci/fuzz"
+        fixture.mkdir(parents=True)
+        shutil.copyfile(repo / "ci/fuzz/run.py", fixture / "run.py")
+        for name in ("snapshot", "statuses"):
+            (fixture / f"fuzz_{name}.c").touch()
+        for runner, seconds, expected in (
+            ("github-hosted", "3600", 0),
+            ("self-hosted", "3600", 0),
+            ("github-hosted", "8160", 0),
+            ("github-hosted", "8161", 1),
+            ("self-hosted", "15360", 0),
+            ("self-hosted", "15361", 1),
+            ("unknown", "3600", 2),
+            ("", "3600", 2),
+            ("self-hosted", "1\nPATH=x", 2),
+        ):
+            with self.subTest(runner=runner, seconds=seconds):
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    cwd=self.root,
+                    env=dict(os.environ, FUZZ_SECS=seconds, RUNNER_ENVIRONMENT=runner),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_runner_class_budget_with_two_regression_fixtures(self):
+        self.budget_pair()
+        for runner, accepted, rejected in (
+            ("github-hosted", "8040", "8041"),
+            ("self-hosted", "15240", "15241"),
+        ):
+            with self.subTest(runner=runner):
+                fuzz.check_budget(self.root, accepted, runner)
+                with (
+                    mock.patch.object(fuzz.subprocess, "run") as run,
+                    self.assertRaisesRegex(ValueError, "total job budget"),
+                ):
+                    fuzz.run(self.root, rejected, runner_class=runner)
+                run.assert_not_called()
+
     def test_total_budget_accepts_current_two_target_defaults(self):
         repo = Path(__file__).resolve().parents[2]
         doc = yaml.load(
@@ -576,7 +664,7 @@ class FuzzTests(unittest.TestCase):
         # 3600 setup + 2*(120 regression + 2*60 grace + 600 merge)
         # + 2 passes*2 fixtures*60 replay leaves 30480s for discovery.
         with mock.patch.object(fuzz.subprocess, "run") as run:
-            fuzz.run(self.root, "15240", True)
+            fuzz.run(self.root, "15240", True, "self-hosted")
         self.assertEqual(run.call_count, 6)
         self.assertEqual(
             sum("-max_total_time=15240" in call.args[0] for call in run.call_args_list),
@@ -590,22 +678,22 @@ class FuzzTests(unittest.TestCase):
                     ValueError, "total job budget.*2 targets.*15240"
                 ),
             ):
-                fuzz.run(self.root, seconds, True)
+                fuzz.run(self.root, seconds, True, "self-hosted")
             run.assert_not_called()
 
     def test_total_budget_added_discovered_target_changes_admission(self):
         self.budget_pair()
         with mock.patch.object(fuzz.subprocess, "run"):
-            fuzz.run(self.root, "15240", True)
+            fuzz.run(self.root, "15240", True, "self-hosted")
         (self.root / "fuzz_accept.c").touch()
         with (
             mock.patch.object(fuzz.subprocess, "run") as run,
             self.assertRaisesRegex(ValueError, "total job budget.*3 targets.*9880"),
         ):
-            fuzz.run(self.root, "15240", True)
+            fuzz.run(self.root, "15240", True, "self-hosted")
         run.assert_not_called()
         with mock.patch.object(fuzz.subprocess, "run") as run:
-            fuzz.run(self.root, "9880", True)
+            fuzz.run(self.root, "9880", True, "self-hosted")
         self.assertEqual(run.call_count, 8)
         self.assertEqual(
             sum("-max_total_time=9880" in call.args[0] for call in run.call_args_list),
@@ -619,10 +707,10 @@ class FuzzTests(unittest.TestCase):
             mock.patch.object(fuzz.subprocess, "run") as run,
             self.assertRaisesRegex(ValueError, "total job budget.*15180"),
         ):
-            fuzz.run(self.root, "15240")
+            fuzz.run(self.root, "15240", runner_class="self-hosted")
         run.assert_not_called()
         with mock.patch.object(fuzz.subprocess, "run") as run:
-            fuzz.run(self.root, "15180")
+            fuzz.run(self.root, "15180", runner_class="self-hosted")
         self.assertEqual(run.call_count, 5)
 
     def test_total_budget_check_cli_without_binaries_and_errors(self):
@@ -634,7 +722,17 @@ class FuzzTests(unittest.TestCase):
             with (
                 self.subTest(seconds=seconds),
                 mock.patch.object(fuzz, "__file__", str(self.root / "run.py")),
-                mock.patch.object(sys, "argv", ["run.py", seconds, "--check-budget"]),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "run.py",
+                        seconds,
+                        "--runner-class",
+                        "self-hosted",
+                        "--check-budget",
+                    ],
+                ),
                 mock.patch.object(fuzz.subprocess, "run") as run,
             ):
                 if expected is None:
@@ -674,7 +772,9 @@ class FuzzTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", command],
                 cwd=self.root,
-                env=dict(os.environ, FUZZ_SECS=seconds),
+                env=dict(
+                    os.environ, FUZZ_SECS=seconds, RUNNER_ENVIRONMENT="self-hosted"
+                ),
                 capture_output=True,
                 text=True,
                 check=False,
