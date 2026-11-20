@@ -364,6 +364,87 @@ class HealthyPRConditionTests(WorkflowFixture):
                     self.assertEqual(policy.main(), 2)
 
 
+class FuzzJobAndOrderTests(WorkflowFixture):
+    def test_fuzz_job_failure_guard_rejected(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_text()
+        for condition in ("failure()", "${{ failure() }}"):
+            with self.subTest(condition=condition):
+                doc = yaml.safe_load(original)
+                doc["jobs"]["fuzz"]["if"] = condition
+                path.write_text(yaml.safe_dump(doc))
+                self.assertEqual(
+                    policy.check(self.root),
+                    ["fuzz job cannot run on healthy monthly run"],
+                )
+
+    def test_fuzz_job_supported_and_unsupported_guards(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_text()
+        for condition in (
+            "success()",
+            "always()",
+            "!cancelled()",
+            "${{ !cancelled() }}",
+        ):
+            with self.subTest(condition=condition):
+                doc = yaml.safe_load(original)
+                doc["jobs"]["fuzz"]["if"] = condition
+                path.write_text(yaml.safe_dump(doc))
+                self.assertEqual(policy.check(self.root), [])
+        for condition in (
+            False,
+            "false",
+            "failure() || false",
+            None,
+            [],
+            "(success())",
+        ):
+            with self.subTest(condition=condition):
+                doc = yaml.safe_load(original)
+                doc["jobs"]["fuzz"]["if"] = condition
+                path.write_text(yaml.safe_dump(doc))
+                with self.assertRaisesRegex(
+                    policy.GraphError, "unsupported job condition"
+                ):
+                    policy.check(self.root)
+        path.write_text(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_fuzz_phase_order_and_cardinality(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_text()
+        commands = FuzzStepConditionTests.COMMANDS
+        ordered = (commands[3], commands[0], commands[1], commands[2])
+        for action in ("swap01", "swap12", "swap23", "missing", "duplicate"):
+            with self.subTest(action=action):
+                doc = yaml.safe_load(original)
+                steps = doc["jobs"]["fuzz"]["steps"]
+                indices = [
+                    next(
+                        i for i, step in enumerate(steps) if step.get("run") == command
+                    )
+                    for command in ordered
+                ]
+                if action.startswith("swap"):
+                    i, j = int(action[-2]), int(action[-1])
+                    steps[indices[i]], steps[indices[j]] = (
+                        steps[indices[j]],
+                        steps[indices[i]],
+                    )
+                elif action == "missing":
+                    steps.pop(indices[2])
+                else:
+                    steps.insert(indices[2], dict(steps[indices[2]]))
+                path.write_text(yaml.safe_dump(doc))
+                self.assertIn(
+                    "lost fuzz regression/discovery or shared build",
+                    policy.check(self.root),
+                )
+        path.write_text(original)
+        self.assertEqual(policy.check(self.root), [])
+
+
 class FuzzStepConditionTests(WorkflowFixture):
     COMMANDS = (
         'bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"',

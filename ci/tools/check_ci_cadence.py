@@ -3,6 +3,7 @@
 
 import re
 import sys
+from itertools import pairwise
 from pathlib import Path
 
 import yaml
@@ -157,6 +158,8 @@ def check(root):
     if jobs.get("codeql", {}).get("uses") != "./.github/workflows/codeql.yml":
         errors.append("lost monthly CodeQL")
     fuzz = jobs.get("fuzz", {})
+    if not healthy_fuzz_step_condition(fuzz):
+        errors.append("fuzz job cannot run on healthy monthly run")
     commands = [step.get("run") for step in fuzz.get("steps", [])]
     build = 'bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"'
     preflight = 'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget'
@@ -165,7 +168,10 @@ def check(root):
     required_fuzz = (preflight, build, regression, discovery)
     if any(commands.count(command) != 1 for command in required_fuzz) or (
         all(command in commands for command in required_fuzz)
-        and commands.index(preflight) > commands.index(build)
+        and any(
+            commands.index(first) > commands.index(second)
+            for first, second in pairwise(required_fuzz)
+        )
     ):
         errors.append("lost fuzz regression/discovery or shared build")
     for step in fuzz.get("steps", []):
