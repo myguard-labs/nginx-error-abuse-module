@@ -8,6 +8,35 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+MAX_GRAPH_NODES = 512
+MAX_GRAPH_RELATIONS = 32768
+
+
+class WorkflowLoader(yaml.SafeLoader):
+    """Preserve scalar mapping keys, including YAML 1.1 boolean job IDs."""
+
+    def construct_mapping(self, node, deep=False):
+        result = {}
+        for key_node, value_node in node.value:
+            key = self.construct_scalar(key_node)
+            if key in result:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate workflow key: {key}", key_node.start_mark
+                )
+            # Job references are identifiers even when YAML 1.1 tags them as
+            # booleans or null. Other values retain their safe typed constructors.
+            if key == "needs" and isinstance(value_node, yaml.ScalarNode):
+                result[key] = self.construct_scalar(value_node)
+            elif key == "needs" and isinstance(value_node, yaml.SequenceNode):
+                result[key] = [self.construct_scalar(item) for item in value_node.value]
+            else:
+                result[key] = self.construct_object(value_node, deep=deep)
+        return result
+
+
+def load_workflow(path):
+    """Load workflow data safely while retaining every job and event name."""
+    return yaml.load(path.read_text(), Loader=WorkflowLoader)
 
 
 class GraphError(ValueError):
@@ -63,14 +92,16 @@ def matrix_size(job):
 def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
     root = Path(root).resolve()
     edges = {}
+    edge_count = 0
 
     def expand(path, prefix, stack):
+        nonlocal edge_count
         path = (root / path).resolve()
         if not path.is_relative_to(root / ".github/workflows") or path in stack:
             raise GraphError("invalid or recursive workflow call")
         try:
             doc = (
-                yaml.safe_load(path.read_text())
+                load_workflow(path)
                 if document_loader is None
                 else document_loader(path)
             )
@@ -111,6 +142,8 @@ def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
                     starts.update(child_starts)
                     ends.update(child_ends)
                 elif "runs-on" in job:
+                    if len(edges) >= MAX_GRAPH_NODES:
+                        raise GraphError("expanded graph exceeds node budget")
                     edges[ident] = set()
                     starts.add(ident)
                     ends.add(ident)
@@ -125,7 +158,11 @@ def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
                 raise GraphError(f"invalid needs for {name}")
             for dep in needs:
                 for node in spans[name][0]:
-                    edges[node].update(spans[dep][1])
+                    added = spans[dep][1] - edges[node]
+                    if edge_count + len(added) > MAX_GRAPH_RELATIONS:
+                        raise GraphError("expanded graph exceeds edge budget")
+                    edges[node].update(added)
+                    edge_count += len(added)
         all_starts = set().union(*(s for s, _ in spans.values()))
         all_ends = set().union(*(e for _, e in spans.values()))
         internal = set().union(*(edges[n] for n in all_starts))
@@ -133,14 +170,23 @@ def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
 
     expand(entry, "", ())
     ancestors = {}
+    ancestor_count = 0
 
     def visit(node, active):
+        nonlocal ancestor_count
         if node in active:
             raise GraphError("dependency cycle")
         if node not in ancestors:
+            if ancestor_count + len(edges[node]) > MAX_GRAPH_RELATIONS:
+                raise GraphError("expanded graph exceeds ancestor budget")
             ancestors[node] = set(edges[node])
+            ancestor_count += len(edges[node])
             for dep in edges[node]:
-                ancestors[node].update(visit(dep, active | {node}))
+                added = visit(dep, active | {node}) - ancestors[node]
+                if ancestor_count + len(added) > MAX_GRAPH_RELATIONS:
+                    raise GraphError("expanded graph exceeds ancestor budget")
+                ancestors[node].update(added)
+                ancestor_count += len(added)
         return ancestors[node]
 
     for node in edges:

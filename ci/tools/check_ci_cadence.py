@@ -7,7 +7,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import yaml
-from check_ci_graph import GraphError, graph, width
+from check_ci_graph import GraphError, graph, load_workflow, width
 
 ROOT = Path(__file__).resolve().parents[2]
 PR_JOBS = {
@@ -29,7 +29,7 @@ PR_JOBS = {
 
 
 def load(root, name):
-    return yaml.safe_load((root / ".github/workflows" / name).read_text())
+    return load_workflow(root / ".github/workflows" / name)
 
 
 def event_names(doc):
@@ -91,7 +91,7 @@ def check(root):
     def document(path):
         key = path.resolve()
         if key not in documents:
-            documents[key] = yaml.safe_load(path.read_text())
+            documents[key] = load_workflow(path)
         return documents[key]
 
     def workflow(name):
@@ -108,10 +108,12 @@ def check(root):
     # hide fuzz or MSVC; command signatures also reject an inline transplant.
     leaves = graph(root, document_loader=document)
     for path in sorted((root / ".github/workflows").glob("*.y*ml")):
-        if path.name == "ci.yml":
-            continue
         doc = document(path)
         triggers = event_names(doc)
+        if "schedule" in triggers and path.name not in {"ci-deep.yml", "codeql.yml"}:
+            errors.append(f"additional scheduled entry point: {path.name}")
+        if path.name == "ci.yml":
+            continue
         if any(event in triggers for event in ("pull_request", "pull_request_target")):
             errors.append(f"additional PR entry point: {path.name}")
             # Also inspect every independently PR-reachable leaf, not only ci.yml.
@@ -137,12 +139,12 @@ def check(root):
         job = pr["jobs"].get(caller, {})
         expected = f"./.github/workflows/{caller}.yml"
         # build-test is named the same as its caller; no conditional green stub.
-        if (
-            job.get("uses") != expected
-            or "if" in job
-            and job["if"] != "${{ !cancelled() }}"
+        if job.get("uses") != expected or (
+            "if" in job and job["if"] != "${{ !cancelled() }}"
         ):
             errors.append(f"missing PR gate: {caller}")
+        if caller in {"build-test", "lint"} and "needs" in job:
+            errors.append(f"PR entry job cannot depend on other jobs: {caller}")
         children = workflow(f"{caller}.yml")["jobs"]
         actual = set(children)
         if actual != required:
@@ -175,6 +177,9 @@ def check(root):
         step.get("name") for step in msvc.get("msvc", {}).get("steps", [])
     }:
         errors.append("lost MSVC native control")
+    for step in msvc.get("msvc", {}).get("steps", []):
+        if step.get("name") in required_steps and not healthy_fuzz_step_condition(step):
+            errors.append(f"MSVC native control cannot run: {step['name']}")
     for job, predecessor in (("memcheck", "msvc"), ("codeql", "scanners")):
         if (
             jobs.get(job, {}).get("needs") != predecessor
@@ -213,6 +218,10 @@ def check(root):
             step, success_only=step.get("run") == discovery
         ):
             errors.append(f"fuzz step cannot run on healthy monthly run: {step['run']}")
+        if step.get("run") in {preflight, discovery} and "FUZZ_SECS" in step.get(
+            "env", {}
+        ):
+            errors.append("fuzz phase overrides selected duration")
     if "FUZZ_SECS=3600" not in script(fuzz):
         errors.append("lost full fuzz duration")
     for name in ("memcheck", "helgrind"):
@@ -222,6 +231,10 @@ def check(root):
             errors.append(f"lost {name} full duration")
     if "pull_request" not in event_names(pr):
         errors.append("lost PR entry point")
+    elif not isinstance(pr.get("on"), dict) or pr["on"]["pull_request"] != {
+        "branches": ["main"]
+    }:
+        errors.append("PR trigger must target main without filters")
     return errors
 
 

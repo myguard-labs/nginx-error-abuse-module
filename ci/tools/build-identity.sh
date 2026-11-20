@@ -32,7 +32,8 @@ fi
 # overrides are unsupported for cross-run executable reuse, even when empty.
 # Only unset variables are eligible.
 toolchain_overrides=(GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPATH
-    C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH)
+    C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH
+    LD_LIBRARY_PATH PKG_CONFIG_PATH CFLAGS CPPFLAGS LDFLAGS)
 if [[ "${1:-}" == --executable-cache-eligible ]]; then
     for override in "${toolchain_overrides[@]}" NGX_ERROR_ABUSE_INCS NGX_ERROR_ABUSE_LIBS; do
         if [[ -v "$override" ]]; then
@@ -58,8 +59,6 @@ if ! packages="$(dpkg-query -W -f='${binary:Package}=${Version}:${Architecture}\
 fi
 {
     printf 'build-identity-v1\0%s\0' "$PWD" "$@"
-    printf '%s\0' "${CFLAGS:-}" "${CPPFLAGS:-}" "${LDFLAGS:-}" \
-        "${LD_LIBRARY_PATH:-}" "${PKG_CONFIG_PATH:-}"
     for override in "${toolchain_overrides[@]}"; do
         printf '%s\0%s\0%s\0' "$override" "${!override+x}" "${!override-}"
     done

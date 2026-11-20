@@ -60,7 +60,8 @@ export GITHUB_OUTPUT="$tmp/outputs"
 # Keep inherited runner build roots out of this disposable fixture.
 export BUILD_ROOT="$tmp/repo/.build"
 toolchain_overrides=(GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPATH
-    C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH)
+    C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH
+    LD_LIBRARY_PATH PKG_CONFIG_PATH CFLAGS CPPFLAGS LDFLAGS)
 consumer_overrides=(NGX_ERROR_ABUSE_INCS NGX_ERROR_ABUSE_LIBS)
 cache_overrides=("${toolchain_overrides[@]}" "${consumer_overrides[@]}")
 unset "${cache_overrides[@]}"
@@ -70,13 +71,26 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 expect_failure() {
     local message="$1"
     shift
-    if "$@" > "$tmp/error" 2>&1; then fail "expected failure: $message"; fi
+    if ( "$@" ) > "$tmp/error" 2>&1; then fail "expected failure: $message"; fi
     grep -Fq "$message" "$tmp/error" || { cat "$tmp/error" >&2; fail "wrong failure: $message"; }
     printf 'ok: %s\n' "$message"
 }
 identity() { CI_BUILD_IDENTITY_ONLY=1 bash ci/tools/ci-build.sh nginx 1.31.3 "${1:-asan}"; }
 import_artifact() { bash ci/tools/ci-build-artifact.sh import 1.31.3 "$tmp/artifact"; }
-changed() { [[ "$1" != "$2" ]] || fail "identity did not change: $3"; }
+changed() {
+    [[ "$1" =~ ^[0-9a-f]{64}$ && "$2" =~ ^[0-9a-f]{64}$ ]] || fail "identity probe failed: $3"
+    [[ "$1" != "$2" ]] || fail "identity did not change: $3"
+}
+# Exercise both inputs, including failures hidden by command substitution.
+valid_probe="$(printf 'probe' | sha256sum | cut -d' ' -f1)"
+other_probe="$(printf 'other' | sha256sum | cut -d' ' -f1)"
+changed "$valid_probe" "$other_probe" valid-probes
+for invalid_probe in '' malformed "${valid_probe:1}" "${valid_probe}0"; do
+    expect_failure 'identity probe failed: invalid-before' changed "$invalid_probe" "$valid_probe" invalid-before
+    expect_failure 'identity probe failed: invalid-after' changed "$valid_probe" "$invalid_probe" invalid-after
+done
+expect_failure 'identity did not change: equal' changed "$valid_probe" "$valid_probe" equal
+expect_failure 'identity probe failed: failed-command' changed "$valid_probe" "$(false)" failed-command
 
 sed -i -E 's/^(NGINX_MAINLINE_SHA256|NGINX_VERSION_SHA256)=.*/\1=malformed/' .github/versions.env
 if identity > "$tmp/pin-error" 2>&1; then fail 'malformed fixture pin unexpectedly succeeded'; fi

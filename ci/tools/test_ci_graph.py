@@ -227,6 +227,98 @@ class GraphTests(unittest.TestCase):
                     type(standalone.exception.__cause__),
                 )
 
+    def test_boolean_and_null_job_ids_are_distinct(self):
+        self.write(
+            "ci.yml",
+            "jobs:\n"
+            + "".join(
+                f"  {name}:\n    runs-on: ubuntu-latest\n"
+                for name in ("on", "yes", "true", "null", "ordinary")
+            ),
+        )
+        self.assertEqual(len(width(graph(self.root))), 5)
+        doc = check_ci_graph.load_workflow(self.workflows / "ci.yml")
+        self.assertEqual(set(doc["jobs"]), {"on", "yes", "true", "null", "ordinary"})
+
+    def test_scalar_and_sequence_dependencies_preserve_job_ids(self):
+        for name in ("on", "yes", "true", "null", "ordinary"):
+            for needs in (name, f"[{name}]", f"['{name}']"):
+                with self.subTest(name=name, needs=needs):
+                    self.write(
+                        "ci.yml",
+                        "jobs:\n"
+                        f"  {name}: {{runs-on: ubuntu-latest}}\n"
+                        f"  after: {{runs-on: ubuntu-latest, needs: {needs}}}\n",
+                    )
+                    expanded = graph(self.root)
+                    self.assertEqual(len(expanded), 2)
+                    self.assertEqual(len(width(expanded)), 1)
+                    doc = check_ci_graph.load_workflow(self.workflows / "ci.yml")
+                    self.assertIn(doc["jobs"]["after"]["needs"], (name, [name]))
+
+    def test_loader_preserves_boolean_values_and_rejects_duplicate_keys(self):
+        self.write(
+            "ci.yml", "jobs: {one: {runs-on: ubuntu-latest, continue-on-error: false}}"
+        )
+        doc = check_ci_graph.load_workflow(self.workflows / "ci.yml")
+        self.assertIs(doc["jobs"]["one"]["continue-on-error"], False)
+        self.write("ci.yml", "jobs: {one: {}, one: {}}")
+        with self.assertRaisesRegex(GraphError, "duplicate workflow key"):
+            graph(self.root)
+
+    def test_expansion_node_budget_and_nested_matrix(self):
+        for count in (8, 9):
+            self.write(
+                "ci.yml",
+                "jobs:\n"
+                + "".join(
+                    f"  j{i}:\n    runs-on: ubuntu-latest\n" for i in range(count)
+                ),
+            )
+            with mock.patch.object(check_ci_graph, "MAX_GRAPH_NODES", 8):
+                if count == 8:
+                    self.assertEqual(len(graph(self.root)), 8)
+                else:
+                    with self.assertRaisesRegex(GraphError, "node budget"):
+                        graph(self.root)
+        self.write(
+            "ci.yml",
+            "jobs:\n  call:\n    uses: ./.github/workflows/child.yml\n    strategy: {matrix: {slot: [1, 2, 3]}}\n",
+        )
+        self.write(
+            "child.yml",
+            "jobs:\n  leaf:\n    runs-on: ubuntu-latest\n    strategy: {matrix: {slot: [1, 2, 3]}}\n",
+        )
+        with (
+            mock.patch.object(check_ci_graph, "MAX_GRAPH_NODES", 8),
+            self.assertRaisesRegex(GraphError, "node budget"),
+        ):
+            graph(self.root)
+
+    def test_dependency_and_ancestor_budgets(self):
+        self.write(
+            "ci.yml",
+            "jobs:\n  first:\n    runs-on: ubuntu-latest\n    strategy: {matrix: {slot: [1, 2]}}\n  second:\n    runs-on: ubuntu-latest\n    needs: first\n    strategy: {matrix: {slot: [1, 2]}}\n",
+        )
+        with mock.patch.object(check_ci_graph, "MAX_GRAPH_RELATIONS", 4):
+            self.assertEqual(len(width(graph(self.root))), 2)
+        with (
+            mock.patch.object(check_ci_graph, "MAX_GRAPH_RELATIONS", 3),
+            self.assertRaisesRegex(GraphError, "edge budget"),
+        ):
+            graph(self.root)
+        self.write(
+            "ci.yml",
+            "jobs:\n  a:\n    runs-on: ubuntu-latest\n  b:\n    runs-on: ubuntu-latest\n    needs: a\n  c:\n    runs-on: ubuntu-latest\n    needs: b\n",
+        )
+        with mock.patch.object(check_ci_graph, "MAX_GRAPH_RELATIONS", 3):
+            self.assertEqual(len(width(graph(self.root))), 1)
+        with (
+            mock.patch.object(check_ci_graph, "MAX_GRAPH_RELATIONS", 2),
+            self.assertRaisesRegex(GraphError, "ancestor budget"),
+        ):
+            graph(self.root)
+
     def test_four_and_injected_fifth_leaf(self):
         self.write(
             "ci.yml",

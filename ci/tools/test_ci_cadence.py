@@ -10,6 +10,7 @@ from unittest import mock
 
 import check_ci_cadence as policy
 import yaml
+from check_ci_graph import WorkflowLoader
 
 
 class WorkflowFixture(unittest.TestCase):
@@ -29,6 +30,123 @@ class WorkflowFixture(unittest.TestCase):
 
 
 class CadenceTests(WorkflowFixture):
+    def update_workflow(self, name, update):
+        doc = policy.load(self.root, name)
+        update(doc)
+        (self.root / ".github/workflows" / name).write_text(yaml.safe_dump(doc))
+
+    def test_pr_entry_jobs_cannot_depend_on_failure_only_root(self):
+        for caller in ("build-test", "lint"):
+            with self.subTest(caller=caller):
+
+                def update(doc, caller=caller):
+                    doc["jobs"]["failure-root"] = {
+                        "runs-on": "ubuntu-latest",
+                        "if": "failure()",
+                    }
+                    doc["jobs"][caller]["needs"] = "failure-root"
+
+                self.update_workflow("ci.yml", update)
+                try:
+                    self.assertIn(
+                        f"PR entry job cannot depend on other jobs: {caller}",
+                        policy.check(self.root),
+                    )
+                finally:
+                    self.update_workflow(
+                        "ci.yml",
+                        lambda doc, caller=caller: doc["jobs"][caller].pop("needs"),
+                    )
+        self.update_workflow("ci.yml", lambda doc: doc["jobs"].pop("failure-root"))
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_only_deep_workflow_may_schedule(self):
+        for name in ("ci.yml", "fuzzing.yml", "windows-msvc.yml", "lint.yml"):
+            with self.subTest(name=name):
+                self.update_workflow(
+                    name,
+                    lambda doc: doc["on"].update(schedule=[{"cron": "30 3 4 * *"}]),
+                )
+                self.assertIn(
+                    f"additional scheduled entry point: {name}", policy.check(self.root)
+                )
+                self.update_workflow(name, lambda doc: doc["on"].pop("schedule"))
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_required_msvc_steps_must_run_when_healthy(self):
+        name = "windows-msvc.yml"
+        original = (self.root / ".github/workflows" / name).read_text()
+        required = (
+            "Build",
+            "Verify module and configuration controls",
+            "Test persistence and singleton ownership",
+        )
+        for control in required:
+            for condition in (False, "${{ false }}", "failure()"):
+                with self.subTest(control=control, condition=condition):
+                    self.update_workflow(
+                        name,
+                        lambda doc, control=control, condition=condition: next(
+                            step
+                            for step in doc["jobs"]["msvc"]["steps"]
+                            if step.get("name") == control
+                        ).update({"if": condition}),
+                    )
+                    self.assertIn(
+                        f"MSVC native control cannot run: {control}",
+                        policy.check(self.root),
+                    )
+                    (self.root / ".github/workflows" / name).write_text(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_budget_and_discovery_cannot_override_selected_duration(self):
+        name = "ci-deep.yml"
+        original = (self.root / ".github/workflows" / name).read_text()
+        for phase in ("Check total fuzz job budget", "Fuzz each target"):
+            for duration in ("60", "3600", "${{ inputs.fuzz_seconds }}"):
+                with self.subTest(phase=phase, duration=duration):
+                    self.update_workflow(
+                        name,
+                        lambda doc, phase=phase, duration=duration: next(
+                            step
+                            for step in doc["jobs"]["fuzz"]["steps"]
+                            if step.get("name") == phase
+                        ).update(env={"FUZZ_SECS": duration}),
+                    )
+                    self.assertIn(
+                        "fuzz phase overrides selected duration",
+                        policy.check(self.root),
+                    )
+                    (self.root / ".github/workflows" / name).write_text(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_pr_trigger_requires_main_without_source_filters(self):
+        for event in (
+            {"branches": ["main"], "paths": ["docs/**"]},
+            {"branches": ["main"], "paths-ignore": ["src/**"]},
+            {"branches": ["other"]},
+            {"branches-ignore": ["main"]},
+            None,
+        ):
+            with self.subTest(event=event):
+                self.set_events("ci.yml", {"pull_request": event})
+                self.assertIn(
+                    "PR trigger must target main without filters",
+                    policy.check(self.root),
+                )
+        self.set_events("ci.yml", {"pull_request": {"branches": ["main"]}})
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_shared_loader_preserves_boolean_job_names(self):
+        self.replace(
+            "ci.yml",
+            "  lint:\n",
+            "  on:\n    runs-on: ubuntu-latest\n  yes:\n    runs-on: ubuntu-latest\n  lint:\n",
+        )
+        self.assertIn("on", policy.load(self.root, "ci.yml")["jobs"])
+        self.assertIn("yes", policy.load(self.root, "ci.yml")["jobs"])
+        self.assertIn("ci.yml: fifth concurrent leaf", policy.check(self.root))
+
     def test_real_contract(self):
         self.assertEqual(policy.check(self.root), [])
 
@@ -46,7 +164,9 @@ class CadenceTests(WorkflowFixture):
     def test_each_workflow_parsed_once_per_check(self):
         expected = set((self.root / ".github/workflows").glob("*.y*ml"))
         with (
-            mock.patch.object(yaml, "safe_load", wraps=yaml.safe_load) as parse,
+            mock.patch.object(
+                policy, "load_workflow", wraps=policy.load_workflow
+            ) as parse,
             mock.patch.object(
                 Path, "read_text", autospec=True, side_effect=Path.read_text
             ) as read,
@@ -118,8 +238,7 @@ class CadenceTests(WorkflowFixture):
 
     def set_events(self, name, events):
         path = self.root / ".github/workflows" / name
-        doc = yaml.safe_load(path.read_text())
-        doc.pop(True, None)  # PyYAML treats an unquoted "on" key as a boolean.
+        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
         doc["on"] = events
         path.write_text(yaml.safe_dump(doc))
 
@@ -134,7 +253,9 @@ class CadenceTests(WorkflowFixture):
                 with self.subTest(events=events):
                     self.set_events("ci.yml", events)
                     expected = (
-                        [] if event == "pull_request" else ["lost PR entry point"]
+                        ["PR trigger must target main without filters"]
+                        if event == "pull_request"
+                        else ["lost PR entry point"]
                     )
                     self.assertEqual(policy.check(self.root), expected)
 
@@ -180,7 +301,14 @@ class CadenceTests(WorkflowFixture):
     def test_malformed_event_shapes_fail_closed(self):
         for name in ("ci.yml", "codeql.yml", "ci-deep.yml"):
             original = (self.root / ".github/workflows" / name).read_text()
-            for events in (None, False, 7, [None], [["pull_request"]], {False: None}):
+            for events in (
+                None,
+                False,
+                7,
+                [None],
+                [["pull_request"]],
+                {("invalid",): None},
+            ):
                 with self.subTest(name=name, events=events):
                     self.set_events(name, events)
                     with mock.patch.object(policy, "ROOT", self.root):
@@ -219,7 +347,7 @@ class CadenceTests(WorkflowFixture):
                 None,
             ):
                 with self.subTest(target=target, value=value):
-                    doc = yaml.safe_load(original)
+                    doc = yaml.load(original, Loader=WorkflowLoader)
                     job = doc["jobs"]["fuzz"]
                     obj = (
                         job
@@ -243,7 +371,7 @@ class CadenceTests(WorkflowFixture):
 
     def test_optional_fuzz_step_may_suppress_failure(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        doc = yaml.safe_load(path.read_text())
+        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
         doc["jobs"]["fuzz"]["steps"].append(
             {"run": "echo optional", "continue-on-error": True}
         )
@@ -275,7 +403,7 @@ class CadenceTests(WorkflowFixture):
     def test_budget_preflight_after_build_is_rejected(self):
         path = self.root / ".github/workflows/ci-deep.yml"
         original = path.read_text()
-        doc = yaml.safe_load(original)
+        doc = yaml.load(original, Loader=WorkflowLoader)
         steps = doc["jobs"]["fuzz"]["steps"]
         preflight = next(
             step for step in steps if step.get("name") == "Check total fuzz job budget"
@@ -410,7 +538,7 @@ class CadenceTests(WorkflowFixture):
 class HealthyPRConditionTests(WorkflowFixture):
     def set_job_condition(self, caller, name, condition):
         path = self.root / ".github/workflows" / f"{caller}.yml"
-        doc = yaml.safe_load(path.read_text())
+        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
         doc["jobs"][name]["if"] = condition
         path.write_text(yaml.safe_dump(doc))
 
@@ -469,7 +597,7 @@ class HealthyPRConditionTests(WorkflowFixture):
 
     def test_artifact_condition_requires_producer_dependency(self):
         path = self.root / ".github/workflows/asan.yml"
-        doc = yaml.safe_load(path.read_text())
+        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
         reload = doc["jobs"]["asan-reload"]
         for needs in (None, [], "asan", ["asan"]):
             with self.subTest(needs=needs):
@@ -506,7 +634,7 @@ class FuzzJobAndOrderTests(WorkflowFixture):
         original = path.read_text()
         for condition in ("failure()", "${{ failure() }}"):
             with self.subTest(condition=condition):
-                doc = yaml.safe_load(original)
+                doc = yaml.load(original, Loader=WorkflowLoader)
                 doc["jobs"]["fuzz"]["if"] = condition
                 path.write_text(yaml.safe_dump(doc))
                 self.assertEqual(
@@ -524,7 +652,7 @@ class FuzzJobAndOrderTests(WorkflowFixture):
             "${{ !cancelled() }}",
         ):
             with self.subTest(condition=condition):
-                doc = yaml.safe_load(original)
+                doc = yaml.load(original, Loader=WorkflowLoader)
                 doc["jobs"]["fuzz"]["if"] = condition
                 path.write_text(yaml.safe_dump(doc))
                 self.assertEqual(policy.check(self.root), [])
@@ -537,7 +665,7 @@ class FuzzJobAndOrderTests(WorkflowFixture):
             "(success())",
         ):
             with self.subTest(condition=condition):
-                doc = yaml.safe_load(original)
+                doc = yaml.load(original, Loader=WorkflowLoader)
                 doc["jobs"]["fuzz"]["if"] = condition
                 path.write_text(yaml.safe_dump(doc))
                 with self.assertRaisesRegex(
@@ -554,7 +682,7 @@ class FuzzJobAndOrderTests(WorkflowFixture):
         ordered = (commands[3], commands[0], commands[1], commands[2])
         for action in ("swap01", "swap12", "swap23", "missing", "duplicate"):
             with self.subTest(action=action):
-                doc = yaml.safe_load(original)
+                doc = yaml.load(original, Loader=WorkflowLoader)
                 steps = doc["jobs"]["fuzz"]["steps"]
                 indices = [
                     next(
@@ -591,7 +719,7 @@ class FuzzStepConditionTests(WorkflowFixture):
 
     def set_step_condition(self, command, condition):
         path = self.root / ".github/workflows/ci-deep.yml"
-        doc = yaml.safe_load(path.read_text())
+        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
         for step in doc["jobs"]["fuzz"]["steps"]:
             if step.get("run") == command:
                 step["if"] = condition
@@ -653,7 +781,7 @@ class FuzzStepConditionTests(WorkflowFixture):
 
     def test_absent_condition_allowed_for_each_phase(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        doc = yaml.safe_load(path.read_text())
+        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
         for step in doc["jobs"]["fuzz"]["steps"]:
             if step.get("run") in self.COMMANDS:
                 with self.subTest(command=step["run"]):
