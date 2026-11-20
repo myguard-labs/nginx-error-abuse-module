@@ -162,6 +162,11 @@ def check(root):
         errors.append("required basic.t step can suppress failure")
     if len(basic) == 1 and not healthy_fuzz_step_condition(basic[0]):
         errors.append("required basic.t step cannot run")
+    if len(basic) == 1 and not re.fullmatch(
+        r"prove(?:[ \t]+-v)?[ \t]+ci/t/basic\.t",
+        str(basic[0].get("run", "")).strip(),
+    ):
+        errors.append("required basic.t command missing")
     events = deep.get("on", deep.get(True, {}))
     if (
         not isinstance(events, dict)
@@ -256,6 +261,25 @@ def check(root):
         re.DOTALL,
     ) or not healthy_fuzz_step_condition(selectors[0]):
         errors.append("lost full fuzz duration")
+    manual = (
+        r'set -euo pipefail\nif \[ "\$EVENT_NAME" = "workflow_dispatch" \]; then\n'
+        r'if ! printf \'%s\' "\$\{FUZZ_SECONDS_INPUT\}" \| '
+        r"grep -qzE '\^\[0-9\]\{1,5\}\$'; then\n"
+        r'echo "[^"\n]*"\nexit 1\nfi\n'
+        r'if \[ "\$\{FUZZ_SECONDS_INPUT\}" -lt 1 \] \|\| '
+        r'\[ "\$\{FUZZ_SECONDS_INPUT\}" -gt 86400 \]; then\n'
+        r'echo "[^"\n]*"\nexit 1\nfi\n'
+        r'printf \'FUZZ_SECS=%s\\n\' "\$\{FUZZ_SECONDS_INPUT\}" >> "\$GITHUB_ENV"\n'
+    )
+    selector_env = selectors[0].get("env") if len(selectors) == 1 else None
+    if (
+        not re.fullmatch(manual, selection.partition("else\n")[0])
+        or not isinstance(selector_env, dict)
+        or selector_env.get("FUZZ_SECONDS_INPUT")
+        != "${{ github.event.inputs.fuzz_seconds }}"
+        or selector_env.get("EVENT_NAME") != "${{ github.event_name }}"
+    ):
+        errors.append("lost validated manual fuzz duration")
     if (
         len(selectors) == 1
         and preflight in commands

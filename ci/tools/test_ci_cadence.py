@@ -16,6 +16,39 @@ import yaml
 from check_ci_graph import WorkflowLoader
 
 
+def fixture_environment(**overrides):
+    # Git's repository-local environment (git rev-parse --local-env-vars).
+    # The lint script itself must retain explicit hook indexes; only fixtures
+    # clear inherited overrides, before adding their own intentional values.
+    local = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+    }
+    return {
+        **{
+            name: value
+            for name, value in os.environ.items()
+            if name not in local
+            and not name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+        },
+        **overrides,
+    }
+
+
 class WorkflowFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -33,6 +66,91 @@ class WorkflowFixture(unittest.TestCase):
 
 
 class CadenceTests(WorkflowFixture):
+    def test_basic_test_command_required(self):
+        path = self.root / ".github/workflows/build-test.yml"
+        original = path.read_bytes()
+        for command in (
+            "echo skipped",
+            "# prove -v ci/t/basic.t",
+            "echo prove ci/t/basic.t",
+            "prove -v ci/t/other.t",
+            "prove -e ci/t/basic.t",
+            "prove -v ci/t/basic.t || true",
+        ):
+            with self.subTest(command=command):
+                path.write_bytes(original)
+                self.replace("build-test.yml", "prove -v ci/t/basic.t", command)
+                self.assertIn(
+                    "required basic.t command missing", policy.check(self.root)
+                )
+                path.write_bytes(original)
+        self.assertEqual(policy.check(self.root), [])
+        self.replace("build-test.yml", "prove -v ci/t/basic.t", "prove ci/t/basic.t")
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_manual_fuzz_exports_validated_input(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_bytes()
+        export = 'printf \'FUZZ_SECS=%s\\n\' "${FUZZ_SECONDS_INPUT}" >> "$GITHUB_ENV"'
+        for replacement in (
+            "true",
+            export.replace("%s", "60"),
+            export.replace("${FUZZ_SECONDS_INPUT}", "3600"),
+            export.replace(' >> "$GITHUB_ENV"', ""),
+            "# " + export,
+        ):
+            with self.subTest(replacement=replacement):
+                path.write_bytes(original)
+                self.replace("ci-deep.yml", export, replacement)
+                self.assertIn(
+                    "lost validated manual fuzz duration", policy.check(self.root)
+                )
+                path.write_bytes(original)
+        for before, after in (
+            ("grep -qzE", "grep -qE"),
+            ("-lt 1", "-lt 0"),
+            ("-gt 86400", "-gt 99999"),
+            ("{1,5}", "+"),
+            ("exit 1", "true"),
+        ):
+            with self.subTest(before=before):
+                path.write_bytes(original)
+                self.replace("ci-deep.yml", before, after)
+                self.assertIn(
+                    "lost validated manual fuzz duration", policy.check(self.root)
+                )
+                path.write_bytes(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_manual_fuzz_input_bindings_required(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_bytes()
+        for env in (
+            None,
+            [],
+            {},
+            {"FUZZ_SECONDS_INPUT": "3600", "EVENT_NAME": "${{ github.event_name }}"},
+            {
+                "FUZZ_SECONDS_INPUT": "${{ github.event.inputs.fuzz_seconds }}",
+                "EVENT_NAME": "schedule",
+            },
+        ):
+            with self.subTest(env=env):
+                path.write_bytes(original)
+                self.update_workflow(
+                    "ci-deep.yml",
+                    lambda doc, env=env: next(
+                        step
+                        for step in doc["jobs"]["fuzz"]["steps"]
+                        if step.get("name") == "Select fuzz duration"
+                    ).update(env=env),
+                )
+                self.assertIn(
+                    "lost validated manual fuzz duration", policy.check(self.root)
+                )
+        path.write_bytes(original)
+        self.assertEqual(policy.check(self.root), [])
+
     def update_workflow(self, name, update):
         doc = policy.load(self.root, name)
         update(doc)
@@ -194,7 +312,7 @@ class CadenceTests(WorkflowFixture):
             "import sys; from pathlib import Path; import check_ci_cadence as p; "
             "p.ROOT=Path(sys.argv[1]); sys.exit(p.main())"
         )
-        env = dict(os.environ, LC_ALL="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+        env = fixture_environment(LC_ALL="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
         result = subprocess.run(
             [sys.executable, "-c", code, str(self.root)],
             cwd=Path(policy.__file__).parent,
@@ -747,13 +865,14 @@ class StagedCadenceTests(WorkflowFixture):
         source = policy.ROOT
         for name in (
             "ci/linter/lib.sh",
+            "ci/linter/run-all.sh",
             "ci/linter/lint-ci-monthly.sh",
             "ci/tools/check_ci_cadence.py",
             "ci/tools/check_ci_graph.py",
         ):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source / name, target)
+            shutil.copy2(source / name, target)
         self.git("init", "-q")
         self.git("add", ".")
         self.git(
@@ -768,23 +887,161 @@ class StagedCadenceTests(WorkflowFixture):
             "fixture",
         )
 
-    def git(self, *args):
+    def git(self, *args, **kwargs):
         return subprocess.run(
-            ["git", *args], cwd=self.root, check=True, capture_output=True
+            ["git", *args],
+            cwd=self.root,
+            env=fixture_environment(),
+            check=True,
+            capture_output=True,
+            **kwargs,
         )
 
-    def lint(self, mode="staged"):
-        index = self.root / ".git/index"
+    def lint(self, mode="staged", files=(), overrides=None):
+        index = Path((overrides or {}).get("GIT_INDEX_FILE", self.root / ".git/index"))
         before = index.read_bytes()
         result = subprocess.run(
-            ["bash", "ci/linter/lint-ci-monthly.sh"],
+            [
+                "bash",
+                "ci/linter/run-all.sh" if files else "ci/linter/lint-ci-monthly.sh",
+                *files,
+            ],
             cwd=self.root,
-            env=dict(os.environ, LINT_MODE=mode),
+            env=fixture_environment(
+                LINT_MODE=mode, LINT_ONLY="ci-monthly", **(overrides or {})
+            ),
             capture_output=True,
             check=False,
         )
         self.assertEqual(index.read_bytes(), before, "lint changed the raw index")
         return result
+
+    def test_explicit_nonworkflow_selection_skips_dirty_graph(self):
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        self.git("add", ".github/workflows/ci-deep.yml")
+        for mode in ("all", "staged"):
+            with self.subTest(mode=mode):
+                result = self.lint(mode, ("ci/tools/check_ci_cadence.py",))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(b"no selected workflow", result.stdout)
+                self.assertEqual(
+                    self.lint(mode, (".github/workflows/ci.yml",)).returncode, 1
+                )
+
+    def test_explicit_prefixed_workflow_selection_checks_graph(self):
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        self.git("add", ".github/workflows/ci-deep.yml")
+        for mode in ("all", "staged"):
+            for name in (
+                "./.github/workflows/ci.yml",
+                str(self.root / ".github/workflows/ci.yml"),
+            ):
+                with self.subTest(mode=mode, name=name):
+                    result = self.lint(mode, (name,))
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertNotIn(b"no selected workflow", result.stdout)
+
+    def test_skip_worktree_workflow_reads_stage_zero_blob(self):
+        self.git("update-index", "--skip-worktree", ".github/workflows/windows.yml")
+        (self.root / ".github/workflows/windows.yml").unlink()
+        path = self.root / ".github/workflows/ci.yml"
+        path.write_bytes(path.read_bytes() + b"\n# selected\n")
+        self.git("add", str(path))
+        result = self.lint()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_sparse_index_workflows_read_stage_zero_blobs(self):
+        path = self.root / ".github/workflows/ci.yml"
+        content = path.read_bytes() + b"\n# staged in sparse index\n"
+        self.git("sparse-checkout", "init", "--cone", "--sparse-index")
+        self.git("sparse-checkout", "set", "ci")
+        self.assertFalse(path.exists())
+        blob = (
+            self.git("hash-object", "-w", "--stdin", input=content)
+            .stdout.strip()
+            .decode()
+        )
+        self.git(
+            "update-index", "--cacheinfo", f"100644,{blob},.github/workflows/ci.yml"
+        )
+        result = self.lint()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists(), "lint expanded the sparse worktree")
+
+    def test_unmerged_workflow_is_rejected_without_index_changes(self):
+        path = ".github/workflows/ci.yml"
+        blob = self.git("rev-parse", f":{path}").stdout.strip()
+        self.git(
+            "update-index",
+            "--index-info",
+            input=b"0 "
+            + b"0" * 40
+            + b"\t"
+            + path.encode()
+            + b"\n100644 "
+            + blob
+            + b" 2\t"
+            + path.encode()
+            + b"\n",
+        )
+        result = self.lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"unmerged or not a regular file", result.stderr)
+
+    def test_explicit_production_index_is_honoured(self):
+        alternate = self.root / "alternate-index"
+        shutil.copyfile(self.root / ".git/index", alternate)
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        env = fixture_environment(GIT_INDEX_FILE=str(alternate))
+        subprocess.run(
+            ["git", "add", ".github/workflows/ci-deep.yml"],
+            cwd=self.root,
+            env=env,
+            check=True,
+        )
+        self.assertEqual(self.lint().returncode, 0)
+        result = self.lint(overrides={"GIT_INDEX_FILE": str(alternate)})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"lost full fuzz duration", result.stderr)
+
+    def test_fixture_ignores_ambient_git_overrides(self):
+        fixture = StagedCadenceTests()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": str(self.root / "absent"),
+                "GIT_WORK_TREE": str(self.root / "absent"),
+                "GIT_INDEX_FILE": str(self.root / "absent-index"),
+                "GIT_COMMON_DIR": str(self.root / "absent"),
+            },
+        ):
+            try:
+                try:
+                    fixture.setUp()
+                    result = fixture.lint("all")
+                except (subprocess.CalledProcessError, OSError) as error:
+                    self.fail(f"fixture inherited ambient Git overrides: {error}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+            finally:
+                fixture.doCleanups()
+
+    def test_fixture_environment_clears_git_local_variables(self):
+        local = self.git("rev-parse", "--local-env-vars").stdout.decode().splitlines()
+        overrides = dict.fromkeys(local, "ambient-override")
+        overrides.update(
+            GIT_CONFIG_KEY_0="core.bare",
+            GIT_CONFIG_VALUE_0="true",
+            FIXTURE_SENTINEL="retained",
+        )
+        with mock.patch.dict(os.environ, overrides):
+            env = fixture_environment()
+            for name in overrides.keys() - {"FIXTURE_SENTINEL"}:
+                self.assertNotIn(name, env)
+            self.assertEqual(env["FIXTURE_SENTINEL"], "retained")
+            self.assertEqual(
+                fixture_environment(GIT_INDEX_FILE="explicit-index")["GIT_INDEX_FILE"],
+                "explicit-index",
+            )
 
     def test_no_staged_workflow_skips_dirty_graph(self):
         self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")

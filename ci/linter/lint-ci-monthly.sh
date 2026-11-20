@@ -4,6 +4,20 @@
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 need python3 "apt-get install python3"
 root="$(repo_root)"
+if [ "$#" -gt 0 ]; then
+	selected=false
+	for path in "$@"; do
+		path=${path#"$root"/}
+		while [[ "$path" == ./* ]]; do path=${path#./}; done
+		case "$path" in
+		.github/workflows/*.yml | .github/workflows/*.yaml) selected=true ;;
+		esac
+	done
+	if [ "$selected" = false ]; then
+		echo 'lint-ci-monthly: no selected workflow files to check'
+		exit 0
+	fi
+fi
 if [ "${LINT_MODE:-all}" != staged ]; then
 	exec python3 "$root/ci/tools/check_ci_cadence.py"
 fi
@@ -16,8 +30,27 @@ if [ -z "$changed" ]; then
 fi
 snapshot=$(mktemp -d "${TMPDIR:-/tmp}/lint-ci-monthly.XXXXXX")
 trap 'rm -rf -- "$snapshot"' EXIT
-GIT_OPTIONAL_LOCKS=0 git ls-files -z -- .github/workflows |
-	GIT_OPTIONAL_LOCKS=0 git checkout-index --prefix="$snapshot/" -z --stdin
+GIT_OPTIONAL_LOCKS=0 python3 - "$snapshot" <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+entries = subprocess.check_output(
+    ["git", "ls-files", "--stage", "-z", "--", ".github/workflows"]
+)
+for entry in entries.split(b"\0"):
+    if not entry:
+        continue
+    metadata, name = entry.split(b"\t", 1)
+    mode, blob, stage = metadata.split()
+    if stage != b"0" or mode not in (b"100644", b"100755"):
+        sys.exit("lint-ci-monthly: workflow index entry is unmerged or not a regular file")
+    target = root / os.fsdecode(name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(subprocess.check_output(["git", "cat-file", "blob", blob]))
+PY
 python3 -c '
 import sys
 from pathlib import Path

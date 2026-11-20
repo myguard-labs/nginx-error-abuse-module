@@ -6,6 +6,7 @@ import importlib.util
 import os
 import runpy
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,159 @@ fuzz = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fuzz)
 
 
+@unittest.skipUnless(os.name == "posix", "merge process groups are POSIX")
+class MergeProcessTests(unittest.TestCase):
+    def test_merge_result_and_spawn_errors_propagate(self):
+        for status in (0, 7):
+            with (
+                self.subTest(status=status),
+                mock.patch.object(fuzz.subprocess, "Popen") as popen,
+            ):
+                process = popen.return_value.__enter__.return_value
+                process.communicate.return_value = ("output", "error")
+                process.returncode = status
+                if status:
+                    with self.assertRaises(subprocess.CalledProcessError) as raised:
+                        fuzz.run_merge(["merge"], cwd="fixture", timeout=600)
+                    self.assertEqual(raised.exception.returncode, status)
+                else:
+                    result = fuzz.run_merge(["merge"], cwd="fixture", timeout=600)
+                    self.assertEqual(
+                        (result.stdout, result.stderr), ("output", "error")
+                    )
+                popen.assert_called_once_with(
+                    ["merge"], cwd="fixture", start_new_session=True
+                )
+                process.communicate.assert_called_once_with(timeout=600)
+        with (
+            mock.patch.object(
+                fuzz.subprocess, "Popen", side_effect=FileNotFoundError("missing")
+            ),
+            self.assertRaises(FileNotFoundError),
+        ):
+            fuzz.run_merge(["merge"], cwd="fixture", timeout=600)
+
+    def test_timeout_reaps_direct_child_and_kills_group_after_grace(self):
+        for group_missing in (False, True):
+            with (
+                self.subTest(group_missing=group_missing),
+                mock.patch.object(fuzz.subprocess, "Popen") as popen,
+                mock.patch.object(fuzz.os, "killpg") as kill,
+            ):
+                process = popen.return_value.__enter__.return_value
+                process.pid = 123
+                expired = subprocess.TimeoutExpired("merge", 600)
+                process.communicate.side_effect = [
+                    expired,
+                    subprocess.TimeoutExpired("merge", 5),
+                    (None, None),
+                ]
+                if group_missing:
+                    kill.side_effect = ProcessLookupError
+                with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                    fuzz.run_merge(["merge"], cwd="fixture", timeout=600)
+                self.assertIs(raised.exception, expired)
+                self.assertEqual(
+                    kill.call_args_list,
+                    [mock.call(123, signal.SIGTERM), mock.call(123, signal.SIGKILL)],
+                )
+                self.assertEqual(
+                    process.communicate.call_args_list,
+                    [mock.call(timeout=600), mock.call(timeout=5), mock.call()],
+                )
+
+    def test_interrupted_merge_kills_group_and_reaps_before_reraising(self):
+        for error in (KeyboardInterrupt(), RuntimeError("wait failed")):
+            for group_missing in (False, True):
+                with (
+                    self.subTest(
+                        error=type(error).__name__, group_missing=group_missing
+                    ),
+                    mock.patch.object(fuzz.subprocess, "Popen") as popen,
+                    mock.patch.object(fuzz.os, "killpg") as kill,
+                ):
+                    process = popen.return_value.__enter__.return_value
+                    process.pid = 123
+                    process.communicate.side_effect = [error, (None, None)]
+                    if group_missing:
+                        kill.side_effect = ProcessLookupError
+                    with self.assertRaises(type(error)) as raised:
+                        fuzz.run_merge(["merge"], cwd="fixture", timeout=600)
+                    self.assertIs(raised.exception, error)
+                    kill.assert_called_once_with(123, signal.SIGKILL)
+                    self.assertEqual(
+                        process.communicate.call_args_list,
+                        [mock.call(timeout=600), mock.call()],
+                    )
+
+    def test_nonposix_retains_direct_subprocess_timeout(self):
+        with (
+            mock.patch.object(fuzz.os, "name", "nt"),
+            mock.patch.object(fuzz.subprocess, "run") as run,
+            mock.patch.object(fuzz.subprocess, "Popen") as popen,
+        ):
+            result = fuzz.run_merge(["merge"], cwd="fixture", timeout=600)
+            self.assertIs(result, run.return_value)
+            run.assert_called_once_with(
+                ["merge"], check=True, cwd="fixture", timeout=600
+            )
+            popen.assert_not_called()
+
+    def test_timeout_stops_descendant_before_workspace_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            binary = root / "merge_probe"
+            pidfile = root / "child.pid"
+            # The parent reaps its worker on SIGTERM. SIGKILL of only the parent
+            # (subprocess.run's timeout) leaves that real worker alive.
+            binary.write_text(
+                f"#!{sys.executable}\n"
+                "import os, signal, subprocess, sys\n"
+                "from pathlib import Path\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import signal; signal.pause()'])\n"
+                "def stop(*_):\n"
+                "    child.wait()\n"
+                "    sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                f"Path({str(pidfile)!r}).write_text(str(child.pid))\n"
+                "signal.pause()\n"
+            )
+            binary.chmod(0o700)
+            original_cleanup = shutil.rmtree
+            checked_workspaces = []
+
+            def cleanup(path, *args, **kwargs):
+                if Path(path).name.startswith(".corpus-"):
+                    checked_workspaces.append(Path(path))
+                    self.assertTrue(pidfile.is_file(), "worker never started")
+                    with self.assertRaises(
+                        ProcessLookupError,
+                        msg="merge descendant is still alive at cleanup",
+                    ):
+                        os.kill(int(pidfile.read_text()), 0)
+                return original_cleanup(path, *args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(fuzz, "MERGE_SECONDS", 2),
+                    mock.patch.object(fuzz.shutil, "rmtree", side_effect=cleanup),
+                    self.assertRaises(subprocess.TimeoutExpired),
+                ):
+                    fuzz.minimize(binary, corpus, root)
+                self.assertEqual(
+                    len(checked_workspaces), 1, "workspace cleanup not checked"
+                )
+            finally:
+                if pidfile.exists():
+                    try:
+                        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+
 class FuzzTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -36,6 +190,15 @@ class FuzzTests(unittest.TestCase):
             (self.root / ("corpus" if name == "snapshot" else f"corpus_{name}")).mkdir()
             (self.root / f"regressions/{name}-boundary.bin").touch()
         (self.root / "fuzz.dict").touch()
+        patcher = mock.patch.object(
+            fuzz,
+            "run_merge",
+            side_effect=lambda args, **kwargs: fuzz.subprocess.run(
+                args, check=True, **kwargs
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_documented_budget_command_matches_workflow(self):
         repo = Path(__file__).resolve().parents[2]
@@ -1020,15 +1183,21 @@ class FuzzMergeSanitizerTests(unittest.TestCase):
         self.minimized.mkdir(parents=True)
         (self.minimized / "previous.bin").write_bytes(b"previous")
         self.completed = []
-        original_run = subprocess.run
+        original_run = fuzz.run_merge
 
         def execute(*args, **kwargs):
             kwargs["timeout"] = 30  # Bound this single-input sanitizer diagnostic.
-            result = original_run(*args, **kwargs, capture_output=True, text=True)
+            result = original_run(
+                *args,
+                **kwargs,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
             self.completed.append(result)
             return result
 
-        patcher = mock.patch.object(fuzz.subprocess, "run", side_effect=execute)
+        patcher = mock.patch.object(fuzz, "run_merge", side_effect=execute)
         patcher.start()
         self.addCleanup(patcher.stop)
 

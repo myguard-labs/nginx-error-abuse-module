@@ -2,8 +2,10 @@
 """Replay all regressions and fuzz every discovered target; fail on omissions."""
 
 import argparse
+import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -21,6 +23,46 @@ JOB_OVERHEAD_SECONDS = 60 * 60  # setup, build, artifact upload and runner overh
 TARGET_OVERHEAD_SECONDS = 120 + 2 * 60 + 600  # regression, exit grace, minimization
 MERGE_SECONDS = 600
 REPLAY_SECONDS = 60  # per fixture, replayed once in each pass
+MERGE_EXIT_GRACE_SECONDS = 5
+
+
+def run_merge(args, *, cwd, timeout, **kwargs):
+    if os.name != "posix":
+        return subprocess.run(args, check=True, cwd=cwd, timeout=timeout, **kwargs)
+    # Own a new group until completion. On timeout, stop workers before removing
+    # their workspace, give the parent time to reap them, then kill stragglers
+    # even if the parent has already exited. Reap our direct child before return.
+    with subprocess.Popen(args, cwd=cwd, start_new_session=True, **kwargs) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.communicate(timeout=MERGE_EXIT_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+            raise
+        except BaseException:
+            # Detached workers do not receive the caller's terminal interrupt.
+            # Stop the whole group and reap our child before workspace cleanup.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
+        result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+        result.check_returncode()
+        return result
 
 
 def regression_fixtures(root):
@@ -87,7 +129,7 @@ def minimize(binary, corpus, root):
         artifacts = Path(
             tempfile.mkdtemp(prefix=f"crash-merge-{binary.name}-", dir=root)
         )
-        subprocess.run(
+        run_merge(
             [
                 str(binary),
                 "-merge=1",
@@ -95,7 +137,6 @@ def minimize(binary, corpus, root):
                 str(corpus),
                 f"-artifact_prefix={artifacts}/",
             ],
-            check=True,
             cwd=root,
             timeout=MERGE_SECONDS,
         )
