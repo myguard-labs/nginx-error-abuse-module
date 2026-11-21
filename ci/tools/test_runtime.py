@@ -353,6 +353,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")
     parser.add_argument("--log-safety-only", action="store_true")
+    parser.add_argument("--redis-lifecycle-only", action="store_true")
     parser.add_argument(
         "--config-seeds-only",
         action="store_true",
@@ -626,6 +627,111 @@ class DisconnectRedisServer(socketserver.ThreadingTCPServer):
         self.shutdown()
         self.server_close()
         self.thread.join(timeout=5)
+
+
+def test_redis_lifecycle(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> None:
+    """RA02-EA-07: completion owns its token even after request termination."""
+    for mode in ("nil", "blocked", "timeout", "disconnect", "cancel", "shutdown"):
+        peer = LifecycleRedisServer(mode)
+        peer.start()
+        server = Nginx(binary, module, root / mode, port, runner, False, peer.port)
+        slow_listener = socket.socket()
+        slow_listener.bind(("127.0.0.1", 0))
+        slow_listener.listen()
+        slow_listener.settimeout(5)
+        slow_client = None
+        upstream = None
+        client = None
+
+        (server.root / "conf").mkdir(parents=True)
+        (server.root / "logs").mkdir()
+        load = f"load_module {module};\n" if module else ""
+        timeout = "250ms" if mode == "timeout" else "30s"
+        slow_port = slow_listener.getsockname()[1]
+        (server.root / "conf" / "nginx.conf").write_text(
+            f"""{load}worker_processes 1;
+worker_shutdown_timeout 100ms;
+pid {server.root}/nginx.pid;
+error_log {server.root}/logs/error.log debug;
+events {{ worker_connections 64; }}
+http {{
+    access_log {server.root}/access.log;
+    error_abuse_redis host=127.0.0.1 port={peer.port} timeout={timeout};
+    error_abuse_zone zone=lifecycle:1m key=$arg_client redis=on;
+    server {{
+        listen 127.0.0.1:{port};
+        location = /redis-ok.gif {{ error_abuse zone=lifecycle; empty_gif; }}
+        location = /slow.gif {{ proxy_pass http://127.0.0.1:{slow_port}; }}
+    }}
+}}
+""",
+            encoding="ascii",
+        )
+        server.write_config = lambda: None
+        try:
+            server.start()
+            _wait_for_log(server.root / "logs" / "error.log", b"connected to Redis")
+            client = socket.create_connection(("127.0.0.1", port), timeout=5)
+            client.sendall(
+                b"GET /redis-ok.gif?client=lifecycle HTTP/1.0\r\n"
+                b"Host: localhost\r\n\r\n"
+            )
+            if not peer.get.wait(5):
+                raise AssertionError(f"{mode}: request never parked on Redis GET")
+            if mode == "shutdown":
+                # A second active request keeps the worker event loop running
+                # until shutdown_timeout forcibly terminates both requests.
+                slow_client = socket.create_connection(("127.0.0.1", port), timeout=5)
+                slow_client.sendall(
+                    b"GET /slow.gif?hold=1 HTTP/1.0\r\nHost: localhost\r\n\r\n"
+                )
+                upstream, _ = slow_listener.accept()
+                os.kill(server.process.pid, signal.SIGQUIT)
+                server.process.wait(timeout=5)
+                _wait_for_log(
+                    server.root / "logs" / "error.log", b"http terminate request"
+                )
+                # exit_process flushes the still-pending hiredis callback.
+            else:
+                if mode == "cancel":
+                    client.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    client.close()
+                    client = None
+                if mode != "timeout":
+                    peer.release.set()
+                if client is not None:
+                    response = b""
+                    while chunk := client.recv(65536):
+                        response += chunk
+                    expected = b"429" if mode == "blocked" else b"200"
+                    if response.split(b" ", 2)[1:2] != [expected]:
+                        raise AssertionError(
+                            f"{mode}: wrong completion response: {response!r}"
+                        )
+                else:
+                    if not peer.finished.wait(5):
+                        raise AssertionError("cancel: late Redis reply was not sent")
+                _wait_for_log(server.root / "access.log", b"client=lifecycle")
+                access = (server.root / "access.log").read_text(encoding="ascii")
+                if access.count("client=lifecycle") != 1:
+                    raise AssertionError(f"{mode}: request completed more than once")
+            server.stop()
+            server.assert_clean_logs()
+            print(f"OK: Redis request lifecycle {mode}")
+        finally:
+            for stream in (client, slow_client, upstream, slow_listener):
+                if stream is not None:
+                    stream.close()
+            peer.stop()
+            server.stop()
 
 
 def test_redis_backoff_cap(
@@ -1273,6 +1379,55 @@ class HostileRedisServer:
             self._thread.join(timeout=5)
         self._server = None
         self._thread = None
+
+
+class LifecycleRedisServer(HostileRedisServer):
+    """Gate GET completion so tests choose reply, timeout, or disconnect."""
+
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+        self.release = threading.Event()
+        self.get = threading.Event()
+        self.finished = threading.Event()
+
+    def start(self) -> None:
+        parent = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                try:
+                    while command := parent._read_command(self.rfile):
+                        if command[0].upper() == b"GET":
+                            parent.get.set()
+                            if not parent.release.wait(10):
+                                return
+                            if parent.mode == "disconnect":
+                                return
+                            if parent.mode == "blocked":
+                                value = str(int(time.time()) + 5).encode("ascii")
+                                response = b"$%d\r\n%s\r\n" % (len(value), value)
+                            else:
+                                response = b"$-1\r\n"
+                            parent.finished.set()
+                        else:
+                            response = parent._response(command)
+                        self.wfile.write(response)
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.release.set()
+        super().stop()
 
 
 class HandshakeRecoveryRedisServer(HostileRedisServer):
@@ -3709,6 +3864,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
         root = pathlib.Path(tmp)
+        if args.redis_lifecycle_only:
+            test_redis_lifecycle(binary, module, root, args.runner, args.port)
+            return 0
         if args.config_seeds_only:
             test_config_seeds(binary, module, root, args.runner)
             print("OK: bounded configuration parser seeds")
@@ -3815,6 +3973,7 @@ def main() -> int:
             binary, module, root, args.runner, args.port + 12, True
         )
         test_redis_deadline_clamp(binary, module, root, args.runner, args.port + 12)
+        test_redis_lifecycle(binary, module, root, args.runner, args.port + 12)
         test_on_full_policy(
             binary,
             module,
