@@ -66,6 +66,58 @@ class WorkflowFixture(unittest.TestCase):
 
 
 class CadenceTests(WorkflowFixture):
+    def test_required_soak_failure_propagation(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_bytes()
+        for name in ("memcheck", "helgrind"):
+            for value in (False, True, "${{ true }}"):
+                with self.subTest(name=name, value=value):
+                    path.write_bytes(original)
+                    self.update_workflow(
+                        "ci-deep.yml",
+                        lambda doc, name=name, value=value: next(
+                            step
+                            for step in doc["jobs"][name]["steps"]
+                            if "ci/tools/soak.sh" in step.get("run", "")
+                        ).update({"continue-on-error": value}),
+                    )
+                    expected = (
+                        [] if value is False else [f"{name} soak can suppress failure"]
+                    )
+                    self.assertEqual(policy.check(self.root), expected)
+        path.write_bytes(original)
+        for name in ("memcheck", "helgrind"):
+            self.update_workflow(
+                "ci-deep.yml",
+                lambda doc, name=name: doc["jobs"][name]["steps"].append(
+                    {
+                        "name": "Notify",
+                        "if": "failure()",
+                        "continue-on-error": True,
+                        "run": "echo notification",
+                    }
+                ),
+            )
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_required_soak_jobs_cannot_suppress_failure(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_bytes()
+        for name in ("memcheck", "helgrind"):
+            for value in (False, True, "false", "${{ false }}", "${{ true }}"):
+                with self.subTest(name=name, value=value):
+                    path.write_bytes(original)
+                    self.update_workflow(
+                        "ci-deep.yml",
+                        lambda doc, name=name, value=value: doc["jobs"][name].update(
+                            {"continue-on-error": value}
+                        ),
+                    )
+                    expected = (
+                        [] if value is False else [f"{name} job can suppress failure"]
+                    )
+                    self.assertEqual(policy.check(self.root), expected)
+
     def test_basic_test_command_required(self):
         path = self.root / ".github/workflows/build-test.yml"
         original = path.read_bytes()
@@ -860,7 +912,7 @@ class CadenceTests(WorkflowFixture):
 
 
 class StagedCadenceTests(WorkflowFixture):
-    def setUp(self):
+    def setUp(self, object_format="sha1"):
         super().setUp()
         source = policy.ROOT
         for name in (
@@ -873,7 +925,10 @@ class StagedCadenceTests(WorkflowFixture):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source / name, target)
-        self.git("init", "-q")
+        init_args = (
+            [] if object_format == "sha1" else [f"--object-format={object_format}"]
+        )
+        self.git("init", "-q", *init_args)
         self.git("add", ".")
         self.git(
             "-c",
@@ -897,16 +952,23 @@ class StagedCadenceTests(WorkflowFixture):
             **kwargs,
         )
 
-    def lint(self, mode="staged", files=(), overrides=None):
+    def lint(self, mode="staged", files=(), overrides=None, cwd=None):
         index = Path((overrides or {}).get("GIT_INDEX_FILE", self.root / ".git/index"))
         before = index.read_bytes()
         result = subprocess.run(
             [
                 "bash",
-                "ci/linter/run-all.sh" if files else "ci/linter/lint-ci-monthly.sh",
+                str(
+                    self.root
+                    / (
+                        "ci/linter/run-all.sh"
+                        if files
+                        else "ci/linter/lint-ci-monthly.sh"
+                    )
+                ),
                 *files,
             ],
-            cwd=self.root,
+            cwd=cwd or self.root,
             env=fixture_environment(
                 LINT_MODE=mode, LINT_ONLY="ci-monthly", **(overrides or {})
             ),
@@ -915,6 +977,52 @@ class StagedCadenceTests(WorkflowFixture):
         )
         self.assertEqual(index.read_bytes(), before, "lint changed the raw index")
         return result
+
+    def test_subdirectory_staged_workflow_validation(self):
+        # A valid staged graph must be reconstructed from repo-root paths even
+        # when cwd is ci/. Dirty worktree content must not enter the snapshot.
+        path = self.root / ".github/workflows/ci.yml"
+        path.write_bytes(path.read_bytes() + b"\n# staged selection\n")
+        self.git("add", str(path))
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        result = self.lint(cwd=self.root / "ci")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"CI cadence: retained PR gates", result.stdout)
+        self.assertNotIn(b"no staged workflow", result.stdout)
+        self.git("add", ".github/workflows/ci-deep.yml")
+        result = self.lint(cwd=self.root / "ci")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"lost full fuzz duration", result.stderr)
+
+    def test_subdirectory_without_staged_workflow_skips(self):
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        result = self.lint(cwd=self.root / "ci")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"no staged workflow", result.stdout)
+
+    def test_unmerged_sha256_workflow_fixture(self):
+        fixture = StagedCadenceTests()
+        try:
+            try:
+                fixture.setUp(object_format="sha256")
+            except subprocess.CalledProcessError as error:
+                if error.cmd[:2] == ["git", "init"] and (
+                    b"unknown hash algorithm" in error.stderr
+                    or (
+                        b"unknown option" in error.stderr
+                        and b"object-format" in error.stderr
+                    )
+                ):
+                    self.skipTest("installed Git does not support SHA-256 repositories")
+                raise
+            blob = fixture.git("rev-parse", ":.github/workflows/ci.yml").stdout.strip()
+            self.assertEqual(len(blob), 64)
+            try:
+                fixture.test_unmerged_workflow_is_rejected_without_index_changes()
+            except subprocess.CalledProcessError as error:
+                self.fail(f"SHA-256 unmerged fixture failed: {error.stderr!r}")
+        finally:
+            fixture.doCleanups()
 
     def test_explicit_nonworkflow_selection_skips_dirty_graph(self):
         self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
@@ -975,7 +1083,7 @@ class StagedCadenceTests(WorkflowFixture):
             "update-index",
             "--index-info",
             input=b"0 "
-            + b"0" * 40
+            + b"0" * len(blob)
             + b"\t"
             + path.encode()
             + b"\n100644 "
@@ -1380,6 +1488,46 @@ class FuzzStepConditionTests(WorkflowFixture):
         for condition in (" ( ( true ) ) ", "${{ (success ( )) }}"):
             with self.subTest(condition=condition):
                 self.assertTrue(policy.healthy_fuzz_step_condition({"if": condition}))
+
+
+class FixtureCompatibilityTests(unittest.TestCase):
+    def test_sha256_unsupported_errors_skip_and_release_partial_fixture(self):
+        original_setup = WorkflowFixture.setUp
+        roots = []
+
+        def prepare(fixture):
+            original_setup(fixture)
+            roots.append(fixture.root)
+
+        for message in (
+            b"fatal: unknown hash algorithm 'sha256'",
+            b"error: unknown option `object-format=sha256'",
+            b"fatal: cannot mkdir: permission denied",
+        ):
+            with self.subTest(message=message):
+                error = subprocess.CalledProcessError(
+                    129, ["git", "init", "-q", "--object-format=sha256"], stderr=message
+                )
+                unsupported = b"permission denied" not in message
+                expected = (
+                    unittest.SkipTest if unsupported else subprocess.CalledProcessError
+                )
+                with (
+                    mock.patch.object(WorkflowFixture, "setUp", new=prepare),
+                    mock.patch.object(StagedCadenceTests, "git", side_effect=error),
+                    self.assertRaises(expected),
+                ):
+                    StagedCadenceTests().test_unmerged_sha256_workflow_fixture()
+                self.assertFalse(roots[-1].exists(), "partial fixture was not removed")
+
+    def test_default_fixture_init_does_not_require_object_format_option(self):
+        fixture = StagedCadenceTests()
+        try:
+            with mock.patch.object(fixture, "git") as git:
+                fixture.setUp()
+            self.assertEqual(git.call_args_list[0], mock.call("init", "-q"))
+        finally:
+            fixture.doCleanups()
 
 
 if __name__ == "__main__":

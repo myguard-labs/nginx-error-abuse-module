@@ -23,7 +23,7 @@ if [ "${LINT_MODE:-all}" != staged ]; then
 fi
 # A graph needs every workflow from the same index, including unchanged callees.
 # Include deletions in the trigger; never refresh or write back the source index.
-changed=$(git diff --cached --name-only -- .github/workflows)
+changed=$(git diff --cached --name-only -- ':(top).github/workflows')
 if [ -z "$changed" ]; then
 	echo 'lint-ci-monthly: no staged workflow files to check'
 	exit 0
@@ -38,7 +38,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 entries = subprocess.check_output(
-    ["git", "ls-files", "--stage", "-z", "--", ".github/workflows"]
+    ["git", "ls-files", "--stage", "--full-name", "-z", "--", ":(top).github/workflows"]
 )
 for entry in entries.split(b"\0"):
     if not entry:

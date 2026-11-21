@@ -287,6 +287,8 @@ def check(root):
     ):
         errors.append("fuzz duration selected after budget preflight")
     for name, variable in (("memcheck", "USE_VALGRIND"), ("helgrind", "USE_HELGRIND")):
+        if jobs.get(name, {}).get("continue-on-error", False) is not False:
+            errors.append(f"{name} job can suppress failure")
         soaks = [
             step
             for step in jobs.get(name, {}).get("steps", [])
@@ -299,6 +301,8 @@ def check(root):
         if not soaks:
             errors.append(f"lost {name} full duration")
         for step in soaks:
+            if step.get("continue-on-error", False) is not False:
+                errors.append(f"{name} soak can suppress failure")
             if step.get("env", {}).get(variable) != "1":
                 errors.append(f"lost {name} instrumentation")
             if not healthy_fuzz_step_condition(step):
