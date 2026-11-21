@@ -37,8 +37,9 @@ class FuzzNamespaceTests(unittest.TestCase):
                         if a.startswith("-merge_control_file=")
                     )
                 )
+                seed = Path(args[3]) / "seed"
                 control.write_text(
-                    f"1\n0\n{Path(args[3]) / 'seed'}\nSTARTED 0 5\nFT 0\n",
+                    f"1\n0\n{seed}\nSTARTED 0 {seed.stat().st_size}\nFT 0\n",
                     encoding="utf-8",
                 )
 
