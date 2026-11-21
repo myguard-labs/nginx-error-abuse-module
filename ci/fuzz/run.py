@@ -117,7 +117,9 @@ def targets(root):
     for source in sorted(root.glob("fuzz_*.c")):
         name = source.stem.removeprefix("fuzz_")
         corpus = root / ("corpus" if name == "snapshot" else f"corpus_{name}")
-        dictionary = root / ("fuzz.dict" if name == "statuses" else f"{name}.dict")
+        dictionary = root / (
+            "fuzz.dict" if name == "statuses" else f"{source.stem}.dict"
+        )
         binary = root / source.stem
         if not binary.is_file() or not corpus.is_dir():
             raise ValueError(
@@ -131,6 +133,8 @@ def targets(root):
 
 def corpus_inputs(corpus):
     """Inventory nonempty seeds exactly as LLVM 18's POSIX merge loader does."""
+    if corpus.is_symlink():
+        raise ValueError(f"corpus root is a symlink: {corpus}")
     inputs = set()
     for path in corpus.rglob("*"):
         relative = path.relative_to(corpus)

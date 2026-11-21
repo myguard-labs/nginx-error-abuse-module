@@ -3,8 +3,9 @@
 
 import re
 import runpy
+import shlex
 import sys
-from itertools import pairwise
+from itertools import groupby, pairwise
 from pathlib import Path
 
 import yaml
@@ -96,6 +97,35 @@ def healthy_fuzz_step_condition(step, *, success_only=False):
     )
 
 
+def writes_fuzz_duration(body):
+    """Detect literal FUZZ_SECS environment writes per command or pipeline."""
+    if "FUZZ_SECS" not in body or "GITHUB_ENV" not in body:
+        return False
+    for line in body.replace("\\\n", " ").splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        try:
+            words = list(lexer)
+        except ValueError:
+            return True  # A malformed duration producer cannot be verified.
+        for separator, group in groupby(
+            words, lambda word: word in {";", "&&", "||", "&"}
+        ):
+            if separator:
+                continue
+            command = list(group)
+            if not any(word.startswith("FUZZ_SECS=") for word in command):
+                continue
+            for index, word in enumerate(command):
+                if word in {"$GITHUB_ENV", "${GITHUB_ENV}"} and (
+                    index > 0
+                    and command[index - 1] in {">", ">>"}
+                    or "tee" in command[:index]
+                ):
+                    return True
+    return False
+
+
 def check(root):
     # Documents live only for this invocation; traversal and validation still run
     # for every call. Failed reads/parses never enter the cache.
@@ -174,6 +204,12 @@ def check(root):
         for name in sorted(required & actual):
             if not healthy_pr_condition(caller, name, children[name]):
                 errors.append(f"PR target cannot run on healthy PR: {caller}/{name}")
+        if (
+            caller == "build-test"
+            and "runtime" in children
+            and children["runtime"].get("continue-on-error", False) is not False
+        ):
+            errors.append("required runtime job can suppress failure")
         if caller == "asan":
             outputs = children.get("asan", {}).get("outputs")
             if not isinstance(outputs, dict) or outputs.get("artifact-id") != (
@@ -194,23 +230,24 @@ def check(root):
             ):
                 errors.append("lost ASan artifact upload step")
 
-    basic_job = workflow("build-test.yml")["jobs"]["test-nginx"]
-    if basic_job.get("continue-on-error", False) is not False:
-        errors.append("required basic.t job can suppress failure")
-    basic = [
-        step
-        for step in basic_job.get("steps", [])
-        if step.get("name") == "Run ci/t/basic.t"
-    ]
-    if len(basic) != 1 or basic[0].get("continue-on-error", False) is not False:
-        errors.append("required basic.t step can suppress failure")
-    if len(basic) == 1 and not healthy_fuzz_step_condition(basic[0]):
-        errors.append("required basic.t step cannot run")
-    if len(basic) == 1 and not re.fullmatch(
-        r"prove(?:[ \t]+-v)?[ \t]+ci/t/basic\.t",
-        str(basic[0].get("run", "")).strip(),
-    ):
-        errors.append("required basic.t command missing")
+    basic_job = workflow("build-test.yml")["jobs"].get("test-nginx")
+    if basic_job is not None:
+        if basic_job.get("continue-on-error", False) is not False:
+            errors.append("required basic.t job can suppress failure")
+        basic = [
+            step
+            for step in basic_job.get("steps", [])
+            if step.get("name") == "Run ci/t/basic.t"
+        ]
+        if len(basic) != 1 or basic[0].get("continue-on-error", False) is not False:
+            errors.append("required basic.t step can suppress failure")
+        if len(basic) == 1 and not healthy_fuzz_step_condition(basic[0]):
+            errors.append("required basic.t step cannot run")
+        if len(basic) == 1 and not re.fullmatch(
+            r"prove(?:[ \t]+-v)?[ \t]+ci/t/basic\.t",
+            str(basic[0].get("run", "")).strip(),
+        ):
+            errors.append("required basic.t command missing")
     events = deep.get("on", deep.get(True, {}))
     if (
         not isinstance(events, dict)
@@ -441,6 +478,13 @@ def check(root):
         and fuzz["steps"].index(selectors[0]) > commands.index(preflight)
     ):
         errors.append("fuzz duration selected after budget preflight")
+    if len(selectors) == 1 and discovery in commands:
+        # Duration selection is the sole environment producer through discovery.
+        # Keep this literal shell contract bounded like the selector checks.
+        start = fuzz["steps"].index(selectors[0]) + 1
+        for step in fuzz["steps"][start : commands.index(discovery) + 1]:
+            if writes_fuzz_duration(str(step.get("run", ""))):
+                errors.append("fuzz duration changed after selection")
     for name, variable in (("memcheck", "USE_VALGRIND"), ("helgrind", "USE_HELGRIND")):
         if jobs.get(name, {}).get("continue-on-error", False) is not False:
             errors.append(f"{name} job can suppress failure")

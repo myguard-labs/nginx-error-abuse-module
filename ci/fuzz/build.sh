@@ -102,7 +102,7 @@ else
             fi
         done
         case "$output" in
-            *.c | *.dict)
+            *.c | *.dict | *.h)
                 echo "fuzz output has a reserved source extension: $output" >&2
                 exit 1
                 ;;

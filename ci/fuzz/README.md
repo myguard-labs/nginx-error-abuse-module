@@ -115,11 +115,14 @@ value other than `NGX_OK`/`NGX_ERROR`, or breaks its lockstep contract with
 `load()`.
 
 `build.sh` and `run.py` discover every `fuzz_*.c`, including future targets.
-Target binary names must not end in `.dict` or `.c`, which are reserved for
-input files. Dotted source names such as `fuzz_headers.v2.c` remain valid.
+Target binary names must not end in `.dict`, `.c`, or `.h`, which are reserved
+for input files. Dotted source names such as `fuzz_headers.v2.c` remain valid.
 Each target requires a matching executable and `corpus_<name>/` directory;
 `fuzz_snapshot` retains `corpus/`. `fuzz_statuses` retains `fuzz.dict`;
-other targets may provide `<name>.dict`. Regression fixtures use
+other targets may provide `<binary-name>.dict` (for example,
+`fuzz_accept.dict`). A target named `fuzz_fuzz` uses `fuzz_fuzz.dict`,
+leaving the statuses dictionary exclusive to `fuzz_statuses`. Regression fixtures
+use
 `regressions/<full-target-name>-<suffix>.bin` with a nonempty suffix. Exactly one
 registered target name followed by `-` must match. Ambiguous prefixes fail before
 any execution, so adding `snapshot-record-length` cannot steal an existing

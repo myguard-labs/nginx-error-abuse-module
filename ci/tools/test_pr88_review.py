@@ -352,7 +352,7 @@ class Cycle102Repairs(unittest.TestCase):
 
     def test_app74_reserved_target_suffix_docs(self):
         docs = (cadence.ROOT / "ci/fuzz/README.md").read_text()
-        self.assertIn("must not end in `.dict` or `.c`", docs)
+        self.assertIn("must not end in `.dict`, `.c`, or `.h`", docs)
         self.assertIn("fuzz_headers.v2.c", docs)
 
     def test_app75_seed_inventory_before_execution_and_before_publication(self):
@@ -530,6 +530,206 @@ class Cycle102Repairs(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(graph.GraphError, "nesting limit"):
                         graph.graph(root)
+
+
+class Cycle103Repairs(unittest.TestCase):
+    def test_app85_target_dictionary_routing(self):
+        with fixture(fuzz_tests.FuzzTests) as test:
+            (test.root / "fuzz_fuzz.c").touch()
+            (test.root / "fuzz_fuzz").touch()
+            (test.root / "corpus_fuzz").mkdir()
+            for own in (False, True):
+                with self.subTest(own=own):
+                    if own:
+                        (test.root / "fuzz_fuzz.dict").touch()
+                    with mock.patch.object(fuzz_tests.fuzz.subprocess, "run") as run:
+                        fuzz_tests.fuzz.run(test.root, "120")
+                    calls = [c.args[0] for c in run.call_args_list]
+                    status = next(
+                        c
+                        for c in calls
+                        if c[0].endswith("fuzz_statuses") and "-max_total_time=120" in c
+                    )
+                    added = next(c for c in calls if c[0].endswith("fuzz_fuzz"))
+                    self.assertIn(f"-dict={test.root}/fuzz.dict", status)
+                    self.assertEqual(
+                        [x for x in added if x.startswith("-dict=")],
+                        [f"-dict={test.root}/fuzz_fuzz.dict"] if own else [],
+                    )
+
+    def test_app86_symlinked_input_root_rejected_before_execution(self):
+        with fixture(fuzz_tests.FuzzTests) as test:
+            corpus = test.root / "corpus_accept"
+            published = test.root / "minimized/corpus_accept"
+            published.mkdir(parents=True)
+            (published / "keep").write_bytes(b"keep")
+            corpus.rmdir()
+            corpus.symlink_to(published, target_is_directory=True)
+            for merge in (False, True):
+                with (
+                    self.subTest(merge=merge),
+                    mock.patch.object(fuzz_tests.fuzz.subprocess, "run") as run,
+                ):
+                    with self.assertRaisesRegex(ValueError, "corpus root.*symlink"):
+                        fuzz_tests.fuzz.run(test.root, "120", merge)
+                    run.assert_not_called()
+            with mock.patch.object(fuzz_tests.fuzz, "run_merge") as run:
+                with self.assertRaisesRegex(ValueError, "corpus root.*symlink"):
+                    fuzz_tests.fuzz.minimize(
+                        test.root / "fuzz_accept", corpus, test.root
+                    )
+                run.assert_not_called()
+            self.assertEqual((published / "keep").read_bytes(), b"keep")
+
+    def test_app87_deep_nested_mappings_are_policy_findings(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            for name in ("README.md", "ci/fuzz/README.md"):
+                target = test.root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cadence.ROOT / name, target)
+            path = test.root / ".github/workflows/ci-deep.yml"
+            for jobs in ([], None, {"fuzz": []}, {"fuzz": None}):
+                with self.subTest(jobs=jobs):
+                    path.write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(cadence.ROOT / "ci/linter/workflow_policy.py"),
+                            "docs",
+                        ],
+                        env=cadence_tests.fixture_environment(
+                            WORKFLOW_POLICY_ROOT=str(test.root)
+                        ),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode, 1, result.stdout + result.stderr
+                    )
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertIn("must be a mapping", result.stdout + result.stderr)
+
+    def test_app88_runtime_cannot_suppress_failures(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/build-test.yml"
+            original = path.read_bytes()
+            for value in (True, "false", "${{ true }}", False, None):
+                with self.subTest(value=value):
+                    path.write_bytes(original)
+                    doc = graph.load_workflow(path)
+                    if value is not None:
+                        doc["jobs"]["runtime"]["continue-on-error"] = value
+                    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                    errors = cadence.check(test.root)
+                    if value is False or value is None:
+                        self.assertEqual(errors, [])
+                    else:
+                        self.assertIn(
+                            "required runtime job can suppress failure", errors
+                        )
+
+    def test_app89_missing_basic_job_reports_policy_finding(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/build-test.yml"
+            doc = graph.load_workflow(path)
+            del doc["jobs"]["test-nginx"]
+            for job in doc["jobs"].values():
+                needs = job.get("needs", [])
+                if isinstance(needs, str):
+                    needs = [needs]
+                if "test-nginx" in needs:
+                    job["needs"] = [name for name in needs if name != "test-nginx"]
+            path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+            errors = cadence.check(test.root)
+            self.assertTrue(
+                any("lost or unexpected PR target: build-test" in e for e in errors)
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import check_ci_cadence as p; from pathlib import Path; "
+                    + f"p.ROOT = Path({str(test.root)!r}); raise SystemExit(p.main())",
+                ],
+                env=cadence_tests.fixture_environment(
+                    PYTHONPATH=str(cadence.ROOT / "ci/tools")
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_app90_duration_cannot_change_after_selection(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            for command in (
+                'echo "FUZZ_SECS=60" >> "$GITHUB_ENV"',
+                'printf "FUZZ_SECS=60\\n" | tee -a "$GITHUB_ENV"',
+                'echo "FUZZ_SECS=60" | tee --append "$GITHUB_ENV"',
+                'echo "FUZZ_SECS=60" >> "${GITHUB_ENV}"',
+                'echo "FUZZ_SECS=60 >> "$GITHUB_ENV"',
+            ):
+                with self.subTest(command=command):
+                    path.write_bytes(original)
+                    doc = graph.load_workflow(path)
+                    steps = doc["jobs"]["fuzz"]["steps"]
+                    index = next(
+                        i
+                        for i, step in enumerate(steps)
+                        if "--check-budget" in str(step.get("run"))
+                    )
+                    steps.insert(index + 1, {"run": command})
+                    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                    self.assertIn(
+                        "fuzz duration changed after selection",
+                        cadence.check(test.root),
+                    )
+            for command in (
+                'echo "$FUZZ_SECS"\necho "CACHE_HIT=true" >> "$GITHUB_ENV"',
+                'echo "$FUZZ_SECS"; echo "CACHE_HIT=true" >> "$GITHUB_ENV"',
+                '# echo "FUZZ_SECS=60" >> "$GITHUB_ENV"',
+                'echo "FUZZ_SECS=60"',
+                'echo "NOT_FUZZ_SECS=60" >> "$GITHUB_ENV"',
+                'echo "$FUZZ_SECS" | cat "$GITHUB_ENV"',
+            ):
+                with self.subTest(harmless=command):
+                    path.write_bytes(original)
+                    doc = graph.load_workflow(path)
+                    steps = doc["jobs"]["fuzz"]["steps"]
+                    index = next(
+                        i
+                        for i, step in enumerate(steps)
+                        if "--check-budget" in str(step.get("run"))
+                    )
+                    steps.insert(index + 1, {"run": command})
+                    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                    self.assertEqual(cadence.check(test.root), [])
+            path.write_bytes(original)
+            self.assertEqual(cadence.check(test.root), [])
+
+    def test_app92_utf8_fixtures_under_ascii_locale(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "test_ci_review_policy.CadenceRepairTests.test_app70_monthly_scanners_and_report_upload_required",
+            ],
+            cwd=cadence.ROOT,
+            env=cadence_tests.fixture_environment(
+                LC_ALL="C",
+                PYTHONUTF8="0",
+                PYTHONCOERCECLOCALE="0",
+                PYTHONPATH=str(cadence.ROOT / "ci/tools"),
+            ),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 @contextlib.contextmanager

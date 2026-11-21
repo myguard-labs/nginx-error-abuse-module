@@ -189,25 +189,26 @@ class FuzzRepairTests(unittest.TestCase):
 class CadenceRepairTests(cadence_fixture.WorkflowFixture):
     def deep(self, mutate):
         path = self.root / ".github/workflows/ci-deep.yml"
-        doc = yaml.load(path.read_text(), Loader=WorkflowLoader)
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
         mutate(doc)
-        path.write_text(yaml.safe_dump(doc))
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     def test_app68_reload_requires_artifact_guard(self):
         path = self.root / ".github/workflows/asan.yml"
-        baseline = path.read_text()
+        baseline = path.read_text(encoding="utf-8")
         for condition in ("success()", "always()", "!cancelled()"):
             path.write_text(
                 baseline.replace(
                     "${{ !cancelled() && needs.asan.outputs.artifact-id != '' }}",
                     "${{ " + condition + " }}",
-                )
+                ),
+                encoding="utf-8",
             )
             self.assertIn(
                 "PR target cannot run on healthy PR: asan/asan-reload",
                 policy.check(self.root),
             )
-        path.write_text(baseline)
+        path.write_text(baseline, encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_app69_scheduled_budget_independent_of_manual(self):
@@ -245,14 +246,14 @@ class CadenceRepairTests(cadence_fixture.WorkflowFixture):
     def test_app70_monthly_scanners_and_report_upload_required(self):
         self.assertEqual(policy.check(self.root), [])
         path = self.root / ".github/workflows/ci-deep.yml"
-        baseline = path.read_text()
+        baseline = path.read_text(encoding="utf-8")
         for name in (
             "flawfinder",
             "clang-tidy (cert-*, security.*)",
             "semgrep",
             "Upload reports",
         ):
-            path.write_text(baseline)
+            path.write_text(baseline, encoding="utf-8")
             self.deep(
                 lambda doc, name=name: doc["jobs"]["scanners"].update(
                     steps=[
@@ -277,14 +278,14 @@ class CadenceRepairTests(cadence_fixture.WorkflowFixture):
                 "${{ github.workspace }}/wrong.log",
             ),
         ):
-            path.write_text(baseline)
+            path.write_text(baseline, encoding="utf-8")
             self.assertIn(before, baseline)
-            path.write_text(baseline.replace(before, after))
+            path.write_text(baseline.replace(before, after), encoding="utf-8")
             self.assertTrue(
                 any("monthly scanner" in error for error in policy.check(self.root)),
                 before,
             )
-        path.write_text(baseline)
+        path.write_text(baseline, encoding="utf-8")
         self.deep(
             lambda doc: doc["jobs"]["scanners"].update(steps=[{"run": "echo ok"}])
         )
@@ -294,10 +295,10 @@ class CadenceRepairTests(cadence_fixture.WorkflowFixture):
 
     def test_monthly_scanner_early_exit_cannot_satisfy_policy(self):
         path = self.root / ".github/workflows/ci-deep.yml"
-        baseline = path.read_text()
+        baseline = path.read_text(encoding="utf-8")
         for name in ("flawfinder", "clang-tidy (cert-*, security.*)", "semgrep"):
             for prefix in ("exit 0\n", "if false; then\n"):
-                path.write_text(baseline)
+                path.write_text(baseline, encoding="utf-8")
 
                 def mutate(doc, name=name, prefix=prefix):
                     step = next(
@@ -318,11 +319,11 @@ class CadenceRepairTests(cadence_fixture.WorkflowFixture):
                     ),
                     (name, prefix),
                 )
-        path.write_text(baseline)
+        path.write_text(baseline, encoding="utf-8")
         self.assertEqual(policy.check(self.root), [])
 
     def test_app62_documentation_has_both_effective_cutoffs(self):
-        text = (REPO / "ci/fuzz/README.md").read_text()
+        text = (REPO / "ci/fuzz/README.md").read_text(encoding="utf-8")
         self.assertIn("GitHub-hosted jobs stop after **360 minutes**", text)
         for name in ("README.md", "ci/fuzz/README.md"):
             destination = self.root / name
@@ -341,7 +342,8 @@ class CadenceRepairTests(cadence_fixture.WorkflowFixture):
             text.replace(
                 "GitHub-hosted jobs stop after **360 minutes**",
                 "GitHub-hosted jobs stop after **600 minutes**",
-            )
+            ),
+            encoding="utf-8",
         )
         result = subprocess.run(command, env=env, capture_output=True, check=False)
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -390,9 +392,13 @@ class StagedRepairTests(cadence_fixture.WorkflowFixture):
 
     def test_app67_budget_import_uses_selected_root(self):
         path = self.root / ".github/workflows/ci.yml"
-        path.write_text(path.read_text() + "\n# staged workflow\n")
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n# staged workflow\n", encoding="utf-8"
+        )
         self.git("add", ".github/workflows/ci.yml")
-        (self.root / "ci/fuzz/run.py").write_text("invalid python syntax!\n")
+        (self.root / "ci/fuzz/run.py").write_text(
+            "invalid python syntax!\n", encoding="utf-8"
+        )
         result = self.lint()
         self.assertEqual(result.returncode, 0, result.stderr)
         result = self.lint(mode="all")

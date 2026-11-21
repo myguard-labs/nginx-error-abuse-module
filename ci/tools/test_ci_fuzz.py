@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from itertools import groupby
 from pathlib import Path
 from unittest import mock
 
@@ -549,6 +550,8 @@ class FuzzTests(unittest.TestCase):
             "ci/fuzz/fuzz_headers": True,
             "ci/fuzz/fuzz_headers.v2": True,
             "ci/fuzz/fuzz_headers.v2.c": False,
+            "ci/fuzz/fuzz_common.h": False,
+            "ci/fuzz/fuzz_headers.v2.h": False,
             "ci/fuzz/fuzz_headers.v2.dict": False,
             "ci/fuzz/corpus_headers/0123456789abcdef": True,
             "ci/fuzz/corpus_headers/seed.bin": False,
@@ -1141,16 +1144,56 @@ class FuzzTests(unittest.TestCase):
                 for step in steps
                 if step["name"] == "Install validation tools"
             )
-            install_command = next(
-                line
-                for line in install.replace("\\\n", " ").splitlines()
-                if "apt-get install" in line
-            )
-            packages = shlex.split(install_command, comments=True)
-            packages = packages[packages.index("-y") + 1 :]
+            packages = []
+            previous = ";"
+            for line in install.replace("\\\n", " ").splitlines():
+                lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+                lexer.whitespace_split = True
+                for separator, words in groupby(
+                    lexer, lambda word: word in {";", "&&", "||", "|", "&"}
+                ):
+                    if separator:
+                        previous = next(words)
+                        continue
+                    command = list(words)
+                    conditional = previous in {"||", "|", "&"}
+                    previous = ";"
+                    if command[:1] == ["sudo"]:
+                        command = command[1:]
+                    if (
+                        not conditional
+                        and len(command) >= 2
+                        and command[0] in {"apt", "apt-get"}
+                        and command[1] == "install"
+                    ):
+                        packages.extend(
+                            word for word in command[2:] if not word.startswith("-")
+                        )
             for package in ("clang", "libclang-rt-dev"):
                 self.assertIn(package, packages)
 
+        split = yaml.safe_load(yaml.safe_dump(workflow))
+        split_step = next(
+            step
+            for step in split["jobs"]["validation"]["steps"]
+            if step["name"] == "Install validation tools"
+        )
+        for script in (
+            "sudo apt-get install -y clang\nsudo apt-get install -y libclang-rt-dev\n",
+            "sudo apt-get install -y clang && sudo apt-get install -y libclang-rt-dev",
+            "sudo apt-get update; sudo apt install -y clang libclang-rt-dev",
+            "sudo apt install -y clang libclang-rt-dev || echo failed",
+        ):
+            with self.subTest(script=script):
+                split_step["run"] = script
+                assert_toolchain_packages(split)
+        for script in (
+            "sudo apt-get install -y clang || sudo apt-get install -y libclang-rt-dev",
+            "sudo apt-get install -y clang ||\nsudo apt-get install -y libclang-rt-dev",
+        ):
+            split_step["run"] = script
+            with self.subTest(fallback=script), self.assertRaises(AssertionError):
+                assert_toolchain_packages(split)
         assert_toolchain_packages(workflow)
         continued = yaml.safe_load(yaml.safe_dump(workflow))
         install_step = next(
@@ -1518,19 +1561,20 @@ class FuzzTests(unittest.TestCase):
             self.assertIn("-fsanitize=address,undefined", command)
             self.assertIn("-fno-sanitize-recover=undefined", command)
             self.assertIn("-fsanitize=fuzzer", command)
-        reserved = self.root / "fuzz_reserved.dict.c"
-        reserved.touch()
-        result = subprocess.run(
-            ["bash", str(build), str(self.root)],
-            env=env,
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("reserved source extension", result.stderr)
-        self.assertEqual(len(log.read_text().splitlines()), 4)
-        reserved.unlink()
+        for suffix in ("dict", "h", "c"):
+            reserved = self.root / f"fuzz_reserved.{suffix}.c"
+            reserved.touch()
+            result = subprocess.run(
+                ["bash", str(build), str(self.root)],
+                env=env,
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("reserved source extension", result.stderr)
+            self.assertEqual(len(log.read_text().splitlines()), 4)
+            reserved.unlink()
         env["CC"] = str(self.root / "absent-compiler")
         result = subprocess.run(
             ["bash", str(build), str(self.root)],

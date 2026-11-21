@@ -543,11 +543,15 @@ def check_docs() -> int:
         fuzz_text = fuzz_readme.read_text(encoding="utf-8")
         if not deep_workflow.is_file():
             errors.append("ci/fuzz/README.md references missing ci-deep.yml")
-        timeout = (
-            load(deep_workflow).get("jobs", {}).get("fuzz", {}).get("timeout-minutes")
-            if deep_workflow.is_file()
-            else None
-        )
+        timeout = None
+        if deep_workflow.is_file():
+            deep_jobs = load(deep_workflow).get("jobs")
+            if not isinstance(deep_jobs, dict):
+                errors.append("ci-deep.yml jobs must be a mapping")
+            elif not isinstance(deep_jobs.get("fuzz"), dict):
+                errors.append("ci-deep.yml jobs.fuzz must be a mapping")
+            else:
+                timeout = deep_jobs["fuzz"].get("timeout-minutes")
         if (
             timeout != 600
             or "600-minute timeout" not in fuzz_text
