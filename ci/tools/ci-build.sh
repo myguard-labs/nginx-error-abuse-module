@@ -65,8 +65,25 @@
 
 set -euo pipefail
 
-ROOT="${BUILD_ROOT:-$PWD/.build}"
-MODULE_DIR="$PWD"
+MODULE_DIR="$(pwd -P)"
+# All cleanup and extraction targets must remain beneath this physical module
+# root. Resolve missing suffixes without creating them and reject symlink
+# redirection before identity probes, cache preparation, downloads or writes.
+root_input="${BUILD_ROOT:-$MODULE_DIR/.build}"
+invalid_build_root() {
+    echo 'invalid BUILD_ROOT: expected a nonsymlink directory below the module root' >&2
+    exit 2
+}
+if ! ROOT="$(realpath -m -- "$root_input")" \
+    || ! root_lexical="$(realpath -ms -- "$root_input")" \
+    || [[ "$ROOT" != "$root_lexical" || "$ROOT" != "$MODULE_DIR/"* ]]; then
+    invalid_build_root
+fi
+root_part="$ROOT"
+while [[ "$root_part" != "$MODULE_DIR" ]]; do
+    [[ ! -L "$root_part" && ( ! -e "$root_part" || -d "$root_part" ) ]] || invalid_build_root
+    root_part="${root_part%/*}"
+done
 NO_CACHE="${NO_CACHE:-0}"
 VERSIONS_FILE="$MODULE_DIR/.github/versions.env"
 

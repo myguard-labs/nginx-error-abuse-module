@@ -66,6 +66,65 @@ class WorkflowFixture(unittest.TestCase):
 
 
 class CadenceTests(WorkflowFixture):
+    def test_asan_artifact_output_mapping_required(self):
+        path = self.root / ".github/workflows/asan.yml"
+        original = path.read_bytes()
+        for outputs in (
+            None,
+            {},
+            {"artifact-id": ""},
+            {"artifact-id": "${{ steps.missing.outputs.artifact-id }}"},
+        ):
+            with self.subTest(outputs=outputs):
+                path.write_bytes(original)
+                self.update_workflow(
+                    "asan.yml",
+                    lambda doc, outputs=outputs: doc["jobs"]["asan"].update(
+                        outputs=outputs
+                    ),
+                )
+                self.assertIn(
+                    "lost ASan artifact-id producer output", policy.check(self.root)
+                )
+        path.write_bytes(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_manual_fuzz_input_requires_valid_default(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        original = path.read_bytes()
+        for inputs in (
+            None,
+            {},
+            {"fuzz_seconds": None},
+            {"fuzz_seconds": {}},
+            *(
+                {"fuzz_seconds": {"default": value}}
+                for value in ("", "0", "86401", "999999", "1\nPATH=x", True)
+            ),
+        ):
+            with self.subTest(inputs=inputs):
+                path.write_bytes(original)
+                self.update_workflow(
+                    "ci-deep.yml",
+                    lambda doc, inputs=inputs: doc["on"]["workflow_dispatch"].update(
+                        inputs=inputs
+                    ),
+                )
+                self.assertIn(
+                    "missing or invalid manual fuzz_seconds default",
+                    policy.check(self.root),
+                )
+        for default in ("1", "00001", "3600", "86400", 3600):
+            with self.subTest(default=default):
+                path.write_bytes(original)
+                self.update_workflow(
+                    "ci-deep.yml",
+                    lambda doc, default=default: doc["on"]["workflow_dispatch"][
+                        "inputs"
+                    ]["fuzz_seconds"].update(default=default),
+                )
+                self.assertEqual(policy.check(self.root), [])
+
     def test_required_soak_failure_propagation(self):
         path = self.root / ".github/workflows/ci-deep.yml"
         original = path.read_bytes()
@@ -912,6 +971,42 @@ class CadenceTests(WorkflowFixture):
 
 
 class StagedCadenceTests(WorkflowFixture):
+    def test_only_fixture_baseline_disables_global_hooks(self):
+        hooks = self.root / "global-hooks"
+        hooks.mkdir()
+        marker = self.root / "hook-ran"
+        hook = hooks / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 42\n")
+        hook.chmod(0o700)
+        config = self.root / "global-gitconfig"
+        config.write_text(f'[core]\n\thooksPath = "{hooks}"\n')
+        fixture = StagedCadenceTests()
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(config)}):
+            try:
+                try:
+                    fixture.setUp()
+                except subprocess.CalledProcessError:
+                    self.fail("fixture baseline ran inherited global hook")
+                self.assertFalse(marker.exists(), "baseline invoked global hook")
+                with self.assertRaises(subprocess.CalledProcessError):
+                    fixture.git(
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.test",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        "hook control",
+                    )
+                self.assertTrue(
+                    marker.exists(), "hooks disabled beyond baseline commit"
+                )
+            finally:
+                fixture.doCleanups()
+
     def setUp(self, object_format="sha1"):
         super().setUp()
         source = policy.ROOT
@@ -937,6 +1032,8 @@ class StagedCadenceTests(WorkflowFixture):
             "user.email=fixture@example.test",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
             "commit",
             "-qm",
             "fixture",

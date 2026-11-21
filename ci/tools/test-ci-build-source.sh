@@ -14,6 +14,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/ci-build-source.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 WORK="$TMP/repo"
+BUILD_ROOTS="$WORK/build-roots"
 FIXTURES="$TMP/fixtures"
 FAKEBIN="$TMP/bin"
 mkdir -p "$WORK/ci/tools" "$WORK/.github/scripts" "$FIXTURES" "$FAKEBIN"
@@ -160,35 +161,63 @@ expect_failure() {
     printf 'ok   %s (exit %s)\n' "$description" "$got"
 }
 
+# Build roots must be owned paths, before prepare cleanup or extraction.
+# These sentinels are test-owned and must survive every rejected invocation.
+external="$TMP/external"
+mkdir -p "$external/nginx-1.31.3-asan" "$WORK/owned"
+printf 'outside sentinel\n' > "$external/nginx-1.31.3-asan/sentinel"
+printf 'owned sentinel\n' > "$WORK/owned/sentinel"
+ln -s "$external" "$WORK/external-link"
+ln -s "$WORK/owned" "$WORK/internal-link"
+ln -s loop-root "$WORK/loop-root"
+printf 'file sentinel\n' > "$WORK/root-file"
+for bad_root in "$external" "$TMP/missing-external" "$WORK/external-link" "$WORK/external-link/nested" "$WORK/internal-link" "$WORK/loop-root" "$WORK/loop-root/nested" "$WORK/root-file" "$WORK/root-file/nested" "$WORK" "$WORK/../external"; do
+    for phase in prepare build; do
+        prepare=0
+        [[ "$phase" != prepare ]] || prepare=1
+        CI_BUILD_CACHE_PREPARE_ONLY="$prepare" GITHUB_OUTPUT="$TMP/root-outputs" \
+            expect_failure "reject $phase root: $bad_root" 2 'invalid BUILD_ROOT: expected a nonsymlink directory below the module root' \
+            "$bad_root" "$TMP/root-rejected.out" "$NGINX_GOOD" 1 nginx 1.31.3
+        [[ "$(cat "$external/nginx-1.31.3-asan/sentinel" 2>/dev/null)" == 'outside sentinel' ]] || fail 'rejected root modified external sentinel'
+        [[ "$(cat "$WORK/owned/sentinel" 2>/dev/null)" == 'owned sentinel' ]] || fail 'rejected root modified owned sentinel'
+        [[ "$(cat "$WORK/root-file")" == 'file sentinel' ]] || fail 'rejected root modified file sentinel'
+        [[ ! -e "$external/nginx-1.31.3.tar.gz" && ! -e "$external/nested" && ! -e "$TMP/missing-external" && ! -e "$TMP/root-outputs" ]] || fail 'rejected root produced files'
+    done
+done
+mkdir -p "$BUILD_ROOTS/unused"
+expect_success "canonical descendant root" nginx-1.31.3-asan \
+    "$BUILD_ROOTS/unused/../canonical-root" "$TMP/root-canonical.out" "$NGINX_GOOD" 1 nginx 1.31.3
+grep -Fq "binary=$BUILD_ROOTS/canonical-root/nginx-1.31.3-asan/objs/nginx" "$TMP/root-canonical.out" || fail 'build output root not canonical'
+
 # Genuine pinned controls: both flavor selectors accept their exact bytes.
-case_root="$TMP/nginx-good-root"
+case_root="$BUILD_ROOTS/nginx-good-root"
 mkdir -p "$case_root"
 cp "$NGINX_GOOD" "$case_root/nginx-1.31.3.tar.gz"
 expect_success "genuine pinned nginx cache" nginx-1.31.3-asan \
     "$case_root" "$TMP/nginx-good.out" /nonexistent 0 nginx 1.31.3
 
-case_root="$TMP/angie-good-root"
+case_root="$BUILD_ROOTS/angie-good-root"
 mkdir -p "$case_root"
 cp "$ANGIE_GOOD" "$case_root/angie-1.12.1.tar.gz"
 expect_success "genuine pinned Angie cache" angie-1.12.1-asan \
     "$case_root" "$TMP/angie-good.out" /nonexistent 0 angie 1.12.1
 
 expect_success "genuine pinned nginx download with NO_CACHE" nginx-1.31.3-asan \
-    "$TMP/nginx-download-good-root" "$TMP/nginx-download-good.out" \
+    "$BUILD_ROOTS/nginx-download-good-root" "$TMP/nginx-download-good.out" \
     "$NGINX_GOOD" 1 nginx 1.31.3
 expect_success "genuine pinned Angie download with NO_CACHE" angie-1.12.1-asan \
-    "$TMP/angie-download-good-root" "$TMP/angie-download-good.out" \
+    "$BUILD_ROOTS/angie-download-good-root" "$TMP/angie-download-good.out" \
     "$ANGIE_GOOD" 1 angie 1.12.1
 
 # A valid but wrong cache entry must be replaced before extraction. The marker
 # assertion distinguishes the replacement from silently compiling the cache.
-case_root="$TMP/nginx-cache-wrong-root"
+case_root="$BUILD_ROOTS/nginx-cache-wrong-root"
 mkdir -p "$case_root"
 cp "$NGINX_WRONG" "$case_root/nginx-1.31.3.tar.gz"
 expect_success "wrong valid nginx cache is replaced" nginx-1.31.3-asan \
     "$case_root" "$TMP/nginx-cache-wrong.out" "$NGINX_GOOD" 0 nginx 1.31.3
 
-case_root="$TMP/angie-cache-wrong-root"
+case_root="$BUILD_ROOTS/angie-cache-wrong-root"
 mkdir -p "$case_root"
 cp "$ANGIE_WRONG" "$case_root/angie-1.12.1.tar.gz"
 expect_success "wrong valid Angie cache is replaced" angie-1.12.1-asan \
@@ -196,7 +225,7 @@ expect_success "wrong valid Angie cache is replaced" angie-1.12.1-asan \
 
 # NO_CACHE removes any local archive, but the downloaded replacement must still
 # match the pin. These wrong archives are valid tar files, not corrupt inputs.
-case_root="$TMP/nginx-download-wrong-root"
+case_root="$BUILD_ROOTS/nginx-download-wrong-root"
 expect_failure "wrong valid nginx download is rejected with NO_CACHE" 1 \
     "sha256 MISMATCH" "$case_root" "$TMP/nginx-download-wrong.out" \
     "$NGINX_WRONG" 1 nginx 1.31.3
@@ -204,7 +233,7 @@ if [[ -e "$case_root/nginx-1.31.3-asan/SOURCE_MARKER" ]]; then
     fail "wrong valid nginx download reached extraction"
 fi
 
-case_root="$TMP/angie-download-wrong-root"
+case_root="$BUILD_ROOTS/angie-download-wrong-root"
 expect_failure "wrong valid Angie download is rejected with NO_CACHE" 1 \
     "sha256 MISMATCH" "$case_root" "$TMP/angie-download-wrong.out" \
     "$ANGIE_WRONG" 1 angie 1.12.1
@@ -214,26 +243,26 @@ fi
 
 # Unknown versions must fail before a downloader can run.
 expect_failure "unknown nginx version fails closed" 2 \
-    "no SHA-256 pin for nginx 9.9.9" "$TMP/nginx-unknown-root" \
+    "no SHA-256 pin for nginx 9.9.9" "$BUILD_ROOTS/nginx-unknown-root" \
     "$TMP/nginx-unknown.out" /nonexistent 0 nginx 9.9.9
 expect_failure "unknown Angie version fails closed" 2 \
-    "no SHA-256 pin for angie 9.9.9" "$TMP/angie-unknown-root" \
+    "no SHA-256 pin for angie 9.9.9" "$BUILD_ROOTS/angie-unknown-root" \
     "$TMP/angie-unknown.out" /nonexistent 0 angie 9.9.9
 expect_failure "unknown flavor fails closed" 2 \
-    "unsupported flavor: unknown" "$TMP/flavor-unknown-root" \
+    "unsupported flavor: unknown" "$BUILD_ROOTS/flavor-unknown-root" \
     "$TMP/flavor-unknown.out" /nonexistent 0 unknown 1.31.3
 BUILD_MODE=unknown expect_failure "unknown mode fails closed" 2 \
-    "unsupported mode: unknown" "$TMP/mode-unknown-root" \
+    "unsupported mode: unknown" "$BUILD_ROOTS/mode-unknown-root" \
     "$TMP/mode-unknown.out" /nonexistent 0 nginx 1.31.3
 
 write_versions "$nginx_sha" "$(printf '0%.0s' {1..64})" "$angie_sha"
 expect_failure "conflicting duplicate nginx pins fail closed" 2 \
-    "conflicting SHA-256 pins for nginx 1.31.3" "$TMP/conflict-root" \
+    "conflicting SHA-256 pins for nginx 1.31.3" "$BUILD_ROOTS/conflict-root" \
     "$TMP/conflict.out" /nonexistent 0 nginx 1.31.3
 
 write_versions invalid invalid "$angie_sha"
 expect_failure "malformed nginx digest fails closed" 2 \
-    "invalid SHA-256 pin for nginx 1.31.3" "$TMP/invalid-root" \
+    "invalid SHA-256 pin for nginx 1.31.3" "$BUILD_ROOTS/invalid-root" \
     "$TMP/invalid.out" /nonexistent 0 nginx 1.31.3
 write_versions "$nginx_sha" "$nginx_sha" "$angie_sha"
 

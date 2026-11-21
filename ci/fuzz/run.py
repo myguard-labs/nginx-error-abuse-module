@@ -35,6 +35,10 @@ def run_merge(args, *, cwd, timeout, **kwargs):
     with subprocess.Popen(args, cwd=cwd, start_new_session=True, **kwargs) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
+            result = subprocess.CompletedProcess(
+                args, process.returncode, stdout, stderr
+            )
+            result.check_returncode()
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -60,8 +64,6 @@ def run_merge(args, *, cwd, timeout, **kwargs):
                 pass
             process.communicate()
             raise
-        result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
-        result.check_returncode()
         return result
 
 

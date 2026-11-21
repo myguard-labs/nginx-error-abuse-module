@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,15 +28,75 @@ SPEC.loader.exec_module(fuzz)
 
 @unittest.skipUnless(os.name == "posix", "merge process groups are POSIX")
 class MergeProcessTests(unittest.TestCase):
+    @staticmethod
+    def worker_stopped(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        if sys.platform == "linux":
+            try:
+                status = Path(f"/proc/{pid}/stat").read_text()
+            except FileNotFoundError:
+                return True  # Reaped between kill(0) and the state read.
+            # The command name may contain spaces and parentheses.
+            fields = status.rpartition(")")[2].split()
+            return bool(fields and fields[0] == "Z")
+        return False
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux zombie state control")
+    def test_worker_liveness_distinguishes_owned_zombie(self):
+        with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
+            deadline = time.monotonic() + 5
+            while (
+                os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                is None
+            ):
+                self.assertLess(time.monotonic(), deadline, "child did not exit")
+                time.sleep(0.01)
+            # WNOWAIT leaves this test-owned child unreaped until context exit.
+            os.kill(child.pid, 0)
+            self.assertTrue(
+                self.worker_stopped(child.pid), "zombie reported as running"
+            )
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child.pid, 0)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process state control")
+    def test_worker_liveness_keeps_running_processes_live(self):
+        for status in ("123 (worker (name)) S 1 2", "123 (worker) R 1 2", ""):
+            with (
+                self.subTest(status=status),
+                mock.patch.object(os, "kill"),
+                mock.patch.object(Path, "read_text", return_value=status),
+            ):
+                self.assertFalse(self.worker_stopped(123))
+        with (
+            mock.patch.object(os, "kill"),
+            mock.patch.object(Path, "read_text", side_effect=FileNotFoundError),
+        ):
+            self.assertTrue(self.worker_stopped(123))
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(os, "kill"),
+            mock.patch.object(Path, "read_text") as read,
+        ):
+            self.assertFalse(self.worker_stopped(123))
+            read.assert_not_called()
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            self.assertTrue(self.worker_stopped(123))
+
     def test_merge_result_and_spawn_errors_propagate(self):
         for status in (0, 7):
             with (
                 self.subTest(status=status),
                 mock.patch.object(fuzz.subprocess, "Popen") as popen,
+                mock.patch.object(fuzz.os, "killpg") as kill,
             ):
                 process = popen.return_value.__enter__.return_value
                 process.communicate.return_value = ("output", "error")
                 process.returncode = status
+                process.pid = 123
                 if status:
                     with self.assertRaises(subprocess.CalledProcessError) as raised:
                         fuzz.run_merge(["merge"], cwd="fixture", timeout=600)
@@ -48,7 +109,14 @@ class MergeProcessTests(unittest.TestCase):
                 popen.assert_called_once_with(
                     ["merge"], cwd="fixture", start_new_session=True
                 )
-                process.communicate.assert_called_once_with(timeout=600)
+                self.assertEqual(
+                    process.communicate.call_args_list,
+                    [mock.call(timeout=600)] + ([mock.call()] if status else []),
+                )
+                self.assertEqual(
+                    kill.call_args_list,
+                    [mock.call(123, signal.SIGKILL)] if status else [],
+                )
         with (
             mock.patch.object(
                 fuzz.subprocess, "Popen", side_effect=FileNotFoundError("missing")
@@ -170,6 +238,54 @@ class MergeProcessTests(unittest.TestCase):
                 self.assertEqual(
                     len(checked_workspaces), 1, "workspace cleanup not checked"
                 )
+            finally:
+                if pidfile.exists():
+                    try:
+                        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_nonzero_merge_stops_surviving_worker_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            pidfile = root / "worker.pid"
+            binary = root / "merge_probe"
+            binary.write_text(
+                f"#!{sys.executable}\n"
+                "import subprocess, sys\nfrom pathlib import Path\n"
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "'import signal; signal.pause()'])\n"
+                f"Path({str(pidfile)!r}).write_text(str(child.pid))\n"
+                "sys.exit(7)\n"
+            )
+            binary.chmod(0o700)
+            original_cleanup = shutil.rmtree
+            checked = []
+
+            def cleanup(path, *args, **kwargs):
+                if Path(path).name.startswith(".corpus-"):
+                    checked.append(path)
+                    self.assertTrue(pidfile.is_file(), "merge worker never started")
+                    deadline = time.monotonic() + 2
+                    while not self.worker_stopped(int(pidfile.read_text())):
+                        self.assertLess(
+                            time.monotonic(),
+                            deadline,
+                            "worker survived nonzero merge exit at cleanup",
+                        )
+                        time.sleep(0.01)
+                return original_cleanup(path, *args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(fuzz.shutil, "rmtree", side_effect=cleanup),
+                    self.assertRaises(subprocess.CalledProcessError) as raised,
+                ):
+                    fuzz.minimize(binary, corpus, root)
+                self.assertEqual(raised.exception.returncode, 7)
+                self.assertEqual(len(checked), 1)
             finally:
                 if pidfile.exists():
                     try:

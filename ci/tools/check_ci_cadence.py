@@ -153,6 +153,12 @@ def check(root):
         for name in sorted(required & actual):
             if not healthy_pr_condition(caller, name, children[name]):
                 errors.append(f"PR target cannot run on healthy PR: {caller}/{name}")
+        if caller == "asan":
+            outputs = children.get("asan", {}).get("outputs")
+            if not isinstance(outputs, dict) or outputs.get("artifact-id") != (
+                "${{ steps.asan-artifact.outputs.artifact-id }}"
+            ):
+                errors.append("lost ASan artifact-id producer output")
     basic = [
         step
         for step in workflow("build-test.yml")["jobs"]["test-nginx"].get("steps", [])
@@ -174,6 +180,12 @@ def check(root):
         or events.get("schedule") != [{"cron": "30 3 4 * *"}]
     ):
         errors.append("monthly/manual trigger contract")
+    dispatch = events.get("workflow_dispatch") if isinstance(events, dict) else None
+    inputs = dispatch.get("inputs") if isinstance(dispatch, dict) else None
+    fuzz_input = inputs.get("fuzz_seconds") if isinstance(inputs, dict) else None
+    default = str(fuzz_input.get("default", "")) if isinstance(fuzz_input, dict) else ""
+    if not re.fullmatch(r"[0-9]{1,5}", default) or not 1 <= int(default) <= 86400:
+        errors.append("missing or invalid manual fuzz_seconds default")
     codeql = workflow("codeql.yml")
     if "schedule" in event_names(codeql):
         errors.append("duplicate CodeQL schedule")
