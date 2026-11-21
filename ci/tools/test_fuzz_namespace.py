@@ -30,6 +30,17 @@ class FuzzNamespaceTests(unittest.TestCase):
         def execute(args, **_kwargs):
             if "-merge=1" in args:
                 (Path(args[2]) / "output").write_bytes(Path(args[3]).name.encode())
+                control = Path(
+                    next(
+                        a.split("=", 1)[1]
+                        for a in args
+                        if a.startswith("-merge_control_file=")
+                    )
+                )
+                control.write_text(
+                    f"1\n0\n{Path(args[3]) / 'seed'}\nSTARTED 0 5\nFT 0\n",
+                    encoding="utf-8",
+                )
 
         with mock.patch.object(fuzz.subprocess, "run", side_effect=execute):
             fuzz.run(self.root, "120", True)
