@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import os
 import runpy
+import shlex
 import shutil
 import signal
 import subprocess
@@ -953,37 +954,16 @@ class FuzzTests(unittest.TestCase):
                 fuzz.run(self.root, "120")
             run.assert_not_called()
 
-    def test_regression_routing_uses_longest_registered_name(self):
-        names = ("header", "header-list", "header-list-long")
-        for name in names:
+    def test_regression_routing_rejects_overlapping_registered_names(self):
+        for name in ("header", "header-list"):
             (self.root / f"fuzz_{name}.c").touch()
             (self.root / f"fuzz_{name}").touch()
             (self.root / f"corpus_{name}").mkdir()
-        expected = {
-            "header-boundary.bin": "header",
-            "header-list-boundary.bin": "header-list",
-            "header-list-long-boundary.bin": "header-list-long",
-            "header-list-long-request-header-boundary.bin": "header-list-long",
-            "header-list-other-multiple-dashes.bin": "header-list",
-            "header-other-multiple-dashes.bin": "header",
-            "snapshot-record-length-bound-exact.bin": "snapshot",
-        }
-        for fixture in expected:
-            (self.root / "regressions" / fixture).touch()
+        (self.root / "regressions/header-list-boundary.bin").touch()
         with mock.patch.object(fuzz.subprocess, "run") as run:
-            fuzz.run(self.root, "120")
-        calls = [call.args[0] for call in run.call_args_list]
-        replay_count = len(expected) + 3
-        self.assertEqual(len(calls), replay_count + 6)
-        replayed = {
-            Path(args[1]).name: Path(args[0]).name for args in calls[:replay_count]
-        }
-        for fixture, name in expected.items():
-            with self.subTest(fixture=fixture):
-                self.assertEqual(replayed[fixture], f"fuzz_{name}")
-        self.assertTrue(
-            all("-max_total_time=120" in args for args in calls[replay_count:])
-        )
+            with self.assertRaisesRegex(ValueError, "ambiguous regression target"):
+                fuzz.run(self.root, "120")
+            run.assert_not_called()
 
     def test_invalid_regression_names_fail_before_any_execution(self):
         for name in ("header", "header-list", "header-list-long"):
@@ -1166,7 +1146,8 @@ class FuzzTests(unittest.TestCase):
                 for line in install.replace("\\\n", " ").splitlines()
                 if "apt-get install" in line
             )
-            packages = install_command.split("-y", 1)[1].split()
+            packages = shlex.split(install_command, comments=True)
+            packages = packages[packages.index("-y") + 1 :]
             for package in ("clang", "libclang-rt-dev"):
                 self.assertIn(package, packages)
 
@@ -1183,6 +1164,12 @@ class FuzzTests(unittest.TestCase):
             .replace(" libclang-rt-dev", " \\\n  libclang-rt-dev", 1)
         )
         assert_toolchain_packages(continued)
+        commented = yaml.safe_load(yaml.safe_dump(workflow))
+        for step in commented["jobs"]["validation"]["steps"]:
+            if step["name"] == "Install validation tools":
+                step["run"] = "sudo apt-get install -y clang # libclang-rt-dev"
+        with self.assertRaises(AssertionError):
+            assert_toolchain_packages(commented)
         for missing_package in ("clang", "libclang-rt-dev"):
             fixture = yaml.safe_load(yaml.safe_dump(workflow))
             install_step = next(

@@ -11,8 +11,6 @@ import yaml
 from check_ci_graph import GraphError, graph, load_workflow, width
 
 ROOT = Path(__file__).resolve().parents[2]
-# Share preflight's calculation rather than maintaining another budget formula.
-check_fuzz_budget = runpy.run_path(str(ROOT / "ci/fuzz/run.py"))["check_budget"]
 PR_NEEDS = {
     "build-test": set(),
     "lint": set(),
@@ -62,11 +60,12 @@ def script(job):
 def healthy_pr_condition(caller, name, job):
     condition = str(job.get("if", "success()"))
     condition = condition.removeprefix("${{").removesuffix("}}").strip()
-    return condition in {"success()", "always()", "!cancelled()"} or (
-        (caller, name) == ("asan", "asan-reload")
-        and job.get("needs") in ("asan", ["asan"])
-        and condition == "!cancelled() && needs.asan.outputs.artifact-id != ''"
-    )
+    if (caller, name) == ("asan", "asan-reload"):
+        return (
+            job.get("needs") in ("asan", ["asan"])
+            and condition == "!cancelled() && needs.asan.outputs.artifact-id != ''"
+        )
+    return condition in {"success()", "always()", "!cancelled()"}
 
 
 def healthy_fuzz_step_condition(step, *, success_only=False):
@@ -109,6 +108,9 @@ def check(root):
     def workflow(name):
         return document(root / ".github/workflows" / name)
 
+    # Select the tree before loading executable budget policy. Staged lint
+    # supplies a snapshot root; importing this module must not read run.py.
+    check_fuzz_budget = runpy.run_path(str(root / "ci/fuzz/run.py"))["check_budget"]
     errors = []
     pr = workflow("ci.yml")
     deep = workflow("ci-deep.yml")
@@ -226,6 +228,10 @@ def check(root):
             check_fuzz_budget(root / "ci/fuzz", default, "github-hosted")
         except ValueError as exc:
             errors.append(f"manual fuzz_seconds default exceeds runner budget: {exc}")
+    try:
+        check_fuzz_budget(root / "ci/fuzz", "3600", "github-hosted")
+    except ValueError as exc:
+        errors.append(f"scheduled fuzz duration exceeds runner budget: {exc}")
     codeql = workflow("codeql.yml")
     if "schedule" in event_names(codeql):
         errors.append("duplicate CodeQL schedule")
@@ -272,6 +278,78 @@ def check(root):
             errors.append(f"monthly ordering/diagnostics: {job}")
     if jobs.get("codeql", {}).get("uses") != "./.github/workflows/codeql.yml":
         errors.append("lost monthly CodeQL")
+    scanners = jobs.get("scanners", {})
+    if (
+        not healthy_fuzz_step_condition(scanners)
+        or scanners.get("continue-on-error", False) is not False
+    ):
+        errors.append("monthly scanner job cannot enforce its checks")
+    scanner_steps = scanners.get("steps", [])
+    source_pattern = r'"\$GITHUB_WORKSPACE"/src/ngx_http_error_abuse_\*\.c'
+    # Bound the whole script: a matching line after exit/false branches cannot
+    # prove that a scanner ran. Comments and continuations remain harmless.
+    for name, signature in (
+        (
+            "flawfinder",
+            (
+                rf"flawfinder --minlevel=1[ \t]+{source_pattern} 2>&1 \| tee flawfinder\.log\n"
+                rf"if flawfinder --minlevel=4 --quiet[ \t]+{source_pattern}[ \t]+"
+                r"2>/dev/null \| grep -Eq 'Hits = \[1-9\]'; then\n"
+                r'echo "[^"\n]+" >&2\nexit 1\nfi\necho "[^"\n]+"'
+            ),
+        ),
+        (
+            "clang-tidy (cert-*, security.*)",
+            (
+                r'set -euo pipefail\nN="\$NGINX_SRC_TREE"\n'
+                r'INCLUDES="(?:-I[A-Za-z0-9_$/.-]+[ \t]*)+"\n'
+                rf"clang-tidy {source_pattern}[ \t]+"
+                r"--checks='-\*,cert-\*,clang-analyzer-security\.\*,"
+                r"-clang-analyzer-security\.insecureAPI\.DeprecatedOrUnsafeBufferHandling'[ \t]+"
+                r"--warnings-as-errors='\*'[ \t]+-- \$INCLUDES "
+                r"\$\(pkg-config --cflags hiredis 2>/dev/null\)[ \t]+"
+                r"2>&1 \| tee clang-tidy\.log"
+            ),
+        ),
+        (
+            "semgrep",
+            (
+                r"semgrep scan --config p/c --config p/security-audit[ \t]+"
+                rf"--jobs=1 --metrics=off[ \t]+{source_pattern} "
+                r"2>&1 \| tee semgrep\.log \|\| true"
+            ),
+        ),
+    ):
+        matches = [step for step in scanner_steps if step.get("name") == name]
+        command = (
+            str(matches[0].get("run", "")).replace("\\\n", " ")
+            if len(matches) == 1
+            else ""
+        )
+        command = "\n".join(
+            line.strip()
+            for line in command.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if (
+            len(matches) != 1
+            or not re.fullmatch(signature, command)
+            or not healthy_fuzz_step_condition(matches[0])
+            or matches[0].get("continue-on-error", False) is not False
+        ):
+            errors.append(f"lost monthly scanner command: {name}")
+    uploads = [step for step in scanner_steps if step.get("name") == "Upload reports"]
+    if (
+        len(uploads) != 1
+        or not str(uploads[0].get("uses", "")).startswith("actions/upload-artifact@")
+        or uploads[0].get("if") != "always()"
+        or set(str(uploads[0].get("with", {}).get("path", "")).splitlines())
+        != {
+            f"${{{{ github.workspace }}}}/{name}.log"
+            for name in ("flawfinder", "clang-tidy", "semgrep")
+        }
+    ):
+        errors.append("lost monthly scanner report upload")
     fuzz = jobs.get("fuzz", {})
     if "continue-on-error" in fuzz and fuzz["continue-on-error"] is not False:
         errors.append("fuzz job can suppress failure")
@@ -392,6 +470,7 @@ def main():
         errors = check(ROOT)
     except (
         GraphError,
+        SyntaxError,
         OSError,
         UnicodeError,
         KeyError,

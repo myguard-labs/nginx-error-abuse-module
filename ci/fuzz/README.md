@@ -118,12 +118,12 @@ value other than `NGX_OK`/`NGX_ERROR`, or breaks its lockstep contract with
 Each target requires a matching executable and `corpus_<name>/` directory;
 `fuzz_snapshot` retains `corpus/`. `fuzz_statuses` retains `fuzz.dict`;
 other targets may provide `<name>.dict`. Regression fixtures use
-`regressions/<full-target-name>-<suffix>.bin` with a nonempty suffix. The longest
-registered target name followed by `-` selects the replay binary, so
-`header-list-boundary.bin` selects `fuzz_header-list` when both `header` and
-`header-list` are registered. Bare target names, unknown prefixes and missing
-suffixes fail before any replay or campaign; missing targets/corpora also fail
-visibly. Existing `snapshot-<suffix>.bin` names remain valid.
+`regressions/<full-target-name>-<suffix>.bin` with a nonempty suffix. Exactly one
+registered target name followed by `-` must match. Ambiguous prefixes fail before
+any execution, so adding `snapshot-record-length` cannot steal an existing
+`snapshot-record-length-bound-exact.bin` fixture from `snapshot`. Bare target
+names, unknown prefixes and missing suffixes also fail; missing targets/corpora
+fail visibly. Existing `snapshot-<suffix>.bin` names remain valid.
 
 The deep job has a total admission budget of **360 minutes on GitHub-hosted
 runners** and **600 minutes on self-hosted runners**. Before building,
@@ -143,8 +143,10 @@ GitHub-hosted runners accept the 3600-second default and at most 8040 seconds pe
 target. Self-hosted runners accept the same default and at most 15240 seconds per
 target. Adding a target or fixture reduces each maximum automatically. These
 are admission allowances, not measured execution guarantees: the workflow's
-600-minute timeout remains an independent hard upper bound if a phase overruns
-its reserve.
+600-minute timeout remains an independent hard upper bound on self-hosted
+runners. GitHub-hosted jobs stop after **360 minutes**, even when the workflow
+allows 600 minutes. Either cutoff can end an overrun before corpus upload.
+See [GitHub Actions limits](https://docs.github.com/en/actions/reference/limits).
 
 The budget preflight and `--merge` discovery include both passes. A standalone
 regression invocation admits its own campaign and replay once, without charging

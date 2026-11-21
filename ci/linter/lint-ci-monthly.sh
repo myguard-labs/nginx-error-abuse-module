@@ -28,7 +28,7 @@ if [ "${LINT_MODE:-all}" != staged ]; then
 fi
 # A graph needs every workflow from the same index, including unchanged callees.
 # Include deletions in the trigger; never refresh or write back the source index.
-changed=$(git diff --cached --ita-invisible-in-index --name-only -- ':(top).github/workflows' ':(top)ci/fuzz')
+changed=$(git diff --no-relative --cached --ita-invisible-in-index --name-only -- ':(top).github/workflows' ':(top)ci/fuzz')
 if [ -z "$changed" ] && [ "$selected" = false ]; then
 	echo 'lint-ci-monthly: no staged workflow files to check'
 	exit 0
@@ -47,7 +47,7 @@ entries = subprocess.check_output(
 )
 def additions(visibility):
     return set(subprocess.check_output([
-        "git", "diff", "--cached", visibility, "--diff-filter=A", "--name-only", "-z",
+        "git", "diff", "--no-relative", "--cached", visibility, "--diff-filter=A", "--name-only", "-z",
         "--", ":(top).github/workflows", ":(top)ci/fuzz",
     ]).split(b"\0"))
 

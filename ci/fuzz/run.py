@@ -2,6 +2,7 @@
 """Replay all regressions and fuzz every discovered target; fail on omissions."""
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -165,20 +166,60 @@ def minimize(binary, corpus, root):
         # start. STARTED only proves entry; FT proves callback completion,
         # even when it has no feature IDs. Empty files are ignored by libFuzzer.
         if any(path.is_file() and path.stat().st_size for path in corpus.rglob("*")):
-            lines = control.read_text().splitlines()
-            count = int(lines[0]) if lines else 0
-            started = [
-                int(match[1])
-                for line in lines[2 + count :]
-                if (match := re.fullmatch(r"STARTED ([0-9]+) [0-9]+", line))
-            ]
-            completed = [
-                int(match[1])
-                for line in lines[2 + count :]
-                if (match := re.fullmatch(r"FT ([0-9]+)(?: [0-9]+)*", line))
-            ]
-            if count < 1 or started != list(range(count)) or completed != started:
-                raise OSError("merge workers did not process every input")
+            try:
+                # Only record syntax is ASCII; POSIX filenames are raw bytes.
+                lines = control.read_bytes().split(b"\n")
+                count = int(lines[0]) if re.fullmatch(rb"[0-9]+", lines[0]) else 0
+                if count < 1 or lines[1] != b"0" or len(lines) < 2 + count:
+                    raise ValueError("invalid merge header")
+                filenames = lines[2 : 2 + count]
+                started = 0
+                completed = 0
+                selected = []
+                for line in lines[2 + count :]:
+                    if not line:
+                        continue
+                    match = re.fullmatch(
+                        rb"(STARTED|FT|COV) ([0-9]+)((?: [0-9]+)*)", line
+                    )
+                    if match is None:
+                        raise ValueError("invalid merge record")
+                    marker, index, values = match.groups()
+                    index = int(index)
+                    if marker == b"STARTED":
+                        if (
+                            len(values.split()) != 1
+                            or index != started
+                            or completed != started
+                        ):
+                            raise ValueError("invalid STARTED record")
+                        started += 1
+                    elif not started or index != started - 1:
+                        raise ValueError("merge record has no current input")
+                    elif marker == b"FT":
+                        if completed != started - 1:
+                            raise ValueError("duplicate FT record")
+                        completed += 1
+                        if values:
+                            selected.append(index)
+                    elif completed != started:
+                        raise ValueError("COV record precedes callback completion")
+                if started != count or completed != started:
+                    raise ValueError("incomplete merge")
+            except (ValueError, IndexError) as exc:
+                raise OSError(
+                    "merge workers did not process every input: malformed control"
+                ) from exc
+            # Default -merge=1 emits newly observed features per input, so every
+            # feature-bearing FT record selects that input (LLVM 18 FuzzerMerge).
+            # Verify the actual full-content output before touching the old tree.
+            for index in selected:
+                expected = Path(os.fsdecode(filenames[index])).read_bytes()
+                output = (
+                    pending / hashlib.sha1(expected, usedforsecurity=False).hexdigest()
+                )
+                if not output.is_file() or output.read_bytes() != expected:
+                    raise OSError(f"incomplete replacement corpus seed: {output.name}")
         if minimized.exists() or minimized.is_symlink():
             minimized.rename(previous)
         try:
@@ -199,18 +240,18 @@ def minimize(binary, corpus, root):
 def run(root, seconds, merge=False, runner_class="github-hosted"):
     check_budget(root, seconds, runner_class, regression=not merge)
     selected = targets(root)
-    # Validate all routing before replay or campaigns. The longest registered
-    # prefix keeps overlapping, hyphenated target names unambiguous.
+    # Reject namespace changes that could silently reassign an existing fixture.
     names = sorted(selected, key=len, reverse=True)
     regressions = []
     for fixture in regression_fixtures(root):
         if not fixture.is_file():
             raise ValueError(f"regression is not a file: {fixture.name}")
-        name = next(
-            (name for name in names if fixture.name.startswith(f"{name}-")), None
-        )
+        matches = [name for name in names if fixture.name.startswith(f"{name}-")]
+        name = matches[0] if matches else None
         if name is None or fixture.stem in selected or fixture.name == f"{name}-.bin":
             raise ValueError(f"regression has no target: {fixture.name}")
+        if len(matches) > 1:
+            raise ValueError(f"ambiguous regression target: {fixture.name}: {matches}")
         regressions.append((selected[name][0], fixture))
     failures = []
     for binary, fixture in regressions:

@@ -3,6 +3,7 @@
 
 import contextlib
 import re
+import runpy
 import shutil
 import subprocess
 import unittest
@@ -65,13 +66,16 @@ class ReviewRepairs(unittest.TestCase):
     def test_default_budget_boundary_tracks_target_and_fixture_inventory(self):
         with fixture(cadence_tests.CadenceTests) as test:
             path = test.root / ".github/workflows/ci-deep.yml"
+            check_budget = runpy.run_path(str(test.root / "ci/fuzz/run.py"))[
+                "check_budget"
+            ]
             for add_target in (False, True):
                 if add_target:
                     (test.root / "ci/fuzz/fuzz_extra.c").touch()
                 with self.assertRaisesRegex(
                     ValueError, "maximum discovery duration"
                 ) as error:
-                    cadence.check_fuzz_budget(test.root / "ci/fuzz", "86400")
+                    check_budget(test.root / "ci/fuzz", "86400")
                 maximum = int(
                     re.search(
                         r"maximum discovery duration is ([0-9]+)", str(error.exception)

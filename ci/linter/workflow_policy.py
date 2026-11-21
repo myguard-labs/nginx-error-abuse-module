@@ -541,6 +541,17 @@ def check_docs() -> int:
     ci_workflow = ROOT / ".github" / "workflows" / "ci.yml"
     if fuzz_readme.is_file():
         fuzz_text = fuzz_readme.read_text(encoding="utf-8")
+        timeout = (
+            load(deep_workflow).get("jobs", {}).get("fuzz", {}).get("timeout-minutes")
+        )
+        if (
+            timeout != 600
+            or "600-minute timeout" not in fuzz_text
+            or "GitHub-hosted jobs stop after **360 minutes**" not in fuzz_text
+        ):
+            errors.append(
+                "ci/fuzz/README.md must state the 600-minute workflow and 360-minute hosted cutoff"
+            )
         fuzz_links = re.findall(r"\]\(([^)]+)\)", fuzz_text)
         expected_fuzz_link = "../../.github/workflows/fuzzing.yml"
         if expected_fuzz_link not in fuzz_links:
