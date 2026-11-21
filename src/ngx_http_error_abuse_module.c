@@ -56,8 +56,8 @@
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
 /* F-5: min HMAC-SHA256 key size (bytes) */
 #define NGX_HTTP_ERROR_ABUSE_MIN_PERSIST_SECRET_BYTES 16
-/* STAB-1: cap configured durations (seconds) so now+block, now-interval and
- * value*1000 cannot overflow signed time_t/int64_t, including on 32-bit. */
+/* STAB-1: cap configured durations (seconds). Redis millisecond conversions
+ * must widen to int64_t before multiplication, including on 32-bit. */
 #define NGX_HTTP_ERROR_ABUSE_MAX_SECONDS   315360000  /* 10 years */
 #define NGX_HTTP_ERROR_ABUSE_DEFAULT_KEY       "$binary_remote_addr"
 #define NGX_HTTP_ERROR_ABUSE_DEFAULT_STATUSES  "403,404,500-599"
@@ -3721,16 +3721,16 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     argvlen[4] = block.len;
     argv[5] = interval;
     argvlen[5] = NGX_ERROR_ABUSE_REDIS_NUMBER(interval,
-                                               ctx->zone->interval * 1000);
+                                       (int64_t) ctx->zone->interval * 1000);
     argv[6] = threshold;
     argvlen[6] = NGX_ERROR_ABUSE_REDIS_NUMBER(threshold,
                                                ctx->zone->threshold);
     argv[7] = block_ms;
     argvlen[7] = NGX_ERROR_ABUSE_REDIS_NUMBER(block_ms,
-                                               ctx->zone->block * 1000);
+                                       (int64_t) ctx->zone->block * 1000);
     argv[8] = inactive;
     argvlen[8] = NGX_ERROR_ABUSE_REDIS_NUMBER(inactive,
-                                               ctx->zone->inactive * 1000);
+                                       (int64_t) ctx->zone->inactive * 1000);
     p = ngx_snprintf((u_char *) nonce, sizeof(nonce), "%uL:%ui",
                      ngx_http_error_abuse_redis_worker.nonce,
                      ++ngx_http_error_abuse_redis_worker.sequence);

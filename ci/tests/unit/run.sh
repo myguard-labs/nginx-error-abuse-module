@@ -232,4 +232,6 @@ if grep -nE "$deadline_add_re" "$ROOT/src/ngx_http_error_abuse_module.c"; then
 fi
 echo "OK: production deadline call sites use saturating time helper"
 
+python3 "$ROOT/ci/tools/test_redis_durations.py" --negative-controls
+
 # The socket/OpenSSL/hiredis integration probe runs separately in CI.
