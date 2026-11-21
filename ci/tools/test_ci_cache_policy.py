@@ -58,6 +58,7 @@ class CachePolicy(unittest.TestCase):
         self.assertIn("CI_BUILD_CACHE_PREPARE_ONLY=1", prepare["run"])
         self.assertEqual(
             restore["if"],
+            "inputs.executable-cache == 'true' && "
             "steps.identity.outputs.eligible == 'true' && "
             "github.ref == 'refs/heads/main' && "
             "(github.event_name == 'push' || github.event_name == 'schedule' || "

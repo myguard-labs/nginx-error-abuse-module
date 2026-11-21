@@ -43,6 +43,8 @@ def load(root, name):
 
 
 def event_names(doc):
+    if not isinstance(doc, dict):
+        raise TypeError("workflow document must be a mapping")
     events = doc.get("on", doc.get(True, {}))
     if isinstance(events, str):
         return {events}
@@ -343,6 +345,12 @@ def check(root):
         len(uploads) != 1
         or not str(uploads[0].get("uses", "")).startswith("actions/upload-artifact@")
         or uploads[0].get("if") != "always()"
+        or any(
+            scanner_steps.index(step) >= scanner_steps.index(uploads[0])
+            for step in scanner_steps
+            if step.get("name")
+            in {"flawfinder", "clang-tidy (cert-*, security.*)", "semgrep"}
+        )
         or set(str(uploads[0].get("with", {}).get("path", "")).splitlines())
         != {
             f"${{{{ github.workspace }}}}/{name}.log"

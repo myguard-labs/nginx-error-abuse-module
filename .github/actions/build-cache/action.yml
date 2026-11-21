@@ -1,4 +1,4 @@
-# sync-sha: 07e9919af46409f6620622c3702a2781df2996370b7fab88a59615ed839f5b0a
+# sync-sha: b6b45b9fcbd3970cc478ddaded4303c57b6eb99813e677c76603e77bddbe421a
 name: Build cache
 description: Restore verified archives, compiler objects and exact trusted-main trees.
 
@@ -13,6 +13,11 @@ inputs:
     description: "nginx or angie, matching ci-build.sh."
     required: false
     default: "nginx"
+
+  executable-cache:
+    description: "Restore/save exact executable trees when the caller consumes them."
+    required: false
+    default: "true"
 
 outputs:
   exact-hit:
@@ -48,12 +53,6 @@ runs:
         BUILD_VERSION: ${{ inputs.nginx-version }}
       run: |  # zizmor: ignore[github-env] -- CCACHE_DIR has a validated root and locally hashed leaf
         set -euo pipefail
-        identity=$(CI_BUILD_CACHE_PREPARE_ONLY=1 bash ci/tools/ci-build.sh "$BUILD_FLAVOR" "$BUILD_VERSION" "$BUILD_MODE")
-        eligible=$(bash ci/tools/build-identity.sh --executable-cache-eligible)
-        echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
-        scope=$(printf '%s\n' "$GITHUB_REPOSITORY" "$GITHUB_REF" | sha256sum | cut -d' ' -f1)
-        echo "build=$identity" >> "$GITHUB_OUTPUT"
-        echo "scope=$scope" >> "$GITHUB_OUTPUT"
         # Start empty even on persistent runners. PRs neither restore nor save
         # compiler objects: ref-scoped Actions entries cannot cross into pushes,
         # and no on-disk cache from an earlier job is accepted implicitly.
@@ -70,6 +69,12 @@ runs:
           echo "invalid workspace for compiler cache" >&2
           exit 2
         fi
+        identity=$(CI_BUILD_CACHE_PREPARE_ONLY=1 bash ci/tools/ci-build.sh "$BUILD_FLAVOR" "$BUILD_VERSION" "$BUILD_MODE")
+        eligible=$(bash ci/tools/build-identity.sh --executable-cache-eligible)
+        echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+        scope=$(printf '%s\n' "$GITHUB_REPOSITORY" "$GITHUB_REF" | sha256sum | cut -d' ' -f1)
+        echo "build=$identity" >> "$GITHUB_OUTPUT"
+        echo "scope=$scope" >> "$GITHUB_OUTPUT"
         parent="$workspace/.build"
         if [[ -L "$parent" || ( -e "$parent" && ! -d "$parent" ) ]]; then
           echo "unsafe compiler cache parent" >&2
@@ -118,6 +123,7 @@ runs:
     - name: Restore exact trusted-main executable tree
       id: executable
       if: >-
+        inputs.executable-cache == 'true' &&
         steps.identity.outputs.eligible == 'true' &&
         github.ref == 'refs/heads/main' &&
         (github.event_name == 'push' || github.event_name == 'schedule' ||

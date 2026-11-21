@@ -1,4 +1,4 @@
-# sync-sha: 1061e82f21d4a13fa785da0cd326314a6709716f5d4862843c96c85f52feec79
+# sync-sha: 09e7d0ceed23779d4834ba054dc5fa141615a1be5d615e2aff4448854fc6ea13
 name: Build and Test
 
 env:
@@ -418,16 +418,13 @@ jobs:
           # libtest-nginx-perl is unavailable on ubuntu-24.04 runners.
           sudo cpanm --notest --quiet Test::Nginx
 
-      # Keyed on mode: coverage, which is the PLAIN (non-harness) tree --
-      # the "Generate coverage report" step below sets TEST_HARNESS=1, which
-      # builds into a separate "-harness" suffixed tree (see ci-build.sh), so
-      # this restores nothing for that tree and coverage.sh builds it fresh.
-      # Kept anyway: coverage.sh's own internal tooling (ci/tests/unit)
-      # still benefits from a warm ccache.
+      # coverage.sh builds a distinct TEST_HARNESS=1 tree. Keep compiler and
+      # source caches, but do not transfer the unused plain executable tree.
       - name: Restore coverage build cache
         uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: coverage
+          executable-cache: "false"
           nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Verify coverage port band is free

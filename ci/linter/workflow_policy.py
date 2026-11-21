@@ -541,8 +541,12 @@ def check_docs() -> int:
     ci_workflow = ROOT / ".github" / "workflows" / "ci.yml"
     if fuzz_readme.is_file():
         fuzz_text = fuzz_readme.read_text(encoding="utf-8")
+        if not deep_workflow.is_file():
+            errors.append("ci/fuzz/README.md references missing ci-deep.yml")
         timeout = (
             load(deep_workflow).get("jobs", {}).get("fuzz", {}).get("timeout-minutes")
+            if deep_workflow.is_file()
+            else None
         )
         if (
             timeout != 600

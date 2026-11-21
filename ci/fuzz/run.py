@@ -129,7 +129,27 @@ def targets(root):
     return result
 
 
+def corpus_inputs(corpus):
+    """Inventory nonempty seeds exactly as LLVM 18's POSIX merge loader does."""
+    inputs = set()
+    for path in corpus.rglob("*"):
+        relative = path.relative_to(corpus)
+        # LLVM skips dot directories, follows file links and ignores empty files.
+        # Reject links/special files and newline names rather than silently losing
+        # seeds or introducing ambiguous merge-control filename records.
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise ValueError(f"unsupported corpus seed: {path}")
+        if path.is_file() and path.stat().st_size:
+            if any(part.startswith(".") for part in relative.parts[:-1]) or "\n" in str(
+                path
+            ):
+                raise ValueError(f"unsupported corpus seed: {path}")
+            inputs.add(os.fsencode(path))
+    return inputs
+
+
 def minimize(binary, corpus, root):
+    inputs = corpus_inputs(corpus)
     output_root = root / "minimized"
     if output_root.is_symlink():
         raise OSError(f"minimized output root is a symlink: {output_root}")
@@ -165,7 +185,7 @@ def minimize(binary, corpus, root):
         # LLVM's outer merge can exit zero even when every worker failed to
         # start. STARTED only proves entry; FT proves callback completion,
         # even when it has no feature IDs. Empty files are ignored by libFuzzer.
-        if any(path.is_file() and path.stat().st_size for path in corpus.rglob("*")):
+        if inputs:
             try:
                 # Only record syntax is ASCII; POSIX filenames are raw bytes.
                 lines = control.read_bytes().split(b"\n")
@@ -173,6 +193,8 @@ def minimize(binary, corpus, root):
                 if count < 1 or lines[1] != b"0" or len(lines) < 2 + count:
                     raise ValueError("invalid merge header")
                 filenames = lines[2 : 2 + count]
+                if count != len(inputs) or set(filenames) != inputs:
+                    raise ValueError("merge inventory mismatch")
                 started = 0
                 completed = 0
                 selected = []
@@ -220,12 +242,16 @@ def minimize(binary, corpus, root):
                 )
                 if not output.is_file() or output.read_bytes() != expected:
                     raise OSError(f"incomplete replacement corpus seed: {output.name}")
-        if minimized.exists() or minimized.is_symlink():
-            minimized.rename(previous)
         try:
+            if minimized.exists() or minimized.is_symlink():
+                minimized.rename(previous)
             pending.rename(minimized)
-        except OSError:
-            if previous.exists() or previous.is_symlink():
+        except BaseException:
+            # A signal may arrive after either rename completed. Restore only
+            # into a vacant destination; an installed replacement stays live.
+            if not (minimized.exists() or minimized.is_symlink()) and (
+                previous.exists() or previous.is_symlink()
+            ):
                 previous.rename(minimized)
             raise
         published = True
@@ -240,6 +266,8 @@ def minimize(binary, corpus, root):
 def run(root, seconds, merge=False, runner_class="github-hosted"):
     check_budget(root, seconds, runner_class, regression=not merge)
     selected = targets(root)
+    for _, corpus, _ in selected.values():
+        corpus_inputs(corpus)
     # Reject namespace changes that could silently reassign an existing fixture.
     names = sorted(selected, key=len, reverse=True)
     regressions = []

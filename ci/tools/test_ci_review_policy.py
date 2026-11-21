@@ -211,6 +211,15 @@ class CadenceRepairTests(cadence_fixture.WorkflowFixture):
         self.assertEqual(policy.check(self.root), [])
 
     def test_app69_scheduled_budget_independent_of_manual(self):
+        # Fix this boundary's inventory independently of checkout target growth.
+        fuzz_root = self.root / "ci/fuzz"
+        for source in fuzz_root.glob("fuzz_*.c"):
+            source.unlink()
+        shutil.rmtree(fuzz_root / "regressions")
+        (fuzz_root / "regressions").mkdir()
+        for index in range(2):
+            (fuzz_root / f"fuzz_synthetic{index}.c").touch()
+            (fuzz_root / f"regressions/synthetic{index}-boundary.bin").touch()
         self.deep(
             lambda doc: doc["on"]["workflow_dispatch"]["inputs"]["fuzz_seconds"].update(
                 default="120"

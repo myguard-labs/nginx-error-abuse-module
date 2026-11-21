@@ -99,6 +99,9 @@ def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
         path = (root / path).resolve()
         if not path.is_relative_to(root / ".github/workflows") or path in stack:
             raise GraphError("invalid or recursive workflow call")
+        # GitHub permits ten levels including the entry workflow.
+        if len(stack) >= 10:
+            raise GraphError("reusable workflow nesting limit exceeded")
         try:
             doc = (
                 load_workflow(path)

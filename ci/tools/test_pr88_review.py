@@ -2,10 +2,12 @@
 """Regression controls for the PR88 full-review repairs."""
 
 import contextlib
+import os
 import re
 import runpy
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -88,7 +90,12 @@ class ReviewRepairs(unittest.TestCase):
                     ] = str(value)
                     path.write_text(yaml.safe_dump(doc, sort_keys=False))
                     errors = cadence.check(test.root)
-                    self.assertEqual(not errors, valid, errors)
+                    manual = [
+                        error
+                        for error in errors
+                        if "manual fuzz_seconds default" in error
+                    ]
+                    self.assertEqual(not manual, valid, errors)
 
     def test_callable_trigger_forms_and_standalone_entry(self):
         with tempfile_directory() as root:
@@ -218,9 +225,23 @@ class ReviewRepairs(unittest.TestCase):
                         fuzz_tests.fuzz.run(test.root, "120")
                     finally:
                         self.assertEqual(
-                            run.call_count,
-                            3,
-                            "fresh campaign ran after failed regression",
+                            run.call_args_list,
+                            [
+                                mock.call(
+                                    [
+                                        str(test.root / f"fuzz_{name}"),
+                                        str(
+                                            test.root
+                                            / f"regressions/{name}-boundary.bin"
+                                        ),
+                                    ],
+                                    check=True,
+                                    cwd=test.root,
+                                    timeout=fuzz_tests.fuzz.REPLAY_SECONDS,
+                                )
+                                for name in ("accept", "snapshot", "statuses")
+                            ],
+                            "fresh campaign ran or a fixture replay was replaced",
                         )
 
     def test_staged_pathspec_overrides_cannot_hide_private_index(self):
@@ -282,6 +303,233 @@ class ReviewRepairs(unittest.TestCase):
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
             with self.assertRaisesRegex(graph.GraphError, "workflow_call"):
                 graph.graph(test.root)
+
+
+class Cycle102Repairs(unittest.TestCase):
+    def test_app72_workspace_rejected_before_prepare(self):
+        with fixture(cache_tests.CompilerCachePreparation) as test:
+            tools = test.repo / "ci/tools"
+            (tools / "ci-build.sh").write_text(
+                'echo called > "$GITHUB_OUTPUT.prepare"\n'
+                'echo tree=fixture-executable-tree >> "$GITHUB_OUTPUT"\n'
+                "echo expected-build-identity\n"
+            )
+            bad = test.root / "repo\n"
+            shutil.copytree(test.repo, bad)
+            test.repo = bad
+            result, _ = test.prepare(success=False)
+            self.assertIn("invalid workspace", result.stderr)
+            self.assertFalse(Path(test.env["GITHUB_OUTPUT"] + ".prepare").exists())
+
+    def test_app73_coverage_executable_cache_opt_out(self):
+        action = yaml.safe_load(
+            (cadence.ROOT / ".github/actions/build-cache/action.yml").read_text()
+        )
+        self.assertEqual(action["inputs"]["executable-cache"]["default"], "true")
+        restore = next(
+            s for s in action["runs"]["steps"] if s.get("id") == "executable"
+        )
+        self.assertIn("inputs.executable-cache == 'true'", restore["if"])
+        workflow = graph.load_workflow(
+            cadence.ROOT / ".github/workflows/build-test.yml"
+        )
+        cache = next(
+            s
+            for s in workflow["jobs"]["coverage"]["steps"]
+            if s.get("uses") == "./.github/actions/build-cache"
+        )
+        self.assertEqual(cache["with"]["executable-cache"], "false")
+        self.assertEqual(
+            len(
+                [
+                    s
+                    for s in action["runs"]["steps"]
+                    if "actions/cache@" in s.get("uses", "")
+                ]
+            ),
+            3,
+        )
+
+    def test_app74_reserved_target_suffix_docs(self):
+        docs = (cadence.ROOT / "ci/fuzz/README.md").read_text()
+        self.assertIn("must not end in `.dict` or `.c`", docs)
+        self.assertIn("fuzz_headers.v2.c", docs)
+
+    def test_app75_seed_inventory_before_execution_and_before_publication(self):
+        with fixture(fuzz_tests.FuzzTests) as test:
+            corpus = test.root / "corpus"
+            old = test.root / "minimized/corpus"
+            old.mkdir(parents=True)
+            (old / "keep").write_bytes(b"keep")
+            for name in (".archive/input", "nested/.archive/input", "bad\nname"):
+                seed = corpus / name
+                seed.parent.mkdir(parents=True, exist_ok=True)
+                seed.write_bytes(b"seed")
+                with (
+                    self.subTest(name=name),
+                    mock.patch.object(fuzz_tests.fuzz.subprocess, "run") as run,
+                    self.assertRaisesRegex(ValueError, "unsupported corpus seed"),
+                ):
+                    fuzz_tests.fuzz.run(test.root, "120")
+                run.assert_not_called()
+                seed.unlink()
+            for name in ("nested/seed", ".visible-file"):
+                seed = corpus / name
+                seed.parent.mkdir(parents=True, exist_ok=True)
+                seed.write_bytes(b"seed")
+            (corpus / "empty").touch()
+            seeds = [corpus / "nested/seed", corpus / ".visible-file"]
+            for filenames, valid in (
+                (seeds, True),
+                (seeds[:1], False),
+                ([seeds[0], seeds[0]], False),
+                ([seeds[0], old / "keep"], False),
+            ):
+
+                def merge(args, filenames=filenames, **_kwargs):
+                    control = Path(
+                        next(
+                            a.split("=", 1)[1]
+                            for a in args
+                            if a.startswith("-merge_control_file=")
+                        )
+                    )
+                    records = b"".join(
+                        b"STARTED %d 4\nFT %d\n" % (i, i) for i in range(len(filenames))
+                    )
+                    control.write_bytes(
+                        str(len(filenames)).encode()
+                        + b"\n0\n"
+                        + b"".join(os.fsencode(p) + b"\n" for p in filenames)
+                        + records
+                    )
+
+                with (
+                    self.subTest(filenames=filenames),
+                    mock.patch.object(fuzz_tests.fuzz, "run_merge", side_effect=merge),
+                ):
+                    if valid:
+                        fuzz_tests.fuzz.minimize(
+                            test.root / "fuzz_snapshot", corpus, test.root
+                        )
+                        (old / "keep").write_bytes(b"keep")
+                    else:
+                        with self.assertRaisesRegex(OSError, "every input"):
+                            fuzz_tests.fuzz.minimize(
+                                test.root / "fuzz_snapshot", corpus, test.root
+                            )
+                        self.assertEqual((old / "keep").read_bytes(), b"keep")
+
+    def test_app76_interrupt_restores_vacant_corpus_and_retains_installed(self):
+        for stage in ("after-backup", "before-install", "after-install"):
+            with self.subTest(stage=stage), fixture(fuzz_tests.FuzzTests) as test:
+                corpus = test.root / "corpus"
+                old = test.root / "minimized/corpus"
+                old.mkdir(parents=True)
+                (old / "keep").write_bytes(b"keep")
+                original = Path.rename
+
+                def rename(path, destination, stage=stage, old=old, original=original):
+                    if stage == "before-install" and path.name == "new":
+                        raise KeyboardInterrupt
+                    result = original(path, destination)
+                    if (stage == "after-backup" and path == old) or (
+                        stage == "after-install" and path.name == "new"
+                    ):
+                        raise KeyboardInterrupt
+                    return result
+
+                with (
+                    mock.patch.object(fuzz_tests.fuzz, "run_merge"),
+                    mock.patch.object(Path, "rename", new=rename),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    fuzz_tests.fuzz.minimize(
+                        test.root / "fuzz_snapshot", corpus, test.root
+                    )
+                self.assertTrue(old.is_dir())
+                if stage == "after-install":
+                    self.assertEqual(list(old.iterdir()), [])
+                else:
+                    self.assertEqual((old / "keep").read_bytes(), b"keep")
+
+    def test_app77_missing_deep_workflow_is_policy_finding(self):
+        with fixture(cadence_tests.CadenceTests) as test:
+            for name in ("README.md", "ci/fuzz/README.md"):
+                target = test.root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cadence.ROOT / name, target)
+            (test.root / ".github/workflows/ci-deep.yml").unlink()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(cadence.ROOT / "ci/linter/workflow_policy.py"),
+                    "docs",
+                ],
+                env=cadence_tests.fixture_environment(
+                    WORKFLOW_POLICY_ROOT=str(test.root)
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("missing ci-deep.yml", result.stdout + result.stderr)
+
+    def test_app78_non_mapping_workflow_is_uncheckable(self):
+        with fixture(cadence_tests.CadenceTests) as test:
+            path = test.root / ".github/workflows/extra.yml"
+            for value in ([], "text", 42, None):
+                with self.subTest(value=value):
+                    path.write_text(yaml.safe_dump(value))
+                    with (
+                        mock.patch.object(cadence, "ROOT", test.root),
+                        mock.patch("sys.stderr"),
+                    ):
+                        self.assertEqual(cadence.main(), 2)
+            for events in ("workflow_call", ["workflow_call"], {"workflow_call": None}):
+                self.assertEqual(cadence.event_names({"on": events}), {"workflow_call"})
+
+    def test_app79_upload_follows_every_scanner(self):
+        with fixture(cadence_tests.CadenceTests) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            doc = graph.load_workflow(path)
+            steps = doc["jobs"]["scanners"]["steps"]
+            upload = next(s for s in steps if s.get("name") == "Upload reports")
+            steps.remove(upload)
+            for name in ("flawfinder", "clang-tidy (cert-*, security.*)", "semgrep"):
+                index = next(i for i, s in enumerate(steps) if s.get("name") == name)
+                steps.insert(index, upload)
+                path.write_text(yaml.safe_dump(doc))
+                self.assertIn(
+                    "lost monthly scanner report upload", cadence.check(test.root)
+                )
+                steps.remove(upload)
+            path.write_bytes(original)
+            self.assertEqual(cadence.check(test.root), [])
+
+    def test_app80_root_inclusive_ten_level_boundary(self):
+        with tempfile_directory() as root:
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            for depth in (10, 11):
+                for index in range(depth):
+                    name = "ci.yml" if index == 0 else f"child{index}.yml"
+                    job = (
+                        {"uses": f"./.github/workflows/child{index + 1}.yml"}
+                        if index < depth - 1
+                        else {"runs-on": "ubuntu-latest"}
+                    )
+                    (workflows / name).write_text(
+                        yaml.safe_dump({"on": "workflow_call", "jobs": {"next": job}})
+                    )
+                if depth == 10:
+                    self.assertEqual(len(graph.graph(root)), 1)
+                else:
+                    with self.assertRaisesRegex(graph.GraphError, "nesting limit"):
+                        graph.graph(root)
 
 
 @contextlib.contextmanager

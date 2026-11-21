@@ -115,6 +115,8 @@ value other than `NGX_OK`/`NGX_ERROR`, or breaks its lockstep contract with
 `load()`.
 
 `build.sh` and `run.py` discover every `fuzz_*.c`, including future targets.
+Target binary names must not end in `.dict` or `.c`, which are reserved for
+input files. Dotted source names such as `fuzz_headers.v2.c` remain valid.
 Each target requires a matching executable and `corpus_<name>/` directory;
 `fuzz_snapshot` retains `corpus/`. `fuzz_statuses` retains `fuzz.dict`;
 other targets may provide `<name>.dict`. Regression fixtures use
