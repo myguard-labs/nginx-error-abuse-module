@@ -117,6 +117,13 @@ Temp snapshots are created with `O_EXCL|O_NOFOLLOW` and `fsync`'d before the
 atomic rename, so a hostile symlink cannot redirect the write and a crash cannot
 leave a truncated state file. On builds with `--with-threads` the snapshot file
 I/O runs on a thread pool, so a slow disk never stalls the worker event loop.
+Restore accepts only regular files. POSIX restores use nonblocking opens and
+reject final-component symlinks with `O_NOFOLLOW`; FIFO inputs cannot wait for
+a writer. If either safety flag is unavailable, restore logs a warning and is
+skipped; snapshot writes remain enabled. Windows retains its native open
+semantics (including symlink resolution) and checks the opened file type.
+The type check happens after open, so it does not prevent device-open side
+effects; keeping the persistence directory private remains necessary.
 The on-disk format is a portable little-endian byte stream (not a native struct
 dump). Set `persist_secret=<hex>` to additionally authenticate the file with
 HMAC-SHA256. The key must be at least 16 bytes (32 hex characters); 32 bytes
