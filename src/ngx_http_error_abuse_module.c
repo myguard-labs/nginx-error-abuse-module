@@ -23,6 +23,7 @@
 #include "ngx_http_error_abuse_time.h"
 #include "ngx_http_error_abuse_probe_hooks.h"
 #include "ngx_http_error_abuse_stats.h"
+#include "ngx_http_error_abuse_tls.h"
 
 #ifdef NGX_TEST_HARNESS
 #include "ngx_test_probe.h"
@@ -279,7 +280,7 @@ typedef struct {
 
 typedef struct {
     redisAsyncContext                   *context;
-    redisSSLContext                     *ssl;
+    SSL_CTX                             *ssl;
     ngx_http_error_abuse_redis_conf_t   *conf;
     ngx_http_error_abuse_redis_event_t   adapter;
     ngx_event_t                          reconnect;
@@ -2643,9 +2644,10 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      * (reconnects fire on a 1s..30s backoff). Handing hiredis a numeric
      * address keeps the connect path non-blocking. */
     {
-        ngx_url_t  u;
-        u_char     text[NGX_SOCKADDR_STRLEN];
-        size_t     tlen;
+        ngx_url_t        u;
+        struct addrinfo  hints, *numeric;
+        u_char           text[NGX_SOCKADDR_STRLEN];
+        size_t           tlen;
 
         /* Keep the original host text for TLS SNI + certificate hostname
          * verification, since the connect address is now numeric. */
@@ -2656,6 +2658,30 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         ngx_memcpy(mcf->redis.sni.data, host.data, host.len);
         mcf->redis.sni.data[host.len] = '\0';
         mcf->redis.sni.len = host.len;
+
+        /* The resolver may accept legacy IPv4 forms (127.1, 0x7f000001).
+         * Reject those for TLS rather than authenticating them as DNS names.
+         * AI_NUMERICHOST never performs DNS resolution. nginx's own dotted
+         * decimal parser remains authoritative, including zero-padded
+         * octets. */
+        if (tls && host.data[0] != '['
+            && ngx_inet_addr(host.data, host.len) == INADDR_NONE
+            && !(host.len == sizeof("255.255.255.255") - 1
+                 && ngx_strncmp(host.data, "255.255.255.255", host.len) == 0))
+        {
+            ngx_memzero(&hints, sizeof(hints));
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_flags = AI_NUMERICHOST;
+            if (getaddrinfo((char *) mcf->redis.sni.data, NULL, &hints,
+                            &numeric) == 0)
+            {
+                freeaddrinfo(numeric);
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "error_abuse_redis TLS requires dotted-decimal IPv4");
+                return NGX_CONF_ERROR;
+            }
+        }
 
         ngx_memzero(&u, sizeof(ngx_url_t));
         u.url = host;
@@ -4051,6 +4077,87 @@ ngx_http_error_abuse_redis_disconnect_callback(const redisAsyncContext *ac,
     ngx_http_error_abuse_redis_arm_reconnect();
 }
 
+/* Configure identity before hiredis can advance the TLS handshake. SNI alone
+ * does not authenticate the peer. SSL_write withholds queued AUTH/SELECT/SCRIPT
+ * bytes until OpenSSL has verified the chain and the configured identity. */
+static ngx_int_t
+ngx_http_error_abuse_redis_start_tls(redisAsyncContext *ac,
+    ngx_http_error_abuse_redis_worker_t *worker)
+{
+    SSL         *ssl;
+    ngx_str_t    identity;
+    in_addr_t    addr4;
+    u_char      *address;
+    size_t       address_len;
+    char         ip[NGX_INET6_ADDRSTRLEN + 1];
+#if (NGX_HAVE_INET6)
+    u_char      addr6[16];
+#endif
+
+    identity = worker->conf->sni;
+    /* ngx_parse_url accepts bracketed IPv6; OpenSSL expects the bare IP. */
+    if (identity.len > 2 && identity.data[0] == '['
+        && identity.data[identity.len - 1] == ']')
+    {
+        identity.data++;
+        identity.len -= 2;
+    }
+    address = NULL;
+    address_len = 0;
+    addr4 = ngx_inet_addr(identity.data, identity.len);
+    if (addr4 != INADDR_NONE
+        || (identity.len == sizeof("255.255.255.255") - 1
+            && ngx_strncmp(identity.data, "255.255.255.255",
+                           identity.len) == 0))
+    {
+        address = (u_char *) &addr4;
+        address_len = sizeof(addr4);
+    }
+#if (NGX_HAVE_INET6)
+    if (ngx_inet6_addr(identity.data, identity.len, addr6) == NGX_OK) {
+        address = addr6;
+        address_len = sizeof(addr6);
+    }
+#endif
+    /* sni remains the original config text; make a terminated copy only
+     * for bracketed IPv6. Other identities are already terminated. */
+    if (identity.data != worker->conf->sni.data) {
+        if (identity.len >= sizeof(ip)) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(ip, identity.data, identity.len);
+        ip[identity.len] = '\0';
+        identity.data = (u_char *) ip;
+    }
+    if (worker->ssl == NULL) {
+        redisInitOpenSSL();
+        worker->ssl = ngx_http_error_abuse_tls_context("/etc/ssl/certs");
+        if (worker->ssl == NULL) {
+            ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+                "error_abuse: Redis TLS context init failed");
+            return NGX_ERROR;
+        }
+    }
+    ssl = ngx_http_error_abuse_tls_session(worker->ssl,
+                                         (char *) identity.data,
+                                         address, address_len);
+    if (ssl == NULL) {
+        ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+            "error_abuse: Redis TLS identity setup failed");
+        return NGX_ERROR;
+    }
+    /* redisInitiateSSL transfers ownership only on REDIS_OK. */
+    if (redisInitiateSSL(&ac->c, ssl) != REDIS_OK) {
+        SSL_free(ssl);
+        ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+            "error_abuse: Redis TLS handshake init failed (error=%d)",
+            ac->c.err);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
 static ngx_int_t
 ngx_http_error_abuse_redis_connect(void)
 {
@@ -4069,32 +4176,11 @@ ngx_http_error_abuse_redis_connect(void)
         return NGX_ERROR;
     }
 
-    /* TLS: must initiate the SSL session before attaching the event adapter
-     * and before any command is queued. Verifies the server certificate
-     * against the system CA store (capath) and the hostname (server_name). */
-    if (worker->conf->tls) {
-        if (worker->ssl == NULL) {
-            redisSSLContextError ssl_err = REDIS_SSL_CTX_NONE;
-
-            redisInitOpenSSL();
-            worker->ssl = redisCreateSSLContext(
-                NULL, "/etc/ssl/certs", NULL, NULL,
-                (char *) worker->conf->sni.data, &ssl_err);
-            if (worker->ssl == NULL) {
-                ngx_log_error(NGX_LOG_ERR, worker->log, 0,
-                    "error_abuse: Redis TLS context init failed (error=%d)",
-                    (int) ssl_err);
-                redisAsyncFree(ac);
-                return NGX_ERROR;
-            }
-        }
-        if (redisInitiateSSLWithContext(&ac->c, worker->ssl) != REDIS_OK) {
-            ngx_log_error(NGX_LOG_ERR, worker->log, 0,
-                "error_abuse: Redis TLS handshake init failed (error=%d)",
-                ac->c.err);
-            redisAsyncFree(ac);
-            return NGX_ERROR;
-        }
+    if (worker->conf->tls
+        && ngx_http_error_abuse_redis_start_tls(ac, worker) != NGX_OK)
+    {
+        redisAsyncFree(ac);
+        return NGX_ERROR;
     }
 
     ac->data = worker;
@@ -4295,7 +4381,7 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
             ngx_http_error_abuse_redis_worker.context = NULL;
         }
         if (ngx_http_error_abuse_redis_worker.ssl != NULL) {
-            redisFreeSSLContext(ngx_http_error_abuse_redis_worker.ssl);
+            SSL_CTX_free(ngx_http_error_abuse_redis_worker.ssl);
             ngx_http_error_abuse_redis_worker.ssl = NULL;
         }
     }

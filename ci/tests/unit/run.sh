@@ -231,3 +231,5 @@ if grep -nE "$deadline_add_re" "$ROOT/src/ngx_http_error_abuse_module.c"; then
   exit 1
 fi
 echo "OK: production deadline call sites use saturating time helper"
+
+# The socket/OpenSSL/hiredis integration probe runs separately in CI.

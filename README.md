@@ -188,7 +188,14 @@ that case — the origin's `dry_run` wins for the whole request.
 
 Points the module at one Redis server (see below). `host=` is required; every
 other option is optional and must use the `key=value` form shown above. The
-`tls://` and `rediss://` host schemes both enable TLS.
+`tls://` and `rediss://` host schemes both enable TLS. TLS verifies the peer's
+certificate chain against `/etc/ssl/certs` and checks the original `host=`
+identity before sending Redis commands (including AUTH). DNS names use hostname
+verification and SNI; numeric IPv4/IPv6 hosts require a matching IP SAN and do
+not send SNI. A final DNS root dot is retained for resolution and removed for
+TLS verification and SNI. IPv4 literals use four decimal octets; shorthand
+numeric forms such as `127.1` are rejected for TLS. A trusted certificate for a
+different endpoint is rejected.
 
 `host=` is resolved to a numeric address **once, at config load**, so the worker
 event loop never blocks on `getaddrinfo()` when (re)connecting. Two consequences:
@@ -346,7 +353,9 @@ real_ip_recursive on;
 
 Build against an nginx or Angie source tree with a C compiler and the usual
 PCRE2 and zlib development headers. The module also links against hiredis with
-TLS support and OpenSSL (`libhiredis-dev` and `libssl-dev` on Debian/Ubuntu).
+TLS support and OpenSSL 1.0.2 or newer (`libhiredis-dev` and `libssl-dev` on
+Debian/Ubuntu). Older OpenSSL versions fail compilation because they lack the
+required peer identity verification APIs.
 
 Windows supports a static nginx module with either MSVC or MinGW-w64. MSVC
 uses vcpkg's `hiredis[ssl]:x64-windows-static` triplet and `/MT`; MinGW-w64
