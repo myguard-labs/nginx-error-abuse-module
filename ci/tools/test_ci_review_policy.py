@@ -96,10 +96,7 @@ class FuzzRepairTests(unittest.TestCase):
                     if args[0].endswith("fuzz_accept"):
                         self.merge_control(
                             args,
-                            b"1\n0\n"
-                            + os.fsencode(self.root / "corpus_accept")
-                            + b"/seed-\xff\n"
-                            + tail,
+                            b"1\n0\n" + os.fsencode(args[3]) + b"/seed-\xff\n" + tail,
                         )
 
                 with (
@@ -121,11 +118,16 @@ class FuzzRepairTests(unittest.TestCase):
         previous = self.root / "minimized/corpus"
         previous.mkdir(parents=True)
         (previous / "keep").write_bytes(b"previous")
-        records = (
-            b"1\n0\n"
-            + os.fsencode(corpus / "input")
-            + b"\nSTARTED 0 5\nFT 0 42\nCOV 0 7\n"
-        )
+
+        def records(args, features=b" 42"):
+            return (
+                b"1\n0\n"
+                + os.fsencode(Path(args[3]) / "input")
+                + b"\nSTARTED 0 5\nFT 0"
+                + features
+                + b"\nCOV 0 7\n"
+            )
+
         for output in (None, b"in", b"wrong"):
             with self.subTest(output=output):
                 with (
@@ -133,7 +135,7 @@ class FuzzRepairTests(unittest.TestCase):
                         fuzz,
                         "run_merge",
                         side_effect=lambda args, output=output, **_kwargs: (
-                            self.merge_control(args, records, output)
+                            self.merge_control(args, records(args), output)
                         ),
                     ),
                     self.assertRaisesRegex(OSError, "replacement"),
@@ -144,7 +146,7 @@ class FuzzRepairTests(unittest.TestCase):
             fuzz,
             "run_merge",
             side_effect=lambda args, **_kwargs: self.merge_control(
-                args, records, b"input"
+                args, records(args), b"input"
             ),
         ):
             fuzz.minimize(self.root / "fuzz_snapshot", corpus, self.root)
@@ -154,11 +156,12 @@ class FuzzRepairTests(unittest.TestCase):
             ).read_bytes(),
             b"input",
         )
-        empty = records.replace(b"FT 0 42", b"FT 0")
         with mock.patch.object(
             fuzz,
             "run_merge",
-            side_effect=lambda args, **_kwargs: self.merge_control(args, empty),
+            side_effect=lambda args, **_kwargs: self.merge_control(
+                args, records(args, b"")
+            ),
         ):
             fuzz.minimize(self.root / "fuzz_snapshot", corpus, self.root)
         self.assertEqual(list(previous.iterdir()), [])
