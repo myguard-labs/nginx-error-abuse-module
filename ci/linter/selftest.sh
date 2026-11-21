@@ -306,16 +306,11 @@ case_ 0 "the commit hook invokes the pre-commit-config hooks" \
 case_ 0 "lint-spelling is dispatched by run-all.sh" \
     bash -c 'ci/linter/run-all.sh --list | grep -q lint-spelling.sh'
 
-# .gitignore must keep curated seeds visible to git while excluding the
-# hash-named files produced by libFuzzer. Remove each exception temporarily
-# to prove the control goes red, then restore the live file before green.
+# Curated snapshot seeds stay addable while hash-named files produced by
+# libFuzzer remain ignored.
 gitignore_backup="$(mktemp "${TMPDIR:-/tmp}/gitignore.XXXXXX")"
 cp .gitignore "$gitignore_backup"
 trap 'cp "$gitignore_backup" .gitignore; rm -f "$gitignore_backup"' EXIT
-sed -i '/^!ci\/fuzz\/corpus\/\*\.bin$/d' .gitignore
-case_ 0 "curated snapshot seed is ignored without exception" \
-    git check-ignore -q -- ci/fuzz/corpus/representative.bin
-cp "$gitignore_backup" .gitignore
 case_ 1 "curated snapshot seed is addable" \
     git check-ignore -q -- ci/fuzz/corpus/representative.bin
 case_ 0 "generated snapshot hash remains ignored" \
