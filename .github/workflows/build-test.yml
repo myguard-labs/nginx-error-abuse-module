@@ -1,4 +1,4 @@
-# sync-sha: 6f7f8060bfc252b95a53e721609e5624edbcebb095f6f66e1ac27ece02f34c24
+# sync-sha: 8620713d4a09c5ae6337f93e1db8e99255908f2a42316eae04d293b373203cc4
 name: Build and Test
 
 env:
@@ -73,6 +73,7 @@ jobs:
           python3 ci/tools/test_ci_fuzz.py
           python3 ci/tools/test_ci_review_policy.py
           python3 ci/tools/test_runtime_lifecycle.py
+          CC=clang python3 ci/tools/test_snapshot_open.py --negative-controls
           python3 -m unittest ci.tools.test_fuzz_namespace
           bash ci/tools/test-ci-build-source.sh
           # The runtime driver's path is assembled from two variables rather

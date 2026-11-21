@@ -4855,6 +4855,55 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     return rc;
 }
 
+/* Keep FIFO opens bounded and reject final-component symlinks on POSIX.
+ * O_NONBLOCK does not suppress device open side effects: the descriptor type
+ * check below guarantees only that nonregular inputs are never read. */
+static ngx_fd_t
+ngx_http_error_abuse_open_snapshot(ngx_str_t *path, ngx_file_info_t *fi,
+    ngx_log_t *log)
+{
+#if !(NGX_WIN32) && (!defined(O_NONBLOCK) || !defined(O_NOFOLLOW))
+    (void) fi;
+    ngx_log_error(NGX_LOG_WARN, log, 0,
+                  "error_abuse persistence file \"%V\" restore unsupported: "
+                  "nonblocking no-follow open unavailable", path);
+    return NGX_INVALID_FILE;
+#else
+    ngx_fd_t  fd;
+
+#if (NGX_WIN32)
+    fd = ngx_open_file(path->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+#else
+    fd = ngx_open_file(path->data, NGX_FILE_RDONLY|O_NONBLOCK|O_NOFOLLOW,
+                       NGX_FILE_OPEN, 0);
+#endif
+    if (fd == NGX_INVALID_FILE) {
+        if (ngx_errno != NGX_ENOENT) {
+            ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
+                          ngx_open_file_n " \"%V\" failed", path);
+        }
+        return NGX_INVALID_FILE;
+    }
+
+    if (ngx_fd_info(fd, fi) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
+                      ngx_fd_info_n " \"%V\" failed", path);
+        (void) ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+    }
+
+    if (!ngx_is_file(fi)) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "error_abuse persistence file \"%V\" is not regular; "
+                      "ignoring", path);
+        (void) ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+    }
+
+    return fd;
+#endif
+}
+
 static ngx_int_t
 ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 {
@@ -4872,20 +4921,8 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     ngx_str_t                     key;
     ngx_http_error_abuse_node_t  *ean;
 
-    fd = ngx_open_file(zone->persist.data, NGX_FILE_RDONLY,
-                       NGX_FILE_OPEN, 0);
+    fd = ngx_http_error_abuse_open_snapshot(&zone->persist, &fi, log);
     if (fd == NGX_INVALID_FILE) {
-        if (ngx_errno != NGX_ENOENT) {
-            ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
-                          ngx_open_file_n " \"%V\" failed", &zone->persist);
-        }
-        return NGX_OK;
-    }
-
-    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
-        ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
-                      ngx_fd_info_n " \"%V\" failed", &zone->persist);
-        (void) ngx_close_file(fd);
         return NGX_OK;
     }
 
