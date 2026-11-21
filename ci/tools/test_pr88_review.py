@@ -401,7 +401,15 @@ class Cycle102Repairs(unittest.TestCase):
                     control.write_bytes(
                         str(len(filenames)).encode()
                         + b"\n0\n"
-                        + b"".join(os.fsencode(p) + b"\n" for p in filenames)
+                        + b"".join(
+                            os.fsencode(
+                                Path(args[3]) / p.relative_to(corpus)
+                                if p.is_relative_to(corpus)
+                                else p
+                            )
+                            + b"\n"
+                            for p in filenames
+                        )
                         + records
                     )
 
@@ -794,7 +802,7 @@ class Cycle104Repairs(unittest.TestCase):
                     )
                     control.write_bytes(
                         b"1\n0\n"
-                        + os.fsencode(seed)
+                        + os.fsencode(Path(args[3]) / seed.relative_to(corpus))
                         + f"\nSTARTED 0 {size}\nFT 0\n".encode()
                     )
 

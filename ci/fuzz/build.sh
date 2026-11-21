@@ -94,6 +94,10 @@ else
     # source, including symlink/hardlink aliases in a separate output directory.
     for source in "${sources[@]}"; do
         target="${source##*/}"
+        if [[ ! "${target%.c}" =~ ^fuzz_[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]]; then
+            echo "unsupported fuzz target name: $target" >&2
+            exit 1
+        fi
         output="$DIR/${target%.c}"
         for input in "${sources[@]}"; do
             if [ "$output" -ef "$input" ]; then

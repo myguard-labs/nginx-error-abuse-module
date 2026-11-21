@@ -554,9 +554,10 @@ def check_docs() -> int:
                 errors.append("ci-deep.yml jobs.fuzz must be a mapping")
             else:
                 timeout = deep_jobs["fuzz"].get("timeout-minutes")
+        if timeout != 600:
+            errors.append("ci-deep.yml jobs.fuzz.timeout-minutes must be 600")
         if (
-            timeout != 600
-            or "600-minute timeout" not in fuzz_text
+            "600-minute timeout" not in fuzz_text
             or "GitHub-hosted jobs stop after **360 minutes**" not in fuzz_text
         ):
             errors.append(

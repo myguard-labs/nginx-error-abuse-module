@@ -57,7 +57,12 @@ def event_names(doc):
 
 
 def script(job):
-    return "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+    return "\n".join(
+        line
+        for step in job.get("steps", [])
+        for line in str(step.get("run", "")).splitlines()
+        if not line.lstrip().startswith("#")
+    )
 
 
 def healthy_pr_condition(caller, name, job):
@@ -134,7 +139,20 @@ def check(root):
     def document(path):
         key = path.resolve()
         if key not in documents:
-            documents[key] = load_workflow(path)
+            doc = load_workflow(path)
+            if not isinstance(doc, dict) or not isinstance(doc.get("jobs", {}), dict):
+                raise TypeError(f"{path.name}: workflow and jobs must be mappings")
+            for name, job in doc.get("jobs", {}).items():
+                if not isinstance(job, dict):
+                    raise TypeError(f"{path.name}/{name}: job must be a mapping")
+                steps = job.get("steps", [])
+                if not isinstance(steps, list) or any(
+                    not isinstance(step, dict) for step in steps
+                ):
+                    raise TypeError(
+                        f"{path.name}/{name}: steps must be a list of mappings"
+                    )
+            documents[key] = doc
         return documents[key]
 
     def workflow(name):
@@ -221,6 +239,22 @@ def check(root):
                 or runtime[0].get("continue-on-error", False) is not False
             ):
                 errors.append("required runtime step can suppress failure")
+            if len(runtime) == 1 and (
+                not healthy_fuzz_step_condition(runtime[0])
+                or re.fullmatch(
+                    r"chmod \+x nginx-bin/nginx\n"
+                    r"python3 ci/tools/test_runtime\.py\s+"
+                    r'--port "\$TEST_BASE_PORT"\s+'
+                    r'--nginx-binary "\$GITHUB_WORKSPACE/nginx-bin/nginx"\s+'
+                    r'--module "\$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module\.so"\s+'
+                    r"--redis-server /usr/bin/redis-server",
+                    script({"steps": runtime}).replace("\\\n", "").strip(),
+                )
+                is None
+            ):
+                errors.append(
+                    "required runtime suite command or healthy condition missing"
+                )
         if caller == "asan":
             outputs = children.get("asan", {}).get("outputs")
             if not isinstance(outputs, dict) or outputs.get("artifact-id") != (
@@ -254,6 +288,19 @@ def check(root):
                 )
             ):
                 errors.append("lost ASan importer metadata contract")
+            exporters = [
+                step
+                for step in children.get("asan", {}).get("steps", [])
+                if step.get("id") == "asan-identity"
+            ]
+            if (
+                len(exporters) != 1
+                or not healthy_fuzz_step_condition(exporters[0])
+                or exporters[0].get("continue-on-error", False) is not False
+                or str(exporters[0].get("run", "")).strip()
+                != 'bash ci/tools/ci-build-artifact.sh export "$NGINX_VERSION" .build/asan-artifact'
+            ):
+                errors.append("lost ASan metadata export step")
             uploads = [
                 step
                 for step in children.get("asan", {}).get("steps", [])
@@ -357,7 +404,7 @@ def check(root):
             errors.append(f"monthly starting job has predecessors: {name}")
     for job, predecessor in (("memcheck", "msvc"), ("codeql", "scanners")):
         if (
-            jobs.get(job, {}).get("needs") != predecessor
+            jobs.get(job, {}).get("needs") not in (predecessor, [predecessor])
             or jobs[job].get("if") != "${{ !cancelled() }}"
         ):
             errors.append(f"monthly ordering/diagnostics: {job}")

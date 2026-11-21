@@ -1,4 +1,4 @@
-# sync-sha: 09e7d0ceed23779d4834ba054dc5fa141615a1be5d615e2aff4448854fc6ea13
+# sync-sha: dd22b255cc7a47fe274800a53c6a976b9100e9aa913b327bfc59220ae9de53ab
 name: Build and Test
 
 env:
@@ -69,6 +69,7 @@ jobs:
           python3 ci/tools/check_ci_cadence.py
           python3 ci/tools/test_ci_cadence.py
           python3 ci/tools/test_pr88_review.py
+          python3 ci/tools/test_pr88_app_review.py
           python3 ci/tools/test_ci_fuzz.py
           python3 ci/tools/test_ci_review_policy.py
           python3 -m unittest ci.tools.test_fuzz_namespace

@@ -116,6 +116,8 @@ def check_budget(root, seconds, runner_class="github-hosted", *, regression=Fals
 def targets(root):
     result = {}
     for source in sorted(root.glob("fuzz_*.c")):
+        if not re.fullmatch(r"fuzz_[A-Za-z0-9_][A-Za-z0-9_.-]*", source.stem):
+            raise ValueError(f"unsupported fuzz target name: {source.name}")
         name = source.stem.removeprefix("fuzz_")
         corpus = root / ("corpus" if name == "snapshot" else f"corpus_{name}")
         dictionary = root / (
@@ -171,7 +173,7 @@ def corpus_inputs(corpus):
 
 
 def minimize(binary, corpus, root):
-    inputs = corpus_inputs(corpus)
+    original_inputs = corpus_inputs(corpus)
     output_root = root / "minimized"
     if output_root.is_symlink():
         raise OSError(f"minimized output root is a symlink: {output_root}")
@@ -185,6 +187,16 @@ def minimize(binary, corpus, root):
     artifacts = None
     try:
         pending.mkdir()
+        # Merge workers and the parent must read the same private bytes. Never
+        # verify against the live campaign corpus after a worker has tested it.
+        snapshot = workspace / "input" / corpus.name
+        snapshot.mkdir(parents=True)
+        for filename in sorted(original_inputs):
+            source = Path(os.fsdecode(filename))
+            destination = snapshot / source.relative_to(corpus)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+        inputs = corpus_inputs(snapshot)
         artifacts = Path(
             tempfile.mkdtemp(prefix=f"crash-merge-{binary.name}-", dir=root)
         )
@@ -193,7 +205,7 @@ def minimize(binary, corpus, root):
                 str(binary),
                 "-merge=1",
                 str(pending),
-                str(corpus),
+                str(snapshot),
                 f"-artifact_prefix={artifacts}/",
                 f"-merge_control_file={control}",
             ],
@@ -319,6 +331,9 @@ def run(root, seconds, merge=False, runner_class="github-hosted"):
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
         ) as exc:
+            payload = fixture.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            (root / f"crash-{binary.name}-replay-{digest}").write_bytes(payload)
             failures.append(exc)
     if failures:
         raise failures[0]

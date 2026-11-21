@@ -157,3 +157,7 @@ The budget preflight and `--merge` discovery include both passes. A standalone
 regression invocation admits its own campaign and replay once, without charging
 the discovery or merge allowance again. Each campaign has a wrapper deadline of
 its target duration plus 60 seconds of exit grace.
+
+Discovered target stems must match `fuzz_[A-Za-z0-9_][A-Za-z0-9_.-]*`.
+Spaces and shell metacharacters cannot be passed safely to libFuzzer merge
+workers; dotted names such as `fuzz_headers.v2.c` remain supported.

@@ -394,7 +394,9 @@ class FuzzTests(unittest.TestCase):
                     if a.startswith("-merge_control_file=")
                 )
             )
-            control.write_text(f"1\n0\n{corpus / 'input.bin'}\nSTARTED 0 5\nFT 0\n")
+            control.write_text(
+                f"1\n0\n{Path(args[3]) / 'input.bin'}\nSTARTED 0 5\nFT 0\n"
+            )
 
         with mock.patch.object(fuzz, "run_merge", side_effect=complete):
             fuzz.minimize(self.root / "fuzz_snapshot", corpus, self.root)
@@ -1139,11 +1141,13 @@ class FuzzTests(unittest.TestCase):
 
         def assert_toolchain_packages(document):
             steps = document["jobs"]["validation"]["steps"]
-            install = next(
-                step["run"]
-                for step in steps
-                if step["name"] == "Install validation tools"
+            install_step = next(
+                step for step in steps if step["name"] == "Install validation tools"
             )
+            self.assertNotIn(
+                "if", install_step, "toolchain install must be unconditional"
+            )
+            install = install_step["run"]
             packages = []
             previous = ";"
             required_chain = False
@@ -1228,6 +1232,14 @@ class FuzzTests(unittest.TestCase):
             with self.subTest(fallback=script), self.assertRaises(AssertionError):
                 assert_toolchain_packages(split)
         assert_toolchain_packages(workflow)
+        disabled = yaml.safe_load(yaml.safe_dump(workflow))
+        next(
+            step
+            for step in disabled["jobs"]["validation"]["steps"]
+            if step["name"] == "Install validation tools"
+        )["if"] = "${{ false }}"
+        with self.assertRaisesRegex(AssertionError, "must be unconditional"):
+            assert_toolchain_packages(disabled)
         continued = yaml.safe_load(yaml.safe_dump(workflow))
         install_step = next(
             step
