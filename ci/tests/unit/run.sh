@@ -231,3 +231,6 @@ if grep -nE "$deadline_add_re" "$ROOT/src/ngx_http_error_abuse_module.c"; then
   exit 1
 fi
 echo "OK: production deadline call sites use saturating time helper"
+
+# Real OpenSSL + hiredis TLS peer: DNS/IP identity, chain trust and byte ordering.
+python3 "$ROOT/ci/tools/test_redis_tls.py"
