@@ -63,7 +63,12 @@ case "$operation" in
         [[ -f "$artifact/nginx" && ! -L "$artifact/nginx" ]] || {
             echo 'missing or non-regular ASan artifact' >&2; exit 1;
         }
-        digest="$(sha256sum "$artifact/nginx" | cut -d' ' -f1)"
+        # Snapshot untrusted download bytes into a private directory. Hash and
+        # install this single snapshot even if the download changes afterward.
+        staging="$(mktemp -d)"
+        trap 'rm -rf -- "$staging"' EXIT
+        cp -- "$artifact/nginx" "$staging/nginx"
+        digest="$(sha256sum "$staging/nginx" | cut -d' ' -f1)"
         [[ "$digest" == "$EXPECTED_BINARY_SHA256" ]] || {
             echo 'ASan artifact SHA-256 mismatch' >&2; exit 1;
         }
@@ -73,7 +78,7 @@ case "$operation" in
         }
         rm -rf "${tree:?}"
         mkdir -p "$tree/objs"
-        cp --remove-destination "$artifact/nginx" "$tree/objs/nginx"
+        mv -- "$staging/nginx" "$tree/objs/nginx"
         chmod +x "$tree/objs/nginx"
         printf 'ASan artifact verified: %s\n' "$artifact_identity"
         ;;

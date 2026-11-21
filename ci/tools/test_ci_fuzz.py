@@ -1146,6 +1146,7 @@ class FuzzTests(unittest.TestCase):
             )
             packages = []
             previous = ";"
+            required_chain = False
             for line in install.replace("\\\n", " ").splitlines():
                 lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
                 lexer.whitespace_split = True
@@ -1156,12 +1157,20 @@ class FuzzTests(unittest.TestCase):
                         previous = next(words)
                         continue
                     command = list(words)
-                    conditional = previous in {"||", "|", "&"}
+                    conditional = previous in {"||", "|", "&"} or (
+                        previous == "&&" and not required_chain
+                    )
                     previous = ";"
                     if command[:1] == ["sudo"]:
                         command = command[1:]
-                    if (
+                    required_chain = (
                         not conditional
+                        and len(command) >= 2
+                        and command[0] in {"apt", "apt-get"}
+                        and command[1] in {"install", "update"}
+                    )
+                    if (
+                        required_chain
                         and len(command) >= 2
                         and command[0] in {"apt", "apt-get"}
                         and command[1] == "install"
@@ -1188,6 +1197,8 @@ class FuzzTests(unittest.TestCase):
                 split_step["run"] = script
                 assert_toolchain_packages(split)
         for script in (
+            "sudo apt-get install -y clang; false && sudo apt-get install -y libclang-rt-dev",
+            "false && sudo apt-get install -y clang libclang-rt-dev",
             "sudo apt-get install -y clang || sudo apt-get install -y libclang-rt-dev",
             "sudo apt-get install -y clang ||\nsudo apt-get install -y libclang-rt-dev",
         ):

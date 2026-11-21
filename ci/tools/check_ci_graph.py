@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Conservative runner-width proof for the PR orchestrator's static graph."""
 
+import re
 import sys
 from collections import deque
 from pathlib import Path
@@ -147,6 +148,14 @@ def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
                     if not isinstance(target, str) or not target.startswith(
                         "./.github/workflows/"
                     ):
+                        raise GraphError("unsupported reusable workflow")
+                    if (
+                        not (root / target[2:])
+                        .resolve()
+                        .is_relative_to(root / ".github/workflows")
+                    ):
+                        raise GraphError("invalid or recursive workflow call")
+                    if not re.fullmatch(r"\./\.github/workflows/[^/]+\.ya?ml", target):
                         raise GraphError("unsupported reusable workflow")
                     child_starts, child_ends = expand(
                         target[2:], ident + "/", stack + (path,)

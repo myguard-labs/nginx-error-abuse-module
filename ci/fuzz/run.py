@@ -26,6 +26,7 @@ TARGET_OVERHEAD_SECONDS = (
     120 + 2 * CAMPAIGN_EXIT_GRACE_SECONDS + 600
 )  # regression, exit grace, minimization
 MERGE_SECONDS = 600
+MAX_INPUT_BYTES = 1 << 20  # LLVM 18 default campaign/merge input limit.
 REPLAY_SECONDS = 60  # per fixture, replayed once in each pass
 MERGE_EXIT_GRACE_SECONDS = 5
 
@@ -148,6 +149,13 @@ def corpus_inputs(corpus):
                 path
             ):
                 raise ValueError(f"unsupported corpus seed: {path}")
+            if path.stat().st_size > MAX_INPUT_BYTES:
+                raise ValueError(f"corpus seed exceeds {MAX_INPUT_BYTES} bytes: {path}")
+            # Read the complete seed before spending any campaign budget.
+            # A successful stat does not imply LLVM can open/read the input.
+            with path.open("rb") as stream:
+                while stream.read(1024 * 1024):
+                    pass
             inputs.add(os.fsencode(path))
     return inputs
 
@@ -217,6 +225,8 @@ def minimize(binary, corpus, root):
                             len(values.split()) != 1
                             or index != started
                             or completed != started
+                            or int(values)
+                            != Path(os.fsdecode(filenames[index])).stat().st_size
                         ):
                             raise ValueError("invalid STARTED record")
                         started += 1

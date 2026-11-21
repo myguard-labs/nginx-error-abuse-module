@@ -351,7 +351,7 @@ class Cycle102Repairs(unittest.TestCase):
         )
 
     def test_app74_reserved_target_suffix_docs(self):
-        docs = (cadence.ROOT / "ci/fuzz/README.md").read_text()
+        docs = (cadence.ROOT / "ci/fuzz/README.md").read_text(encoding="utf-8")
         self.assertIn("must not end in `.dict`, `.c`, or `.h`", docs)
         self.assertIn("fuzz_headers.v2.c", docs)
 
@@ -718,6 +718,241 @@ class Cycle103Repairs(unittest.TestCase):
                 "-m",
                 "unittest",
                 "test_ci_review_policy.CadenceRepairTests.test_app70_monthly_scanners_and_report_upload_required",
+            ],
+            cwd=cadence.ROOT,
+            env=cadence_tests.fixture_environment(
+                LC_ALL="C",
+                PYTHONUTF8="0",
+                PYTHONCOERCECLOCALE="0",
+                PYTHONPATH=str(cadence.ROOT / "ci/tools"),
+            ),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class Cycle104Repairs(unittest.TestCase):
+    def test_app94_unreadable_seed_fails_before_campaign(self):
+        with fixture(fuzz_tests.FuzzTests) as test:
+            seed = test.root / "corpus/input.bin"
+            seed.write_bytes(b"input")
+            original = Path.open
+
+            def open_seed(path, *args, **kwargs):
+                if path == seed:
+                    raise PermissionError("unreadable seed control")
+                return original(path, *args, **kwargs)
+
+            for merge in (False, True):
+                with (
+                    self.subTest(merge=merge),
+                    mock.patch.object(Path, "open", open_seed),
+                    mock.patch.object(fuzz_tests.fuzz.subprocess, "run") as run,
+                    self.assertRaisesRegex(PermissionError, "unreadable seed control"),
+                ):
+                    fuzz_tests.fuzz.run(test.root, "120", merge)
+                run.assert_not_called()
+            seed.unlink()
+            self.assertEqual(fuzz_tests.fuzz.corpus_inputs(seed.parent), set())
+
+    def test_app95_oversized_seed_fails_before_campaign(self):
+        with fixture(fuzz_tests.FuzzTests) as test:
+            seed = test.root / "corpus/input.bin"
+            seed.write_bytes(b"A" * (1 << 20))
+            self.assertEqual(
+                fuzz_tests.fuzz.corpus_inputs(seed.parent), {os.fsencode(seed)}
+            )
+            seed.write_bytes(b"A" * ((1 << 20) + 1))
+            for merge in (False, True):
+                with (
+                    self.subTest(merge=merge),
+                    mock.patch.object(fuzz_tests.fuzz.subprocess, "run") as run,
+                    self.assertRaisesRegex(ValueError, "corpus seed exceeds.*1048576"),
+                ):
+                    fuzz_tests.fuzz.run(test.root, "120", merge)
+                run.assert_not_called()
+
+    def test_app95_merge_requires_full_tested_size(self):
+        with fixture(fuzz_tests.FuzzTests) as test:
+            corpus = test.root / "corpus"
+            seed = corpus / "input.bin"
+            seed.write_bytes(b"input")
+            old = test.root / "minimized/corpus"
+            old.mkdir(parents=True)
+            (old / "keep").write_bytes(b"keep")
+            for size in (0, 4, 6, 5):
+
+                def merge(args, size=size, **_kwargs):
+                    control = Path(
+                        next(
+                            a.split("=", 1)[1]
+                            for a in args
+                            if a.startswith("-merge_control_file=")
+                        )
+                    )
+                    control.write_bytes(
+                        b"1\n0\n"
+                        + os.fsencode(seed)
+                        + f"\nSTARTED 0 {size}\nFT 0\n".encode()
+                    )
+
+                with mock.patch.object(fuzz_tests.fuzz, "run_merge", side_effect=merge):
+                    if size == 5:
+                        fuzz_tests.fuzz.minimize(
+                            test.root / "fuzz_snapshot", corpus, test.root
+                        )
+                        self.assertEqual(list(old.iterdir()), [])
+                    else:
+                        with self.assertRaisesRegex(OSError, "malformed control"):
+                            fuzz_tests.fuzz.minimize(
+                                test.root / "fuzz_snapshot", corpus, test.root
+                            )
+                        self.assertEqual((old / "keep").read_bytes(), b"keep")
+
+    def test_app96_asan_upload_requires_binary_and_missing_file_error(self):
+        with fixture(cadence_tests.CadenceTests) as test:
+            path = test.root / ".github/workflows/asan.yml"
+            original = path.read_bytes()
+            for inputs in (
+                None,
+                [],
+                {},
+                {"path": "missing", "if-no-files-found": "warn"},
+                {"path": ".build/asan-artifact/nginx", "if-no-files-found": "warn"},
+                {"path": "missing", "if-no-files-found": "error"},
+            ):
+                doc = graph.load_workflow(path)
+                upload = next(
+                    s
+                    for s in doc["jobs"]["asan"]["steps"]
+                    if s.get("id") == "asan-artifact"
+                )
+                upload["with"] = inputs
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                self.assertIn(
+                    "lost ASan artifact upload step", cadence.check(test.root)
+                )
+                path.write_bytes(original)
+            self.assertEqual(cadence.check(test.root), [])
+
+    def test_app97_manual_duration_is_free_entry(self):
+        with fixture(cadence_tests.CadenceTests) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            for kind, valid in (
+                ("choice", False),
+                ("boolean", False),
+                ("environment", False),
+                ("number", False),
+                ("string", True),
+                (None, True),
+            ):
+                doc = graph.load_workflow(path)
+                value = doc["on"]["workflow_dispatch"]["inputs"]["fuzz_seconds"]
+                if kind is not None:
+                    value["type"] = kind
+                if kind == "choice":
+                    value["options"] = ["3600"]
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                self.assertEqual(
+                    "manual fuzz_seconds must allow free entry"
+                    in cadence.check(test.root),
+                    not valid,
+                )
+                path.write_bytes(original)
+
+    def test_app98_scanner_upload_inputs_require_mapping(self):
+        with fixture(cadence_tests.CadenceTests) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            for value in (None, [], "reports", {}):
+                doc = graph.load_workflow(path)
+                next(
+                    s
+                    for s in doc["jobs"]["scanners"]["steps"]
+                    if s.get("name") == "Upload reports"
+                )["with"] = value
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                self.assertIn(
+                    "lost monthly scanner report upload", cadence.check(test.root)
+                )
+                path.write_bytes(original)
+            self.assertEqual(cadence.check(test.root), [])
+
+    def test_app99_minimized_upload_enabled_after_discovery(self):
+        with fixture(cadence_tests.CadenceTests) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            for mutation in (
+                "disabled",
+                "missing",
+                "action",
+                "path",
+                "inputs",
+                "early",
+                "suppressed",
+                "valid",
+            ):
+                doc = graph.load_workflow(path)
+                steps = doc["jobs"]["fuzz"]["steps"]
+                upload = next(
+                    s for s in steps if s.get("name") == "Upload minimized corpus"
+                )
+                if mutation == "disabled":
+                    upload["if"] = False
+                if mutation == "missing":
+                    steps.remove(upload)
+                if mutation == "action":
+                    upload["uses"] = "actions/download-artifact@fake"
+                if mutation == "path":
+                    upload["with"]["path"] = "ci/fuzz/corpus"
+                if mutation == "inputs":
+                    upload["with"] = None
+                if mutation == "suppressed":
+                    upload["continue-on-error"] = True
+                if mutation == "early":
+                    steps.remove(upload)
+                    steps.insert(0, upload)
+                path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                self.assertEqual(
+                    "lost minimized corpus upload after discovery"
+                    in cadence.check(test.root),
+                    mutation != "valid",
+                )
+                path.write_bytes(original)
+
+    def test_app100_nested_reusable_workflow_rejected(self):
+        with tempfile_directory() as root:
+            workflows = root / ".github/workflows"
+            (workflows / "nested").mkdir(parents=True)
+            child = {
+                "on": "workflow_call",
+                "jobs": {"leaf": {"runs-on": "ubuntu-latest"}},
+            }
+            for target, valid in (("nested/child.yml", False), ("child.yml", True)):
+                (workflows / target).write_text(yaml.safe_dump(child), encoding="utf-8")
+                (workflows / "ci.yml").write_text(
+                    yaml.safe_dump(
+                        {"jobs": {"call": {"uses": "./.github/workflows/" + target}}}
+                    ),
+                    encoding="utf-8",
+                )
+                if valid:
+                    self.assertEqual(graph.graph(root), {"call[0]/leaf[0]": set()})
+                else:
+                    with self.assertRaisesRegex(
+                        graph.GraphError, "unsupported reusable workflow"
+                    ):
+                        graph.graph(root)
+
+    def test_app103_fuzz_readme_under_ascii_locale(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "test_pr88_review.Cycle102Repairs.test_app74_reserved_target_suffix_docs",
             ],
             cwd=cadence.ROOT,
             env=cadence_tests.fixture_environment(

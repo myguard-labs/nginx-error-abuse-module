@@ -163,3 +163,19 @@ import_artifact
 verify_installed
 [[ ! -e "$BUILD_ROOT/nginx-1.31.3-asan/owned" ]] || fail 'valid import did not replace destination'
 echo 'ok: portable ASan artifact controls passed'
+
+# Swap the download immediately after hashing. The installed bytes must come
+# from the private snapshot that was actually verified.
+mkdir "$tmp/race-tools"
+cat > "$tmp/race-tools/sha256sum" <<'SH'
+#!/usr/bin/env bash
+/usr/bin/sha256sum "$@"
+if [[ "${1:-}" != '' && -f "$1" ]] && cmp -s -- "$1" "$RACE_ARTIFACT"; then
+    printf '#!/bin/sh\necho unverified-swap\n' > "$RACE_ARTIFACT"
+fi
+SH
+chmod +x "$tmp/race-tools/sha256sum"
+PATH="$tmp/race-tools:$PATH" RACE_ARTIFACT="$tmp/artifact/nginx" import_artifact
+verify_installed
+cp "$tmp/saved-binary" "$tmp/artifact/nginx"
+echo 'ok: APP101 download swap cannot replace verified staged bytes'

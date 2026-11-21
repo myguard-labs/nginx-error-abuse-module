@@ -227,6 +227,9 @@ def check(root):
                     "actions/upload-artifact@"
                 )
                 or not healthy_fuzz_step_condition(uploads[0])
+                or not isinstance(uploads[0].get("with"), dict)
+                or uploads[0]["with"].get("path") != ".build/asan-artifact/nginx"
+                or uploads[0]["with"].get("if-no-files-found") != "error"
             ):
                 errors.append("lost ASan artifact upload step")
 
@@ -258,6 +261,8 @@ def check(root):
     dispatch = events.get("workflow_dispatch") if isinstance(events, dict) else None
     inputs = dispatch.get("inputs") if isinstance(dispatch, dict) else None
     fuzz_input = inputs.get("fuzz_seconds") if isinstance(inputs, dict) else None
+    if not isinstance(fuzz_input, dict) or fuzz_input.get("type", "string") != "string":
+        errors.append("manual fuzz_seconds must allow free entry")
     default = str(fuzz_input.get("default", "")) if isinstance(fuzz_input, dict) else ""
     if not re.fullmatch(r"[0-9]{1,5}", default) or not 1 <= int(default) <= 86400:
         errors.append("missing or invalid manual fuzz_seconds default")
@@ -388,7 +393,8 @@ def check(root):
             if step.get("name")
             in {"flawfinder", "clang-tidy (cert-*, security.*)", "semgrep"}
         )
-        or set(str(uploads[0].get("with", {}).get("path", "")).splitlines())
+        or not isinstance(uploads[0].get("with"), dict)
+        or set(str(uploads[0]["with"].get("path", "")).splitlines())
         != {
             f"${{{{ github.workspace }}}}/{name}.log"
             for name in ("flawfinder", "clang-tidy", "semgrep")
@@ -414,6 +420,25 @@ def check(root):
         )
     ):
         errors.append("lost fuzz regression/discovery or shared build")
+    corpus_uploads = [
+        step
+        for step in fuzz.get("steps", [])
+        if step.get("name") == "Upload minimized corpus"
+    ]
+    if (
+        len(corpus_uploads) != 1
+        or not str(corpus_uploads[0].get("uses", "")).startswith(
+            "actions/upload-artifact@"
+        )
+        or not healthy_fuzz_step_condition(corpus_uploads[0])
+        or corpus_uploads[0].get("continue-on-error", False) is not False
+        or not isinstance(corpus_uploads[0].get("with"), dict)
+        or corpus_uploads[0]["with"].get("path")
+        != "${{ github.workspace }}/ci/fuzz/minimized/"
+        or discovery not in commands
+        or fuzz["steps"].index(corpus_uploads[0]) <= commands.index(discovery)
+    ):
+        errors.append("lost minimized corpus upload after discovery")
     for step in fuzz.get("steps", []):
         if (
             step.get("run") in required_fuzz
