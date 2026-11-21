@@ -77,6 +77,9 @@ class ExecutableCacheEligibility(unittest.TestCase):
         action = yaml.safe_load(
             (ROOT / ".github/actions/build-cache/action.yml").read_text()
         )
+        cls.inputs = {
+            name: value.get("default", "") for name, value in action["inputs"].items()
+        }
         cls.prepare = next(
             s["run"] for s in action["runs"]["steps"] if s.get("id") == "identity"
         )
@@ -102,11 +105,12 @@ class ExecutableCacheEligibility(unittest.TestCase):
         self.assertFalse(pathlib.Path(output["tree"]).exists(), "stale tree survived")
         return output
 
-    def allowed(self, env, output):
+    def allowed(self, env, output, *, inputs=None):
         # Evaluate the expression from the action, not a second copy of its
         # allowlist. Only string equality is supported; Actions ignores case
         # for string comparisons, and absent step outputs are empty.
         context = {
+            "inputs": self.inputs | (inputs or {}),
             "github": types.SimpleNamespace(
                 ref=env["GITHUB_REF"], event_name=env["GITHUB_EVENT_NAME"]
             ),
@@ -117,6 +121,12 @@ class ExecutableCacheEligibility(unittest.TestCase):
             ),
         }
         expression = self.cache["if"].replace("&&", " and ").replace("||", " or ")
+
+        # Actions property names may contain hyphens; Python parses those as
+        # subtraction. Preserve their actual input lookup semantics explicitly.
+        expression = re.sub(
+            r"\binputs\.([A-Za-z_][A-Za-z0-9_-]*)", r"inputs['\1']", expression
+        )
 
         def evaluate(node):
             if isinstance(node, ast.BoolOp):
@@ -134,6 +144,8 @@ class ExecutableCacheEligibility(unittest.TestCase):
                 if not isinstance(left, str) or not isinstance(right, str):
                     raise AssertionError("cache equality requires strings")
                 return left.lower() == right.lower()
+            if isinstance(node, ast.Subscript):
+                return evaluate(node.value)[evaluate(node.slice)]
             if isinstance(node, ast.Attribute):
                 return getattr(evaluate(node.value), node.attr)
             if isinstance(node, ast.Name):
@@ -143,6 +155,22 @@ class ExecutableCacheEligibility(unittest.TestCase):
             raise AssertionError(f"unsupported cache condition: {ast.dump(node)}")
 
         return evaluate(ast.parse(expression, mode="eval").body)
+
+    def test_declared_default_and_explicit_executable_cache_input(self):
+        output = self.preparation(self.env)
+        self.assertTrue(self.allowed(self.env, output))
+        for value, expected in (
+            ("false", False),
+            ("", False),
+            ("FALSE", False),
+            ("true", True),
+            ("TRUE", True),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.allowed(self.env, output, inputs={"executable-cache": value}),
+                    expected,
+                )
 
     def key(self, output):
         values = {
