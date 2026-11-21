@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Monthly coverage and runner-width policy; all workflows form one contract.
+# Staged blobs must reflect committed object bytes, even with local replace refs.
+export GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 need python3 "apt-get install python3"
@@ -23,7 +25,7 @@ if [ "${LINT_MODE:-all}" != staged ]; then
 fi
 # A graph needs every workflow from the same index, including unchanged callees.
 # Include deletions in the trigger; never refresh or write back the source index.
-changed=$(git diff --cached --name-only -- ':(top).github/workflows')
+changed=$(git diff --cached --ita-invisible-in-index --name-only -- ':(top).github/workflows')
 if [ -z "$changed" ] && [ "$selected" = false ]; then
 	echo 'lint-ci-monthly: no staged workflow files to check'
 	exit 0
@@ -40,10 +42,19 @@ root = Path(sys.argv[1])
 entries = subprocess.check_output(
     ["git", "ls-files", "--stage", "--full-name", "-z", "--", ":(top).github/workflows"]
 )
+def additions(visibility):
+    return set(subprocess.check_output([
+        "git", "diff", "--cached", visibility, "--diff-filter=A", "--name-only", "-z",
+        "--", ":(top).github/workflows",
+    ]).split(b"\0"))
+
+intent = additions("--ita-visible-in-index") - additions("--ita-invisible-in-index")
 for entry in entries.split(b"\0"):
     if not entry:
         continue
     metadata, name = entry.split(b"\t", 1)
+    if name in intent:
+        continue
     mode, blob, stage = metadata.split()
     if stage != b"0" or mode not in (b"100644", b"100755"):
         sys.exit("lint-ci-monthly: workflow index entry is unmerged or not a regular file")

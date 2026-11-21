@@ -44,6 +44,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the selftest doc
     )
     raise SystemExit(2) from None
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+from check_ci_graph import load_workflow
+
 # WORKFLOW_POLICY_ROOT points the checks at a fixture tree instead of the repo.
 # It exists so ci/linter/selftest.sh can assert the FAILING direction of every
 # check against a committed, readable fixture -- rather than by planting a file
@@ -112,7 +115,7 @@ def workflows() -> list[pathlib.Path]:
 def load(path: pathlib.Path) -> dict:
     """Parse a workflow. A file that will not parse is exit 2, never clean."""
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        doc = load_workflow(path)
     except yaml.YAMLError as exc:
         raise PolicyError(f"{path.name}: unparsable YAML: {exc}") from exc
     if not isinstance(doc, dict):

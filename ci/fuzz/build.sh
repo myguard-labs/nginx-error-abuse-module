@@ -90,6 +90,24 @@ else
     shopt -s nullglob
     sources=("$FUZZ_DIR"/fuzz_*.c)
     [ "${#sources[@]}" -gt 0 ] || { echo "no fuzz target sources" >&2; exit 1; }
+    # Validate the whole output plan before the first compiler can truncate a
+    # source, including symlink/hardlink aliases in a separate output directory.
+    for source in "${sources[@]}"; do
+        target="${source##*/}"
+        output="$DIR/${target%.c}"
+        for input in "${sources[@]}"; do
+            if [ "$output" -ef "$input" ]; then
+                echo "fuzz output $output collides with source $input" >&2
+                exit 1
+            fi
+        done
+        case "$output" in
+            *.c | *.dict)
+                echo "fuzz output has a reserved source extension: $output" >&2
+                exit 1
+                ;;
+        esac
+    done
     for source in "${sources[@]}"; do
         target="${source##*/}"
         build_one "$target" "$DIR/${target%.c}"

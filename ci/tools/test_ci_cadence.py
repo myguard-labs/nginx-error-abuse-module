@@ -66,6 +66,99 @@ class WorkflowFixture(unittest.TestCase):
 
 
 class CadenceTests(WorkflowFixture):
+    def test_docs_policy_preserves_boolean_job_ids(self):
+        repo = Path(__file__).resolve().parents[2]
+        for name in ("README.md", "ci/fuzz/README.md"):
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(repo / name, target)
+        path = self.root / ".github/workflows/ci.yml"
+        with path.open("a") as stream:
+            stream.write(
+                "\n  yes:\n    uses: ./.github/workflows/fuzzing.yml\n"
+                "  on:\n    runs-on: ubuntu-latest\n    steps: [{run: echo ordinary}]\n"
+            )
+        result = subprocess.run(
+            [sys.executable, str(repo / "ci/linter/workflow_policy.py"), "docs"],
+            env=dict(os.environ, WORKFLOW_POLICY_ROOT=str(self.root)),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            b"ci.yml must not call monthly/manual fuzzing on PRs",
+            result.stdout + result.stderr,
+        )
+
+    def test_required_jobs_reject_failure_suppression(self):
+        for filename, name, message in (
+            (
+                "build-test.yml",
+                "test-nginx",
+                "required basic.t job can suppress failure",
+            ),
+            ("ci-deep.yml", "msvc", "monthly MSVC job can suppress failure"),
+            ("windows-msvc.yml", "msvc", "MSVC job can suppress failure"),
+        ):
+            path = self.root / ".github/workflows" / filename
+            original = path.read_bytes()
+            for value in (True, "${{ true }}", False):
+                with self.subTest(filename=filename, value=value):
+                    doc = yaml.load(original, Loader=WorkflowLoader)
+                    doc["jobs"][name]["continue-on-error"] = value
+                    path.write_text(yaml.safe_dump(doc))
+                    errors = policy.check(self.root)
+                    self.assertEqual(message in errors, value is not False, errors)
+            path.write_bytes(original)
+
+    def test_monthly_required_jobs_must_run_when_healthy(self):
+        for filename, name, label in (
+            ("ci-deep.yml", "msvc", "monthly MSVC"),
+            ("windows-msvc.yml", "msvc", "MSVC"),
+            ("ci-deep.yml", "helgrind", "helgrind"),
+        ):
+            path = self.root / ".github/workflows" / filename
+            original = path.read_bytes()
+            for condition in ("failure()", False, "success()", "${{ !cancelled() }}"):
+                with self.subTest(filename=filename, name=name, condition=condition):
+                    doc = yaml.load(original, Loader=WorkflowLoader)
+                    doc["jobs"][name]["if"] = condition
+                    path.write_text(yaml.safe_dump(doc))
+                    if condition is False:
+                        with self.assertRaises(policy.GraphError):
+                            policy.check(self.root)
+                        continue
+                    errors = policy.check(self.root)
+                    self.assertEqual(
+                        f"{label} job cannot run on healthy monthly run" in errors,
+                        condition in ("failure()", False),
+                        errors,
+                    )
+            path.write_bytes(original)
+
+    def test_msvc_required_steps_reject_failure_suppression(self):
+        path = self.root / ".github/workflows/windows-msvc.yml"
+        original = path.read_bytes()
+        for name in (
+            "Build",
+            "Verify module and configuration controls",
+            "Test persistence and singleton ownership",
+        ):
+            for value in (True, "${{ true }}", False):
+                with self.subTest(name=name, value=value):
+                    doc = yaml.load(original, Loader=WorkflowLoader)
+                    next(
+                        s for s in doc["jobs"]["msvc"]["steps"] if s.get("name") == name
+                    )["continue-on-error"] = value
+                    path.write_text(yaml.safe_dump(doc))
+                    errors = policy.check(self.root)
+                    self.assertEqual(
+                        f"MSVC native control can suppress failure: {name}" in errors,
+                        value is not False,
+                        errors,
+                    )
+        path.write_bytes(original)
+
     def test_msvc_entry_points_are_only_monthly_call_and_manual(self):
         path = self.root / ".github/workflows/windows-msvc.yml"
         original = path.read_bytes()
@@ -1015,6 +1108,47 @@ class CadenceTests(WorkflowFixture):
 
 
 class StagedCadenceTests(WorkflowFixture):
+    def test_intent_to_add_is_not_a_staged_workflow(self):
+        new = self.root / ".github/workflows/new.yml"
+        new.write_text("invalid workflow")
+        self.git("add", "-N", str(new))
+        result = self.lint()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"no staged workflow", result.stdout)
+        selected = self.root / ".github/workflows/ci.yml"
+        selected.write_bytes(selected.read_bytes() + b"\n# selected\n")
+        self.git("add", str(selected))
+        result = self.lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        new.write_bytes(b"")
+        self.git("add", str(new))
+        result = self.lint()
+        self.assertNotEqual(
+            result.returncode, 0, "genuinely staged empty workflow was skipped"
+        )
+
+    def test_replacement_blob_cannot_hide_private_index_defect(self):
+        path = self.root / ".github/workflows/ci-deep.yml"
+        good = self.git(
+            "rev-parse", "HEAD:.github/workflows/ci-deep.yml"
+        ).stdout.strip()
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        private = self.root / "private-index"
+        shutil.copyfile(self.root / ".git/index", private)
+        environment = fixture_environment(GIT_INDEX_FILE=str(private))
+        subprocess.run(
+            ["git", "add", str(path)], cwd=self.root, env=environment, check=True
+        )
+        bad = subprocess.check_output(
+            ["git", "rev-parse", ":.github/workflows/ci-deep.yml"],
+            cwd=self.root,
+            env=environment,
+        ).strip()
+        self.git("replace", bad.decode(), good.decode())
+        result = self.lint(overrides={"GIT_INDEX_FILE": str(private)})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"lost full fuzz duration", result.stdout + result.stderr)
+
     def test_fixture_baseline_ignores_global_exclusions(self):
         ignores = self.root / "global-ignore"
         ignores.write_text(".github/\n")

@@ -202,7 +202,8 @@ class MergeProcessTests(unittest.TestCase):
             # (subprocess.run's timeout) leaves that real worker alive.
             binary.write_text(
                 f"#!{sys.executable}\n"
-                "import os, signal, subprocess, sys\n"
+                "import os, signal, subprocess, sys, time\n"
+                "time.sleep(0.3)\n"
                 "from pathlib import Path\n"
                 "child = subprocess.Popen([sys.executable, '-c', "
                 "'import signal; signal.pause()'])\n"
@@ -214,6 +215,20 @@ class MergeProcessTests(unittest.TestCase):
                 "signal.pause()\n"
             )
             binary.chmod(0o700)
+            original_communicate = subprocess.Popen.communicate
+            ready = False
+
+            def communicate(process, *args, **kwargs):
+                nonlocal ready
+                if not ready:
+                    deadline = time.monotonic() + 30
+                    while not pidfile.is_file():
+                        if process.poll() is not None or time.monotonic() >= deadline:
+                            self.fail("merge probe failed to become ready")
+                        time.sleep(0.01)
+                    ready = True
+                return original_communicate(process, *args, **kwargs)
+
             original_cleanup = shutil.rmtree
             checked_workspaces = []
 
@@ -230,7 +245,8 @@ class MergeProcessTests(unittest.TestCase):
 
             try:
                 with (
-                    mock.patch.object(fuzz, "MERGE_SECONDS", 2),
+                    mock.patch.object(fuzz, "MERGE_SECONDS", 0.1),
+                    mock.patch.object(subprocess.Popen, "communicate", new=communicate),
                     mock.patch.object(fuzz.shutil, "rmtree", side_effect=cleanup),
                     self.assertRaises(subprocess.TimeoutExpired),
                 ):
@@ -315,6 +331,129 @@ class FuzzTests(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_standalone_timeout_matches_admission(self):
+        repo = Path(__file__).resolve().parents[2]
+        doc = yaml.safe_load((repo / ".github/workflows/fuzzing.yml").read_text())
+        self.assertEqual(
+            doc["jobs"]["fuzz-regression"]["timeout-minutes"] * 60,
+            fuzz.RUNNER_BUDGETS["github-hosted"],
+        )
+
+    def test_minimization_rejects_symlinked_root(self):
+        (self.root / "corpus/input.bin").write_bytes(b"keep")
+        (self.root / "minimized").symlink_to(self.root, target_is_directory=True)
+        with (
+            mock.patch.object(fuzz, "run_merge") as merge,
+            self.assertRaisesRegex(OSError, "symlink"),
+        ):
+            fuzz.minimize(self.root / "fuzz_snapshot", self.root / "corpus", self.root)
+        merge.assert_not_called()
+        self.assertEqual((self.root / "corpus/input.bin").read_bytes(), b"keep")
+
+    def test_minimization_rejects_unprocessed_inputs(self):
+        corpus = self.root / "corpus"
+        (corpus / "input.bin").write_bytes(b"input")
+        previous = self.root / "minimized/corpus"
+        previous.mkdir(parents=True)
+        (previous / "keep.bin").write_bytes(b"keep")
+        for records in (
+            None,
+            "",
+            "1\n0\ninput.bin\n",
+            "2\n0\ninput.bin\nother.bin\nSTARTED 0 5\n",
+        ):
+            with self.subTest(records=records):
+
+                def merge(args, records=records, **kwargs):
+                    if records is not None:
+                        control = Path(
+                            next(
+                                a.split("=", 1)[1]
+                                for a in args
+                                if a.startswith("-merge_control_file=")
+                            )
+                        )
+                        control.write_text(records)
+
+                with (
+                    mock.patch.object(fuzz, "run_merge", side_effect=merge),
+                    self.assertRaises(OSError),
+                ):
+                    fuzz.minimize(self.root / "fuzz_snapshot", corpus, self.root)
+                self.assertEqual((previous / "keep.bin").read_bytes(), b"keep")
+
+        # No new features is valid after every input actually ran.
+        def complete(args, **kwargs):
+            control = Path(
+                next(
+                    a.split("=", 1)[1]
+                    for a in args
+                    if a.startswith("-merge_control_file=")
+                )
+            )
+            control.write_text(f"1\n0\n{corpus / 'input.bin'}\nSTARTED 0 5\nFT 0\n")
+
+        with mock.patch.object(fuzz, "run_merge", side_effect=complete):
+            fuzz.minimize(self.root / "fuzz_snapshot", corpus, self.root)
+        self.assertEqual(list(previous.iterdir()), [])
+
+    def test_directory_build_rejects_source_collision_before_compiler(self):
+        repo = Path(__file__).resolve().parents[2]
+        build = self.root / "build.sh"
+        shutil.copyfile(repo / "ci/fuzz/build.sh", build)
+        nginx = self.root / "nginx"
+        (nginx / "objs").mkdir(parents=True)
+        (nginx / "objs/ngx_auto_config.h").touch()
+        compiler = self.root / "compiler"
+        marker = self.root / "compiled"
+        compiler.write_text(f'#!/bin/sh\ntouch "{marker}"\n')
+        compiler.chmod(0o700)
+        source = self.root / "fuzz_accept.c"
+        source.write_bytes(b"preserved source")
+        for alias in (False, True):
+            with self.subTest(alias=alias):
+                if alias:
+                    (self.root / "fuzz_accept").unlink()
+                    (self.root / "fuzz_accept").symlink_to(source)
+                else:
+                    (self.root / "fuzz_accept.c.c").touch()
+                result = subprocess.run(
+                    ["bash", str(build), str(self.root)],
+                    env=dict(os.environ, NGX_SRC=str(nginx), CC=str(compiler)),
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(b"collides with source", result.stderr)
+                self.assertFalse(
+                    marker.exists(), "compiler ran before output validation"
+                )
+                self.assertEqual(source.read_bytes(), b"preserved source")
+                if not alias:
+                    (self.root / "fuzz_accept.c.c").unlink()
+                else:
+                    (self.root / "fuzz_accept").unlink()
+
+    def test_monthly_build_receives_exact_cache_identity(self):
+        repo = Path(__file__).resolve().parents[2]
+        doc = yaml.safe_load((repo / ".github/workflows/ci-deep.yml").read_text())
+        steps = doc["jobs"]["fuzz"]["steps"]
+        cache = next(
+            s for s in steps if s.get("uses") == "./.github/actions/build-cache"
+        )
+        configure = next(s for s in steps if s.get("name") == "Configure nginx tree")
+        self.assertEqual(
+            configure.get("env"),
+            {
+                "CI_BUILD_CACHE_HIT": "${{ steps."
+                + cache["id"]
+                + ".outputs.exact-hit }}",
+                "CI_BUILD_CACHE_IDENTITY": "${{ steps."
+                + cache["id"]
+                + ".outputs.identity }}",
+            },
+        )
 
     def test_regression_budget_does_not_double_charge_discovery(self):
         # 18 targets and 10 fixtures admit a 60s discovery pass (21000s),
@@ -407,6 +546,9 @@ class FuzzTests(unittest.TestCase):
         repo = Path(__file__).resolve().parents[2]
         paths = {
             "ci/fuzz/fuzz_headers": True,
+            "ci/fuzz/fuzz_headers.v2": True,
+            "ci/fuzz/fuzz_headers.v2.c": False,
+            "ci/fuzz/fuzz_headers.v2.dict": False,
             "ci/fuzz/corpus_headers/0123456789abcdef": True,
             "ci/fuzz/corpus_headers/seed.bin": False,
             "ci/fuzz/fuzz_headers.c": False,
@@ -548,6 +690,16 @@ class FuzzTests(unittest.TestCase):
                     self.assertEqual((corpus / "input.bin").read_bytes(), b"input")
                     destinations.append(pending)
                     (pending / "fresh.bin").write_bytes(payload)
+                    control = Path(
+                        next(
+                            a.split("=", 1)[1]
+                            for a in args
+                            if a.startswith("-merge_control_file=")
+                        )
+                    )
+                    control.write_text(
+                        f"1\n0\n{corpus / 'input.bin'}\nSTARTED 0 5\nFT 0\n"
+                    )
 
             with mock.patch.object(fuzz.subprocess, "run", side_effect=execute) as run:
                 fuzz.run(self.root, "120", True)
@@ -1362,6 +1514,7 @@ class FuzzTests(unittest.TestCase):
         )
         for name in ("CFLAGS", "LIB_FUZZING_ENGINE"):
             env.pop(name, None)
+        (self.root / "fuzz_headers.v2.c").touch()
         result = subprocess.run(
             ["bash", str(build), str(self.root)],
             env=env,
@@ -1371,13 +1524,26 @@ class FuzzTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = log.read_text().splitlines()
-        self.assertEqual(len(commands), 3)
-        for name in ("snapshot", "statuses", "accept"):
+        self.assertEqual(len(commands), 4)
+        for name in ("snapshot", "statuses", "accept", "headers.v2"):
             self.assertTrue(any(f"fuzz_{name}.c" in command for command in commands))
         for command in commands:
             self.assertIn("-fsanitize=address,undefined", command)
             self.assertIn("-fno-sanitize-recover=undefined", command)
             self.assertIn("-fsanitize=fuzzer", command)
+        reserved = self.root / "fuzz_reserved.dict.c"
+        reserved.touch()
+        result = subprocess.run(
+            ["bash", str(build), str(self.root)],
+            env=env,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("reserved source extension", result.stderr)
+        self.assertEqual(len(log.read_text().splitlines()), 4)
+        reserved.unlink()
         env["CC"] = str(self.root / "absent-compiler")
         result = subprocess.run(
             ["bash", str(build), str(self.root)],

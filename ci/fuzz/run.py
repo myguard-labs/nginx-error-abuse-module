@@ -130,11 +130,14 @@ def targets(root):
 
 def minimize(binary, corpus, root):
     output_root = root / "minimized"
+    if output_root.is_symlink():
+        raise OSError(f"minimized output root is a symlink: {output_root}")
     output_root.mkdir(exist_ok=True)
     minimized = output_root / corpus.name
     workspace = Path(tempfile.mkdtemp(prefix=f".{minimized.name}-", dir=corpus.parent))
     pending = workspace / "new"
     previous = workspace / "previous"
+    control = workspace / "merge-control"
     published = False
     artifacts = None
     try:
@@ -149,6 +152,7 @@ def minimize(binary, corpus, root):
                 str(pending),
                 str(corpus),
                 f"-artifact_prefix={artifacts}/",
+                f"-merge_control_file={control}",
             ],
             cwd=root,
             timeout=MERGE_SECONDS,
@@ -157,6 +161,19 @@ def minimize(binary, corpus, root):
         # Only this invocation's artifacts count; retain them for failure upload.
         if any(artifacts.iterdir()):
             raise OSError(f"merge produced crash artifacts: {artifacts}")
+        # LLVM's outer merge can exit zero even when every worker failed to
+        # start. Its control file records each input actually entered by a
+        # worker. Empty files carry no inputs and are ignored by libFuzzer.
+        if any(path.is_file() and path.stat().st_size for path in corpus.rglob("*")):
+            lines = control.read_text().splitlines()
+            count = int(lines[0]) if lines else 0
+            started = [
+                int(match[1])
+                for line in lines[2 + count :]
+                if (match := re.fullmatch(r"STARTED ([0-9]+) [0-9]+", line))
+            ]
+            if count < 1 or started != list(range(count)):
+                raise OSError("merge workers did not process every input")
         if minimized.exists() or minimized.is_symlink():
             minimized.rename(previous)
         try:

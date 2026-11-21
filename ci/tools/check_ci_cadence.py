@@ -173,9 +173,12 @@ def check(root):
             ):
                 errors.append("lost ASan artifact upload step")
 
+    basic_job = workflow("build-test.yml")["jobs"]["test-nginx"]
+    if basic_job.get("continue-on-error", False) is not False:
+        errors.append("required basic.t job can suppress failure")
     basic = [
         step
-        for step in workflow("build-test.yml")["jobs"]["test-nginx"].get("steps", [])
+        for step in basic_job.get("steps", [])
         if step.get("name") == "Run ci/t/basic.t"
     ]
     if len(basic) != 1 or basic[0].get("continue-on-error", False) is not False:
@@ -221,7 +224,21 @@ def check(root):
         step.get("name") for step in msvc.get("msvc", {}).get("steps", [])
     }:
         errors.append("lost MSVC native control")
+    for label, job in (
+        ("monthly MSVC", jobs.get("msvc", {})),
+        ("MSVC", msvc.get("msvc", {})),
+        ("helgrind", jobs.get("helgrind", {})),
+    ):
+        if not healthy_fuzz_step_condition(job):
+            errors.append(f"{label} job cannot run on healthy monthly run")
+        if label != "helgrind" and job.get("continue-on-error", False) is not False:
+            errors.append(f"{label} job can suppress failure")
     for step in msvc.get("msvc", {}).get("steps", []):
+        if (
+            step.get("name") in required_steps
+            and step.get("continue-on-error", False) is not False
+        ):
+            errors.append(f"MSVC native control can suppress failure: {step['name']}")
         if step.get("name") in required_steps and not healthy_fuzz_step_condition(step):
             errors.append(f"MSVC native control cannot run: {step['name']}")
     for job, predecessor in (("memcheck", "msvc"), ("codeql", "scanners")):

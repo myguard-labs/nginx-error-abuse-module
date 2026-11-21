@@ -1,4 +1,4 @@
-# sync-sha: 5e68ff499ca4b514bdadb694a916591c6f2d2d8bcaf8ea5d189f4e16f4ce0b31
+# sync-sha: d4500c4148e3b024499a3a40e63ee7205f451d070dc9f010be06adc7eafee04e
 name: CI Deep
 
 # Monthly/manual orchestrator: fuzz regression + discovery; MSVC then Memcheck;
@@ -62,12 +62,16 @@ jobs:
       # cp7a: version is resolved dynamically above, so the cache key changes
       # with it -- correct, since a new mainline release IS a new build tree.
       - name: Restore build caches
+        id: build-cache
         uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Configure nginx tree
+        env:
+          CI_BUILD_CACHE_HIT: ${{ steps.build-cache.outputs.exact-hit }}
+          CI_BUILD_CACHE_IDENTITY: ${{ steps.build-cache.outputs.identity }}
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Select fuzz duration

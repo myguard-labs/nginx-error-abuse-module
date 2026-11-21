@@ -8,7 +8,8 @@ build/
 objs/
 ci/fuzz/generated_parser.inc
 ci/fuzz/fuzz_*
-!ci/fuzz/fuzz_*.*
+!ci/fuzz/fuzz_*.c
+!ci/fuzz/fuzz_*.dict
 ci/fuzz/crash-*
 ci/fuzz/*-min/
 ci/fuzz/minimized/

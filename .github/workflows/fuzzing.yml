@@ -1,4 +1,4 @@
-# sync-sha: 54fb18c6db11a68a3b5a4cc92b24525f06e7550daa0bef186a6e0d54e8ce51cd
+# sync-sha: c21d1b1a03f97c34c4ab031864969322bc6b44303f016526ad004b64f4c3eb8f
 name: Fuzzing
 
 # Manual/reusable regression diagnostic. CI Deep also runs this same regression
@@ -32,7 +32,7 @@ jobs:
   fuzz-regression:
     name: Fuzz regression (120s/target)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    timeout-minutes: 360
     steps:
       - name: Checkout module
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
