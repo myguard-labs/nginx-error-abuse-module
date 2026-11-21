@@ -116,6 +116,8 @@ def load(path: pathlib.Path) -> dict:
     """Parse a workflow. A file that will not parse is exit 2, never clean."""
     try:
         doc = load_workflow(path)
+    except (OSError, UnicodeError) as exc:
+        raise PolicyError(f"{path.name}: cannot read workflow: {exc}") from exc
     except yaml.YAMLError as exc:
         raise PolicyError(f"{path.name}: unparsable YAML: {exc}") from exc
     if not isinstance(doc, dict):

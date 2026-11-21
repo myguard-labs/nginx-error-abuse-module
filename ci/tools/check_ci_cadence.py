@@ -210,12 +210,50 @@ def check(root):
             and children["runtime"].get("continue-on-error", False) is not False
         ):
             errors.append("required runtime job can suppress failure")
+        if caller == "build-test" and "runtime" in children:
+            runtime = [
+                step
+                for step in children["runtime"].get("steps", [])
+                if step.get("name") == "Run multi-worker runtime suite"
+            ]
+            if (
+                len(runtime) != 1
+                or runtime[0].get("continue-on-error", False) is not False
+            ):
+                errors.append("required runtime step can suppress failure")
         if caller == "asan":
             outputs = children.get("asan", {}).get("outputs")
             if not isinstance(outputs, dict) or outputs.get("artifact-id") != (
                 "${{ steps.asan-artifact.outputs.artifact-id }}"
             ):
                 errors.append("lost ASan artifact-id producer output")
+            metadata = {
+                "build-identity": ("identity", "EXPECTED_BUILD_IDENTITY"),
+                "binary-sha256": ("sha256", "EXPECTED_BINARY_SHA256"),
+                "artifact-identity": (
+                    "artifact-identity",
+                    "EXPECTED_ARTIFACT_IDENTITY",
+                ),
+                "artifact-sha256": ("artifact-sha256", "EXPECTED_ARTIFACT_SHA256"),
+            }
+            importers = [
+                step
+                for step in children.get("asan-reload", {}).get("steps", [])
+                if step.get("name") == "Verify plain ASan artifact"
+            ]
+            bindings = importers[0].get("env") if len(importers) == 1 else None
+            if (
+                not isinstance(outputs, dict)
+                or not isinstance(bindings, dict)
+                or any(
+                    outputs.get(output)
+                    != "${{ steps.asan-identity.outputs." + source + " }}"
+                    or bindings.get(variable)
+                    != "${{ needs.asan.outputs." + output + " }}"
+                    for output, (source, variable) in metadata.items()
+                )
+            ):
+                errors.append("lost ASan importer metadata contract")
             uploads = [
                 step
                 for step in children.get("asan", {}).get("steps", [])
@@ -314,6 +352,9 @@ def check(root):
             errors.append(f"MSVC native control can suppress failure: {step['name']}")
         if step.get("name") in required_steps and not healthy_fuzz_step_condition(step):
             errors.append(f"MSVC native control cannot run: {step['name']}")
+    for name in ("fuzz", "msvc", "helgrind", "scanners"):
+        if jobs.get(name, {}).get("needs", []) != []:
+            errors.append(f"monthly starting job has predecessors: {name}")
     for job, predecessor in (("memcheck", "msvc"), ("codeql", "scanners")):
         if (
             jobs.get(job, {}).get("needs") != predecessor
@@ -420,6 +461,26 @@ def check(root):
         )
     ):
         errors.append("lost fuzz regression/discovery or shared build")
+    for name, phase in (
+        ("Upload regression crash artifacts", regression),
+        ("Upload crash artifacts", discovery),
+    ):
+        uploads = [step for step in fuzz.get("steps", []) if step.get("name") == name]
+        upload = uploads[0] if len(uploads) == 1 else {}
+        condition = (
+            str(upload.get("if", "")).removeprefix("${{").removesuffix("}}").strip()
+        )
+        if (
+            len(uploads) != 1
+            or condition != "failure()"
+            or not str(upload.get("uses", "")).startswith("actions/upload-artifact@")
+            or upload.get("continue-on-error", False) is not False
+            or not isinstance(upload.get("with"), dict)
+            or upload["with"].get("path") != "${{ github.workspace }}/ci/fuzz/crash-*"
+            or phase not in commands
+            or fuzz["steps"].index(upload) <= commands.index(phase)
+        ):
+            errors.append(f"lost failure-only fuzz crash upload: {name}")
     corpus_uploads = [
         step
         for step in fuzz.get("steps", [])
@@ -527,7 +588,8 @@ def check(root):
         for step in soaks:
             if step.get("continue-on-error", False) is not False:
                 errors.append(f"{name} soak can suppress failure")
-            if step.get("env", {}).get(variable) != "1":
+            env = step.get("env")
+            if not isinstance(env, dict) or env.get(variable) != "1":
                 errors.append(f"lost {name} instrumentation")
             if not healthy_fuzz_step_condition(step):
                 errors.append(f"{name} soak cannot run on healthy monthly run")

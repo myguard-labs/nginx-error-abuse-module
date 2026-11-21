@@ -132,12 +132,22 @@ def targets(root):
     return result
 
 
+def corpus_entries(corpus):
+    """Walk every directory explicitly; listing failures must never lose seeds."""
+    pending = [corpus]
+    while pending:
+        for path in pending.pop().iterdir():
+            yield path
+            if path.is_dir() and not path.is_symlink():
+                pending.append(path)
+
+
 def corpus_inputs(corpus):
     """Inventory nonempty seeds exactly as LLVM 18's POSIX merge loader does."""
     if corpus.is_symlink():
         raise ValueError(f"corpus root is a symlink: {corpus}")
     inputs = set()
-    for path in corpus.rglob("*"):
+    for path in corpus_entries(corpus):
         relative = path.relative_to(corpus)
         # LLVM skips dot directories, follows file links and ignores empty files.
         # Reject links/special files and newline names rather than silently losing

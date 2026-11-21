@@ -1174,6 +1174,22 @@ class FuzzTests(unittest.TestCase):
                         and len(command) >= 2
                         and command[0] in {"apt", "apt-get"}
                         and command[1] == "install"
+                        # Only real installs count, regardless of a runner's
+                        # pre-existing toolchain satisfying the later probe.
+                        and all(
+                            word
+                            in {
+                                "-y",
+                                "--yes",
+                                "--assume-yes",
+                                "--no-install-recommends",
+                                "--no-install-suggests",
+                                "-q",
+                                "-qq",
+                            }
+                            or not word.startswith("-")
+                            for word in command[2:]
+                        )
                     ):
                         packages.extend(
                             word for word in command[2:] if not word.startswith("-")
@@ -1191,12 +1207,18 @@ class FuzzTests(unittest.TestCase):
             "sudo apt-get install -y clang\nsudo apt-get install -y libclang-rt-dev\n",
             "sudo apt-get install -y clang && sudo apt-get install -y libclang-rt-dev",
             "sudo apt-get update; sudo apt install -y clang libclang-rt-dev",
+            "sudo apt install --yes --no-install-recommends clang libclang-rt-dev",
             "sudo apt install -y clang libclang-rt-dev || echo failed",
         ):
             with self.subTest(script=script):
                 split_step["run"] = script
                 assert_toolchain_packages(split)
         for script in (
+            "sudo apt-get install --simulate clang libclang-rt-dev",
+            "sudo apt-get install --download-only clang libclang-rt-dev",
+            "sudo apt install -s clang libclang-rt-dev",
+            "sudo apt-get install -dy clang libclang-rt-dev",
+            "sudo apt-get install -o APT::Get::Simulate=true clang libclang-rt-dev",
             "sudo apt-get install -y clang; false && sudo apt-get install -y libclang-rt-dev",
             "false && sudo apt-get install -y clang libclang-rt-dev",
             "sudo apt-get install -y clang || sudo apt-get install -y libclang-rt-dev",

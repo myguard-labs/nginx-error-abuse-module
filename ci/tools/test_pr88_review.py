@@ -2,6 +2,7 @@
 """Regression controls for the PR88 full-review repairs."""
 
 import contextlib
+import glob
 import os
 import re
 import runpy
@@ -23,8 +24,8 @@ import yaml
 @contextlib.contextmanager
 def fixture(kind):
     test = kind()
-    test.setUp()
     try:
+        test.setUp()
         yield test
     finally:
         test.doCleanups()
@@ -965,6 +966,247 @@ class Cycle104Repairs(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class Cycle105Repairs(unittest.TestCase):
+    def test_app104_listing_errors_propagate_and_empty_corpus_is_valid(self):
+        with fixture(fuzz_tests.FuzzTests) as test:
+            corpus = test.root / "corpus"
+            self.assertEqual(fuzz_tests.fuzz.corpus_inputs(corpus), set())
+            hidden = corpus / ".archive"
+            hidden.mkdir()
+            (hidden / "seed.bin").write_bytes(b"seed")
+            original_scan = os.scandir
+            original_list = os.listdir
+
+            def denied_scan(path):
+                if Path(path) == hidden:
+                    raise PermissionError("listing denied")
+                return original_scan(path)
+
+            def denied_list(path):
+                if Path(path) == hidden:
+                    raise PermissionError("listing denied")
+                return original_list(path)
+
+            with (
+                mock.patch("os.scandir", side_effect=denied_scan),
+                mock.patch("os.listdir", side_effect=denied_list),
+                mock.patch.object(
+                    glob._StringGlobber, "scandir", side_effect=denied_scan
+                )
+                if hasattr(glob, "_StringGlobber")
+                else contextlib.nullcontext(),
+                self.assertRaisesRegex(PermissionError, "listing denied"),
+            ):
+                fuzz_tests.fuzz.corpus_inputs(corpus)
+            with self.assertRaisesRegex(ValueError, "unsupported corpus seed"):
+                fuzz_tests.fuzz.corpus_inputs(corpus)
+
+    def test_app105_workflow_read_errors_are_filename_bound_policy_errors(self):
+        policy = runpy.run_path(str(cadence.ROOT / "ci/linter/workflow_policy.py"))
+        with tempfile_directory() as root:
+            path = root / "broken.yml"
+            for error in (PermissionError("denied"), UnicodeError("encoding")):
+                with (
+                    self.subTest(error=error),
+                    mock.patch.dict(
+                        policy["load"].__globals__,
+                        load_workflow=mock.Mock(side_effect=error),
+                    ),
+                    self.assertRaisesRegex(policy["PolicyError"], "broken.yml"),
+                ):
+                    policy["load"](path)
+            path.write_bytes(b"\xff")
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            path.rename(workflows / path.name)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(cadence.ROOT / "ci/linter/workflow_policy.py"),
+                    "runners",
+                ],
+                env=cadence_tests.fixture_environment(WORKFLOW_POLICY_ROOT=str(root)),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("broken.yml", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_app106_runtime_step_enforces_result(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/build-test.yml"
+            original = path.read_bytes()
+            for value in (True, "false", "${{ true }}", False, None):
+                with self.subTest(value=value):
+                    path.write_bytes(original)
+                    doc = graph.load_workflow(path)
+                    step = next(
+                        s
+                        for s in doc["jobs"]["runtime"]["steps"]
+                        if s.get("name") == "Run multi-worker runtime suite"
+                    )
+                    if value is not None:
+                        step["continue-on-error"] = value
+                    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                    self.assertEqual(
+                        "required runtime step can suppress failure"
+                        in cadence.check(test.root),
+                        value is not False and value is not None,
+                    )
+
+    def test_app107_asan_metadata_outputs_and_import_bindings(self):
+        pairs = {
+            "build-identity": "EXPECTED_BUILD_IDENTITY",
+            "binary-sha256": "EXPECTED_BINARY_SHA256",
+            "artifact-identity": "EXPECTED_ARTIFACT_IDENTITY",
+            "artifact-sha256": "EXPECTED_ARTIFACT_SHA256",
+        }
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/asan.yml"
+            original = path.read_bytes()
+            self.assertEqual(cadence.check(test.root), [])
+            for output, variable in pairs.items():
+                for target in ("output", "binding", "env"):
+                    for value in (None, "wrong"):
+                        with self.subTest(output=output, target=target, value=value):
+                            path.write_bytes(original)
+                            doc = graph.load_workflow(path)
+                            if target == "output":
+                                mapping = doc["jobs"]["asan"]["outputs"]
+                                key = output
+                            else:
+                                step = next(
+                                    s
+                                    for s in doc["jobs"]["asan-reload"]["steps"]
+                                    if s.get("name") == "Verify plain ASan artifact"
+                                )
+                                mapping, key = (
+                                    (step, "env")
+                                    if target == "env"
+                                    else (step["env"], variable)
+                                )
+                            if value is None:
+                                mapping.pop(key)
+                            else:
+                                mapping[key] = value
+                            path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                            self.assertIn(
+                                "lost ASan importer metadata contract",
+                                cadence.check(test.root),
+                            )
+
+    def test_app108_monthly_starting_jobs_have_no_predecessors(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            for job, predecessor in (
+                ("fuzz", "codeql"),
+                ("msvc", "codeql"),
+                ("helgrind", "codeql"),
+                ("scanners", "fuzz"),
+            ):
+                for needs in (predecessor, [predecessor], [], None):
+                    with self.subTest(job=job, needs=needs):
+                        path.write_bytes(original)
+                        doc = graph.load_workflow(path)
+                        if needs is not None:
+                            doc["jobs"][job]["needs"] = needs
+                        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                        self.assertEqual(
+                            f"monthly starting job has predecessors: {job}"
+                            in cadence.check(test.root),
+                            needs not in ([], None),
+                        )
+
+    def test_app109_crash_uploads_required_independently(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            for name in ("Upload regression crash artifacts", "Upload crash artifacts"):
+                for mutation in (
+                    "missing",
+                    "condition",
+                    "action",
+                    "path",
+                    "inputs",
+                    "early",
+                    "suppressed",
+                    "valid",
+                ):
+                    with self.subTest(name=name, mutation=mutation):
+                        path.write_bytes(original)
+                        doc = graph.load_workflow(path)
+                        steps = doc["jobs"]["fuzz"]["steps"]
+                        step = next(s for s in steps if s.get("name") == name)
+                        if mutation == "missing":
+                            steps.remove(step)
+                        if mutation == "condition":
+                            step["if"] = "success()"
+                        if mutation == "action":
+                            step["uses"] = "actions/download-artifact@fake"
+                        if mutation == "path":
+                            step["with"]["path"] = "ci/fuzz/minimized/"
+                        if mutation == "inputs":
+                            step["with"] = None
+                        if mutation == "suppressed":
+                            step["continue-on-error"] = True
+                        if mutation == "early":
+                            steps.remove(step)
+                            steps.insert(0, step)
+                        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                        self.assertEqual(
+                            f"lost failure-only fuzz crash upload: {name}"
+                            in cadence.check(test.root),
+                            mutation != "valid",
+                        )
+
+    def test_app110_malformed_soak_env_is_a_policy_finding(self):
+        with fixture(cadence_tests.WorkflowFixture) as test:
+            path = test.root / ".github/workflows/ci-deep.yml"
+            original = path.read_bytes()
+            for job, variable in (
+                ("helgrind", "USE_HELGRIND"),
+                ("memcheck", "USE_VALGRIND"),
+            ):
+                for env in (None, [], "invalid", {}, {variable: "1"}):
+                    with self.subTest(job=job, env=env):
+                        path.write_bytes(original)
+                        doc = graph.load_workflow(path)
+                        step = next(
+                            s
+                            for s in doc["jobs"][job]["steps"]
+                            if "bash ci/tools/soak.sh" in s.get("run", "")
+                        )
+                        step["env"] = env
+                        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                        self.assertEqual(
+                            f"lost {job} instrumentation" in cadence.check(test.root),
+                            env != {variable: "1"},
+                        )
+
+    def test_app112_partial_setup_always_runs_cleanups(self):
+        cleaned = []
+
+        class Partial(unittest.TestCase):
+            def setUp(self):
+                self.addCleanup(cleaned.append, "cleaned")
+                raise OSError("setup failed")
+
+        with self.assertRaisesRegex(OSError, "setup failed"), fixture(Partial):
+            self.fail("setup must fail before yielding")
+        self.assertEqual(cleaned, ["cleaned"])
+
+        class Complete(unittest.TestCase):
+            def setUp(self):
+                self.addCleanup(cleaned.append, "complete")
+
+        with fixture(Complete):
+            pass
+        self.assertEqual(cleaned, ["cleaned", "complete"])
 
 
 @contextlib.contextmanager
