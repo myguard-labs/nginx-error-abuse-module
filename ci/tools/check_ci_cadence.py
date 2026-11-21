@@ -2,6 +2,7 @@
 """Enforce CI04 cadence, retained gates and expanded four-runner bounds."""
 
 import re
+import runpy
 import sys
 from itertools import pairwise
 from pathlib import Path
@@ -10,6 +11,17 @@ import yaml
 from check_ci_graph import GraphError, graph, load_workflow, width
 
 ROOT = Path(__file__).resolve().parents[2]
+# Share preflight's calculation rather than maintaining another budget formula.
+check_fuzz_budget = runpy.run_path(str(ROOT / "ci/fuzz/run.py"))["check_budget"]
+PR_NEEDS = {
+    "build-test": set(),
+    "lint": set(),
+    "asan": {"build-test", "lint"},
+    "valgrind": {"build-test"},
+    "codeql": {"lint"},
+    "security-scanners": {"codeql"},
+    "windows": {"build-test", "lint"},
+}
 PR_JOBS = {
     "build-test": {
         "validation",
@@ -146,6 +158,11 @@ def check(root):
             errors.append(f"missing PR gate: {caller}")
         if caller in {"build-test", "lint"} and "needs" in job:
             errors.append(f"PR entry job cannot depend on other jobs: {caller}")
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        if not isinstance(needs, list) or set(needs) != PR_NEEDS[caller]:
+            errors.append(f"PR predecessor contract: {caller}")
         children = workflow(f"{caller}.yml")["jobs"]
         actual = set(children)
         if actual != required:
@@ -203,6 +220,12 @@ def check(root):
     default = str(fuzz_input.get("default", "")) if isinstance(fuzz_input, dict) else ""
     if not re.fullmatch(r"[0-9]{1,5}", default) or not 1 <= int(default) <= 86400:
         errors.append("missing or invalid manual fuzz_seconds default")
+    else:
+        try:
+            # A no-override manual run must work on the hosted fallback too.
+            check_fuzz_budget(root / "ci/fuzz", default, "github-hosted")
+        except ValueError as exc:
+            errors.append(f"manual fuzz_seconds default exceeds runner budget: {exc}")
     codeql = workflow("codeql.yml")
     if "schedule" in event_names(codeql):
         errors.append("duplicate CodeQL schedule")

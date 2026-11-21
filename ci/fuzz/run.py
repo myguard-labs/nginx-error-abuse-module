@@ -162,8 +162,8 @@ def minimize(binary, corpus, root):
         if any(artifacts.iterdir()):
             raise OSError(f"merge produced crash artifacts: {artifacts}")
         # LLVM's outer merge can exit zero even when every worker failed to
-        # start. Its control file records each input actually entered by a
-        # worker. Empty files carry no inputs and are ignored by libFuzzer.
+        # start. STARTED only proves entry; FT proves callback completion,
+        # even when it has no feature IDs. Empty files are ignored by libFuzzer.
         if any(path.is_file() and path.stat().st_size for path in corpus.rglob("*")):
             lines = control.read_text().splitlines()
             count = int(lines[0]) if lines else 0
@@ -172,7 +172,12 @@ def minimize(binary, corpus, root):
                 for line in lines[2 + count :]
                 if (match := re.fullmatch(r"STARTED ([0-9]+) [0-9]+", line))
             ]
-            if count < 1 or started != list(range(count)):
+            completed = [
+                int(match[1])
+                for line in lines[2 + count :]
+                if (match := re.fullmatch(r"FT ([0-9]+)(?: [0-9]+)*", line))
+            ]
+            if count < 1 or started != list(range(count)) or completed != started:
                 raise OSError("merge workers did not process every input")
         if minimized.exists() or minimized.is_symlink():
             minimized.rename(previous)
@@ -222,6 +227,8 @@ def run(root, seconds, merge=False, runner_class="github-hosted"):
             subprocess.TimeoutExpired,
         ) as exc:
             failures.append(exc)
+    if failures:
+        raise failures[0]
     for binary, corpus, dictionary in selected.values():
         args = [
             str(binary),

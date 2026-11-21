@@ -166,6 +166,8 @@ class GraphTests(unittest.TestCase):
         self.workflows.mkdir(parents=True)
 
     def write(self, name, body):
+        if name != "ci.yml" and body.startswith("jobs:"):
+            body = "on: workflow_call\n" + body
         (self.workflows / name).write_text(body)
 
     def test_fixture_resolves_symlinked_tempdir_and_cleans_up(self):

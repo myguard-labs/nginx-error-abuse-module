@@ -1,4 +1,4 @@
-# sync-sha: 4dca3e3c6b1fa5b2748ed2fe9086e931b93bd6ddf8431cd09a294ba45b979d07
+# sync-sha: 07e9919af46409f6620622c3702a2781df2996370b7fab88a59615ed839f5b0a
 name: Build cache
 description: Restore verified archives, compiler objects and exact trusted-main trees.
 
@@ -59,17 +59,26 @@ runs:
         # and no on-disk cache from an earlier job is accepted implicitly.
         # Cache service versions include the path: keep it stable across runs,
         # including compatible-object fallbacks after the build identity changes.
-        # Require a canonical absolute parent so cleanup cannot traverse a link,
-        # escape via .., or inject another GITHUB_ENV/output entry.
-        runner_temp=${RUNNER_TEMP:-}
-        if [[ "$runner_temp" != /* || "$runner_temp" == / ||
-              "$runner_temp" == *$'\n'* || "$runner_temp" == *$'\r'* ]] ||
-           [[ ! -d "$runner_temp" || "$runner_temp" != "$(realpath -e -- "$runner_temp")" ]]; then
-          echo "invalid RUNNER_TEMP for compiler cache" >&2
+        # The cache service hashes the path text. Use a workspace-relative
+        # path so compatible jobs share a version across runner slots and roots.
+        # Compiler use and cleanup still use a canonical, contained absolute path.
+        # Preserve trailing newlines until validation; command substitution
+        # would otherwise strip them and silently select a different directory.
+        workspace=$(pwd -P && printf '.')
+        workspace=${workspace%$'\n.'}
+        if [[ "$workspace" == / || "$workspace" == *$'\n'* || "$workspace" == *$'\r'* ]]; then
+          echo "invalid workspace for compiler cache" >&2
           exit 2
         fi
+        parent="$workspace/.build"
+        if [[ -L "$parent" || ( -e "$parent" && ! -d "$parent" ) ]]; then
+          echo "unsafe compiler cache parent" >&2
+          exit 2
+        fi
+        mkdir -p -- "$parent"
         variant=$(printf '%s\0' "$BUILD_MODE" "$BUILD_FLAVOR" "$BUILD_VERSION" | sha256sum | cut -d' ' -f1)
-        cache_dir="$runner_temp/ea-ccache-$scope-$variant"
+        cache_path=".build/ea-ccache-$scope-$variant"
+        cache_dir="$workspace/$cache_path"
         if [[ -L "$cache_dir" || ( -e "$cache_dir" && ! -d "$cache_dir" ) ]]; then
           echo "unsafe compiler cache target" >&2
           exit 2
@@ -79,7 +88,7 @@ runs:
         rm -rf -- "$cache_dir"
         mkdir -m 700 -- "$cache_dir"
         echo "CCACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
-        echo "path=$cache_dir" >> "$GITHUB_OUTPUT"
+        echo "path=$cache_path" >> "$GITHUB_OUTPUT"
 
     - name: Restore trusted-ref ccache
       if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target'

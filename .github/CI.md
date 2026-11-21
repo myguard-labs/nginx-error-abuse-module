@@ -56,7 +56,7 @@ corpus (30 days) artifacts. New `fuzz_*.c` targets are automatically built and
 run; a missing corpus/binary or unroutable regression fails visibly. Manual
 `fuzz_seconds` remains strictly bounded to 1..86400; scheduled runs use 3600.
 
-### Required-check migration before delivery
+## Required-check migration before delivery
 
 Current protection requires `fuzzing / Fuzz regression (120s/target)`. Before
 pushing the cadence change, remove that context and retain the other ten real

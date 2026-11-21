@@ -620,7 +620,7 @@ class FuzzTests(unittest.TestCase):
                 ):
                     fuzz.run(self.root, "120", True)
                 self.assertIs(raised.exception, error)
-                self.assertEqual(run.call_count, 9)
+                self.assertEqual(run.call_count, 3 if phase == "replay" else 9)
                 self.assertEqual(Path(run.call_args.args[0][0]).name, "fuzz_statuses")
                 self.assertEqual(list(self.root.glob(".corpus*-*")), [])
 
@@ -1091,7 +1091,7 @@ class FuzzTests(unittest.TestCase):
         ) as run:
             with self.assertRaises(subprocess.CalledProcessError):
                 fuzz.run(self.root, "120")
-            self.assertEqual(run.call_count, 6)
+            self.assertEqual(run.call_count, 3)
         with (
             mock.patch.object(fuzz, "__file__", str(self.root / "run.py")),
             mock.patch.object(sys, "argv", ["run.py", "120"]),

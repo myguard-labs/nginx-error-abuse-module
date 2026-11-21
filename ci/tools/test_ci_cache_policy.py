@@ -3,6 +3,7 @@
 
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -243,7 +244,7 @@ class CompilerCachePreparation(unittest.TestCase):
         exported = pathlib.Path(env["GITHUB_ENV"]).read_text()
         if success:
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(exported, f"CCACHE_DIR={output['path']}\n")
+            self.assertEqual(exported, f"CCACHE_DIR={self.repo / output['path']}\n")
             self.assertEqual(output["tree"], "fixture-executable-tree")
             self.assertEqual(
                 output["build"],
@@ -257,7 +258,7 @@ class CompilerCachePreparation(unittest.TestCase):
 
     def test_same_context_has_stable_service_path_and_clears_stale_disk(self):
         _, first = self.prepare()
-        cache = pathlib.Path(first["path"])
+        cache = self.repo / first["path"]
         (cache / "poisoned-object").write_text("untrusted prior run")
         sibling = self.runner / "sibling"
         sibling.mkdir()
@@ -271,7 +272,7 @@ class CompilerCachePreparation(unittest.TestCase):
 
     def test_variant_and_ref_paths_are_isolated(self):
         _, first = self.prepare()
-        cache = pathlib.Path(first["path"])
+        cache = self.repo / first["path"]
         sentinel = cache / "sentinel"
         sentinel.write_text("other context")
         paths = {first["path"]}
@@ -296,7 +297,7 @@ class CompilerCachePreparation(unittest.TestCase):
 
     def test_hostile_leaf_is_rejected_without_following_or_removing_it(self):
         _, output = self.prepare()
-        cache = pathlib.Path(output["path"])
+        cache = self.repo / output["path"]
         cache.rmdir()
         outside = self.root / "outside"
         outside.mkdir()
@@ -315,31 +316,35 @@ class CompilerCachePreparation(unittest.TestCase):
         self.assertIn("unsafe compiler cache target", result.stderr)
         self.assertEqual(cache.read_text(), "caller file")
 
-    def test_invalid_runner_roots_are_rejected(self):
-        ancestor = self.root / "linked-parent"
-        ancestor.symlink_to(self.root, target_is_directory=True)
-        # Existing directories ensure control-character rejection is exercised,
-        # rather than passing only because the injected path does not exist.
-        injected_roots = [
-            pathlib.Path(str(self.runner) + "\nINJECTED=1"),
-            pathlib.Path(str(self.runner) + "\r"),
-        ]
-        for root in injected_roots:
-            root.mkdir()
-        for runner_temp in (
-            "",
-            "/",
-            "relative",
-            str(self.root / "missing"),
-            str(ancestor / self.runner.name),
-            str(self.runner) + "/../runner temp",
-            *(str(root) for root in injected_roots),
-        ):
-            with self.subTest(runner_temp=runner_temp):
-                result, _ = self.prepare(success=False, RUNNER_TEMP=runner_temp)
-                self.assertIn("invalid RUNNER_TEMP for compiler cache", result.stderr)
-        for root in [self.runner, *injected_roots]:
-            self.assertEqual(list(root.iterdir()), [])
+    def test_unsafe_cache_parents_are_rejected(self):
+        parent = self.repo / ".build"
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep"
+        sentinel.write_text("preserved")
+        for target in (outside, self.root / "missing"):
+            with self.subTest(target=target):
+                parent.symlink_to(target, target_is_directory=True)
+                result, _ = self.prepare(success=False)
+                self.assertIn("unsafe compiler cache parent", result.stderr)
+                self.assertTrue(parent.is_symlink())
+                self.assertEqual(sentinel.read_text(), "preserved")
+                parent.unlink()
+        parent.write_text("preserved file")
+        self.prepare(success=False)
+        self.assertEqual(parent.read_text(), "preserved file")
+
+    def test_workspace_control_characters_are_rejected(self):
+        for suffix in ("\nINJECTED=1", "\n", "\r"):
+            with self.subTest(suffix=suffix):
+                original = self.repo
+                self.repo = self.root / ("repo" + suffix)
+                shutil.copytree(original, self.repo)
+                try:
+                    result, _ = self.prepare(success=False)
+                    self.assertIn("invalid workspace", result.stderr)
+                finally:
+                    self.repo = original
 
 
 def load_tests(loader, tests, _pattern):

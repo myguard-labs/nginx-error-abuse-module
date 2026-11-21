@@ -2,6 +2,9 @@
 # Monthly coverage and runner-width policy; all workflows form one contract.
 # Staged blobs must reflect committed object bytes, even with local replace refs.
 export GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0
+# Pathspec magic is part of our queries; ambient overrides must not hide paths.
+# Keep GIT_INDEX_FILE: hooks may intentionally select a private index.
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 need python3 "apt-get install python3"
@@ -12,7 +15,7 @@ if [ "$#" -gt 0 ]; then
 		path=${path#"$root"/}
 		while [[ "$path" == ./* ]]; do path=${path#./}; done
 		case "$path" in
-		.github/workflows/*.yml | .github/workflows/*.yaml) selected=true ;;
+		.github/workflows/*.yml | .github/workflows/*.yaml | ci/fuzz/*) selected=true ;;
 		esac
 	done
 	if [ "$selected" = false ]; then
@@ -25,7 +28,7 @@ if [ "${LINT_MODE:-all}" != staged ]; then
 fi
 # A graph needs every workflow from the same index, including unchanged callees.
 # Include deletions in the trigger; never refresh or write back the source index.
-changed=$(git diff --cached --ita-invisible-in-index --name-only -- ':(top).github/workflows')
+changed=$(git diff --cached --ita-invisible-in-index --name-only -- ':(top).github/workflows' ':(top)ci/fuzz')
 if [ -z "$changed" ] && [ "$selected" = false ]; then
 	echo 'lint-ci-monthly: no staged workflow files to check'
 	exit 0
@@ -40,12 +43,12 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 entries = subprocess.check_output(
-    ["git", "ls-files", "--stage", "--full-name", "-z", "--", ":(top).github/workflows"]
+    ["git", "ls-files", "--stage", "--full-name", "-z", "--", ":(top).github/workflows", ":(top)ci/fuzz"]
 )
 def additions(visibility):
     return set(subprocess.check_output([
         "git", "diff", "--cached", visibility, "--diff-filter=A", "--name-only", "-z",
-        "--", ":(top).github/workflows",
+        "--", ":(top).github/workflows", ":(top)ci/fuzz",
     ]).split(b"\0"))
 
 intent = additions("--ita-visible-in-index") - additions("--ita-invisible-in-index")

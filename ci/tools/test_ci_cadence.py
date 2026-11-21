@@ -49,6 +49,15 @@ def fixture_environment(**overrides):
     }
 
 
+def copy_fuzz_inventory(source, target):
+    destination = target / "ci/fuzz"
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in (source / "ci/fuzz").glob("fuzz_*.c"):
+        shutil.copyfile(path, destination / path.name)
+    shutil.copyfile(source / "ci/fuzz/run.py", destination / "run.py")
+    shutil.copytree(source / "ci/fuzz/regressions", destination / "regressions")
+
+
 class WorkflowFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -57,6 +66,7 @@ class WorkflowFixture(unittest.TestCase):
         shutil.copytree(
             policy.ROOT / ".github/workflows", self.root / ".github/workflows"
         )
+        copy_fuzz_inventory(policy.ROOT, self.root)
 
     def replace(self, name, before, after):
         path = self.root / ".github/workflows" / name
@@ -172,9 +182,13 @@ class CadenceTests(WorkflowFixture):
                 self.update_workflow(
                     "windows-msvc.yml", lambda doc, events=events: doc.update(on=events)
                 )
-                self.assertIn(
-                    "MSVC monthly/manual trigger contract", policy.check(self.root)
-                )
+                if "workflow_call" not in events:
+                    with self.assertRaisesRegex(policy.GraphError, "workflow_call"):
+                        policy.check(self.root)
+                else:
+                    self.assertIn(
+                        "MSVC monthly/manual trigger contract", policy.check(self.root)
+                    )
         path.write_bytes(original)
         self.assertEqual(policy.check(self.root), [])
 
@@ -251,7 +265,7 @@ class CadenceTests(WorkflowFixture):
                     "missing or invalid manual fuzz_seconds default",
                     policy.check(self.root),
                 )
-        for default in ("1", "00001", "3600", "86400", 3600):
+        for default in ("1", "00001", "3600", 3600):
             with self.subTest(default=default):
                 path.write_bytes(original)
                 self.update_workflow(
@@ -844,7 +858,10 @@ class CadenceTests(WorkflowFixture):
         for event in ("schedule", "prefix_schedule", "schedule_suffix"):
             for events in (event, [event], {event: None}):
                 with self.subTest(events=events):
-                    self.set_events("codeql.yml", events)
+                    # The event parser accepts all forms, while a called
+                    # workflow independently owes workflow_call.
+                    self.assertEqual(policy.event_names({"on": events}), {event})
+                    self.set_events("codeql.yml", {"workflow_call": None, event: None})
                     expected = (
                         ["duplicate CodeQL schedule"] if event == "schedule" else []
                     )

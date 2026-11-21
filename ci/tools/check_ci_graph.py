@@ -108,6 +108,15 @@ def graph(root, entry=".github/workflows/ci.yml", *, document_loader=None):
             jobs = doc["jobs"]
         except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError) as exc:
             raise GraphError(f"cannot load {path}: {exc}") from exc
+        if stack:
+            events = doc.get("on", doc.get(True, {}))
+            callable_workflow = (
+                events == "workflow_call"
+                or isinstance(events, (dict, list))
+                and "workflow_call" in events
+            )
+            if not callable_workflow:
+                raise GraphError(f"called workflow lacks workflow_call: {path.name}")
         if not isinstance(jobs, dict) or not jobs:
             raise GraphError("missing jobs")
         spans = {}
