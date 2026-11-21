@@ -3384,6 +3384,29 @@ ngx_http_error_abuse_redis_record_failure(time_t now)
     }
 }
 
+/* A queued GET owns this heap token until hiredis completes it, including
+ * NULL replies on disconnect/exit. Request cleanup invalidates request before
+ * termination can free its pool, but leaves the token for that callback.
+ * A live callback disables cleanup and frees the token before resuming phases;
+ * a cancelled callback frees only the token and never touches request memory.
+ * All transitions run on the worker event loop. The park reference is released
+ * only by a live callback; nginx termination owns cancelled-request
+ * teardown. */
+typedef struct {
+    ngx_http_request_t  *request;
+    ngx_http_cleanup_t  *cleanup;
+} ngx_http_error_abuse_redis_check_t;
+
+static void
+ngx_http_error_abuse_redis_check_cleanup(void *data)
+{
+    ngx_http_error_abuse_redis_check_t *check = data;
+
+    check->request = NULL;
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_http_error_abuse_redis_worker.log, 0,
+                   "error_abuse: Redis check request invalidated");
+}
+
 static ngx_int_t
 ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     ngx_http_error_abuse_req_ctx_t *ctx)
@@ -3393,6 +3416,8 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     ngx_str_t   events, block;
     const char *argv[2];
     size_t      argvlen[2];
+    ngx_http_cleanup_t                 *cln;
+    ngx_http_error_abuse_redis_check_t *check;
 
     if (ctx->redis_pending) {
         return NGX_AGAIN;
@@ -3423,15 +3448,34 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     argvlen[0] = 3;
     argv[1] = (const char *) block.data;
     argvlen[1] = block.len;
+    check = ngx_alloc(sizeof(ngx_http_error_abuse_redis_check_t),
+                      r->connection->log);
+    if (check == NULL) {
+        ctx->redis_checked = 1;
+        return NGX_DECLINED;
+    }
+    cln = ngx_http_cleanup_add(r, 0);
+    if (cln == NULL) {
+        ngx_free(check);
+        ctx->redis_checked = 1;
+        return NGX_DECLINED;
+    }
+    check->request = r;
+    check->cleanup = cln;
+    cln->data = check;
+    cln->handler = ngx_http_error_abuse_redis_check_cleanup;
+
     ctx->redis_pending = 1;
     rc = redisAsyncCommandArgv(ngx_http_error_abuse_redis_worker.context,
                                ngx_http_error_abuse_redis_check_callback,
-                               r, 2, argv, argvlen);
+                               check, 2, argv, argvlen);
     if (rc != REDIS_OK) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "error_abuse: failed to queue Redis GET command");
         ngx_http_error_abuse_redis_record_failure(now);
 
+        cln->handler = NULL;
+        ngx_free(check);
         ctx->redis_pending = 0;
         ctx->redis_checked = 1;
         return NGX_DECLINED;
@@ -3440,6 +3484,7 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     /* Async park: hold a reference so the request survives until the Redis
      * callback resumes it. Released by ngx_http_finalize_request(NGX_DONE)
      * in ngx_http_error_abuse_redis_check_callback. */
+    r->write_event_handler = ngx_http_request_empty_handler;
     r->main->count++;
 
     return NGX_AGAIN;
@@ -3453,8 +3498,20 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     ngx_http_request_t               *r;
     ngx_connection_t                  *c;
     ngx_http_error_abuse_req_ctx_t   *ctx;
+    ngx_http_error_abuse_redis_check_t *check = privdata;
 
-    r = privdata;
+    r = check->request;
+    if (r == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP,
+                       ngx_http_error_abuse_redis_worker.log, 0,
+                       "error_abuse: Redis check completed after cleanup "
+                       "(null=%d)", data == NULL);
+        ngx_free(check);
+        return;
+    }
+    check->cleanup->handler = NULL;
+    ngx_free(check);
+
     c = r->connection;
     ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
     if (ctx == NULL) {
@@ -3533,6 +3590,7 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
      * touches r either. run_posted_requests(c) then runs LAST, off the
      * pre-captured connection, the same way ngx_http_request_handler() calls
      * it after its event handler, never re-touching r itself. */
+    r->write_event_handler = ngx_http_core_run_phases;
     ngx_http_finalize_request(r, NGX_DONE);
     ngx_http_core_run_phases(r);
     ngx_http_run_posted_requests(c);
