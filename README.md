@@ -192,7 +192,10 @@ other option is optional and must use the `key=value` form shown above. The
 certificate chain against `/etc/ssl/certs` and checks the original `host=`
 identity before sending Redis commands (including AUTH). DNS names use hostname
 verification and SNI; numeric IPv4/IPv6 hosts require a matching IP SAN and do
-not send SNI. A trusted certificate for a different endpoint is rejected.
+not send SNI. A final DNS root dot is retained for resolution and removed for
+TLS verification and SNI. IPv4 literals use four decimal octets; shorthand
+numeric forms such as `127.1` are rejected for TLS. A trusted certificate for a
+different endpoint is rejected.
 
 `host=` is resolved to a numeric address **once, at config load**, so the worker
 event loop never blocks on `getaddrinfo()` when (re)connecting. Two consequences:

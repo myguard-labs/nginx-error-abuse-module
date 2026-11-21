@@ -2644,9 +2644,10 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      * (reconnects fire on a 1s..30s backoff). Handing hiredis a numeric
      * address keeps the connect path non-blocking. */
     {
-        ngx_url_t  u;
-        u_char     text[NGX_SOCKADDR_STRLEN];
-        size_t     tlen;
+        ngx_url_t        u;
+        struct addrinfo  hints, *numeric;
+        u_char           text[NGX_SOCKADDR_STRLEN];
+        size_t           tlen;
 
         /* Keep the original host text for TLS SNI + certificate hostname
          * verification, since the connect address is now numeric. */
@@ -2657,6 +2658,30 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         ngx_memcpy(mcf->redis.sni.data, host.data, host.len);
         mcf->redis.sni.data[host.len] = '\0';
         mcf->redis.sni.len = host.len;
+
+        /* The resolver may accept legacy IPv4 forms (127.1, 0x7f000001).
+         * Reject those for TLS rather than authenticating them as DNS names.
+         * AI_NUMERICHOST never performs DNS resolution. nginx's own dotted
+         * decimal parser remains authoritative, including zero-padded
+         * octets. */
+        if (tls && host.data[0] != '['
+            && ngx_inet_addr(host.data, host.len) == INADDR_NONE
+            && !(host.len == sizeof("255.255.255.255") - 1
+                 && ngx_strncmp(host.data, "255.255.255.255", host.len) == 0))
+        {
+            ngx_memzero(&hints, sizeof(hints));
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_flags = AI_NUMERICHOST;
+            if (getaddrinfo((char *) mcf->redis.sni.data, NULL, &hints,
+                            &numeric) == 0)
+            {
+                freeaddrinfo(numeric);
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "error_abuse_redis TLS requires dotted-decimal IPv4");
+                return NGX_CONF_ERROR;
+            }
+        }
 
         ngx_memzero(&u, sizeof(ngx_url_t));
         u.url = host;
@@ -4059,10 +4084,12 @@ static ngx_int_t
 ngx_http_error_abuse_redis_start_tls(redisAsyncContext *ac,
     ngx_http_error_abuse_redis_worker_t *worker)
 {
-    SSL        *ssl;
-    ngx_str_t   identity;
-    ngx_int_t   is_ip;
-    char        ip[NGX_INET6_ADDRSTRLEN + 1];
+    SSL         *ssl;
+    ngx_str_t    identity;
+    in_addr_t    addr4;
+    u_char      *address;
+    size_t       address_len;
+    char         ip[NGX_INET6_ADDRSTRLEN + 1];
 #if (NGX_HAVE_INET6)
     u_char      addr6[16];
 #endif
@@ -4075,13 +4102,21 @@ ngx_http_error_abuse_redis_start_tls(redisAsyncContext *ac,
         identity.data++;
         identity.len -= 2;
     }
-    is_ip = (ngx_inet_addr(identity.data, identity.len) != INADDR_NONE
-             || (identity.len == sizeof("255.255.255.255") - 1
-                 && ngx_strncmp(identity.data, "255.255.255.255",
-                                identity.len) == 0));
+    address = NULL;
+    address_len = 0;
+    addr4 = ngx_inet_addr(identity.data, identity.len);
+    if (addr4 != INADDR_NONE
+        || (identity.len == sizeof("255.255.255.255") - 1
+            && ngx_strncmp(identity.data, "255.255.255.255",
+                           identity.len) == 0))
+    {
+        address = (u_char *) &addr4;
+        address_len = sizeof(addr4);
+    }
 #if (NGX_HAVE_INET6)
     if (ngx_inet6_addr(identity.data, identity.len, addr6) == NGX_OK) {
-        is_ip = 1;
+        address = addr6;
+        address_len = sizeof(addr6);
     }
 #endif
     /* sni remains the original config text; make a terminated copy only
@@ -4105,7 +4140,7 @@ ngx_http_error_abuse_redis_start_tls(redisAsyncContext *ac,
     }
     ssl = ngx_http_error_abuse_tls_session(worker->ssl,
                                          (char *) identity.data,
-                                         (int) is_ip);
+                                         address, address_len);
     if (ssl == NULL) {
         ngx_log_error(NGX_LOG_ERR, worker->log, 0,
             "error_abuse: Redis TLS identity setup failed");

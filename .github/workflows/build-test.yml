@@ -1,4 +1,4 @@
-# sync-sha: de6e6db0658ba885401dbd47891a7ce7d8b793eb8339bfc667b086e9c6961e71
+# sync-sha: 6f7f8060bfc252b95a53e721609e5624edbcebb095f6f66e1ac27ece02f34c24
 name: Build and Test
 
 env:
@@ -142,7 +142,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential clang curl libhiredis-dev libpcre2-dev zlib1g-dev
+            build-essential clang curl libhiredis-dev libpcre2-dev libssl-dev \
+            openssl python3 zlib1g-dev
 
       # ccache/mold/eatmydata presence, verified source archive and compatible
       # compiler-object cache for this mode (debug). See ci/tools/ci-build.sh's
@@ -173,6 +174,11 @@ jobs:
           build=".build/${MATRIX_FLAVOR}-${NGINX_VERSION}-debug/objs"
           test -f "$build/ngx_http_error_abuse_module.so"
           ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
+
+      - name: Check TLS probe guards and certificate identities
+        run: |
+          python3 ci/tools/test_redis_tls_controls.py
+          python3 ci/tools/test_redis_tls.py
 
       - name: Strict module compile
         env:

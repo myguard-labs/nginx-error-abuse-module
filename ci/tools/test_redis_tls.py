@@ -18,6 +18,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+from contextlib import contextmanager, nullcontext
 
 
 def command(*args: str) -> None:
@@ -48,7 +49,8 @@ def certificates(root: pathlib.Path) -> None:
         ("wrong-ip", "IP:127.0.0.2"),
         ("dns-ip", "DNS:127.0.0.1"),
         ("ipv6", "IP:::1"),
-        ("partial", "DNS:local*"),
+        ("exact", "DNS:redis1.example.test"),
+        ("partial", "DNS:redis*.example.test"),
     ):
         command(
             "openssl",
@@ -158,7 +160,7 @@ def probe(
     )
     peer.thread.start()
     if args.nginx_binary:
-        case = root / f"case-{name}-{trusted}"
+        case = root / f"case-{name}-{identity.replace(':', '_')}-{trusted}"
         case.mkdir()
         (case / "logs").mkdir()
         host = f"[{identity}]" if ":" in identity else identity
@@ -210,9 +212,7 @@ http {{
             check=False,
         )
         peer.finish()
-        assert (result.returncode == 0) == success, (
-            f"{name}: unexpected client status {result.returncode}: {result.stderr!r}"
-        )
+        check_client_status(result, success, name)
     if success:
         assert (
             b"AUTH" in peer.data and b"SELECT" in peer.data and b"SCRIPT" in peer.data
@@ -222,7 +222,9 @@ http {{
             < peer.data.index(b"SELECT")
             < peer.data.index(b"SCRIPT")
         )
-        assert peer.sni == ([None] if is_ip else [identity]), f"{name}: incorrect SNI"
+        assert peer.sni == ([None] if is_ip else [identity.removesuffix(".")]), (
+            f"{name}: incorrect SNI"
+        )
     else:
         assert not peer.data, (
             f"{name}: unverified peer received Redis application bytes"
@@ -235,11 +237,69 @@ http {{
     )
 
 
+def check_client_status(
+    result: subprocess.CompletedProcess, success: bool, name: str
+) -> None:
+    # 3 means OpenSSL reported a verification failure. A signal, setup error,
+    # transport failure or arbitrary nonzero status never counts as rejection.
+    expected = 0 if success else 3
+    assert result.returncode == expected, (
+        f"{name}: unexpected client status {result.returncode}: {result.stderr!r}"
+    )
+
+
+@contextmanager
+def nginx_fixtures(root: pathlib.Path):
+    installed = pathlib.Path("/etc/ssl/certs") / f"redis-tls-{root.name}.pem"
+    hosts = pathlib.Path("/etc/hosts")
+    original_hosts = hosts.read_bytes()
+    try:
+        installed.write_bytes((root / "ca.pem").read_bytes())
+        command("openssl", "rehash", "/etc/ssl/certs")
+        hosts.write_bytes(
+            original_hosts
+            + b"\n127.0.0.1 redis1.example.test redis1.example.test. localhost.\n"
+        )
+        yield installed
+    finally:
+        try:
+            installed.unlink(missing_ok=True)
+            command("openssl", "rehash", "/etc/ssl/certs")
+        finally:
+            hosts.write_bytes(original_hosts)
+
+
+def reject_numeric_shorthand(args: argparse.Namespace, root: pathlib.Path) -> None:
+    for identity in ("127.1", "2130706433", "0x7f000001", "0177.1"):
+        case = root / f"config-{identity}"
+        case.mkdir()
+        (case / "logs").mkdir()
+        config = case / "nginx.conf"
+        config.write_text(f"""load_module {args.module};
+error_log stderr;
+pid {case}/nginx.pid;
+events {{}}
+http {{ error_abuse_redis host=tls://{identity}; }}
+""")
+        result = subprocess.run(
+            [args.nginx_binary, "-p", str(case), "-c", str(config), "-t"],
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 1, f"{identity}: shorthand config was accepted"
+        assert b"TLS requires dotted-decimal IPv4" in result.stderr, result.stderr
+        print(f"OK: rejected numeric shorthand {identity}", flush=True)
+
+
 def main() -> None:
+    if not __debug__:
+        raise SystemExit("TLS probe requires Python without optimization")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nginx-binary")
     parser.add_argument("--module")
-    parser.add_argument("--only", choices=("wrong-dns", "wrong-ip"))
+    parser.add_argument(
+        "--only", choices=("wrong-dns", "wrong-ip", "partial", "ip", "dns")
+    )
     args = parser.parse_args()
     assert bool(args.nginx_binary) == bool(args.module)
     if args.nginx_binary:
@@ -248,11 +308,9 @@ def main() -> None:
         root = pathlib.Path(directory)
         (root / "empty").mkdir()
         certificates(root)
-        installed = pathlib.Path("/etc/ssl/certs") / f"redis-tls-{root.name}.pem"
-        if args.nginx_binary:
-            installed.write_bytes((root / "ca.pem").read_bytes())
-            command("openssl", "rehash", "/etc/ssl/certs")
-        else:
+        if args.nginx_binary and not args.only:
+            reject_numeric_shorthand(args, root)
+        if not args.nginx_binary:
             repo = pathlib.Path(__file__).resolve().parents[2]
             command(
                 *shlex.split(os.environ.get("CC", "cc")),
@@ -275,14 +333,17 @@ def main() -> None:
                 ).decode(),
                 end="",
             )
-        try:
+        with nginx_fixtures(root) if args.nginx_binary else nullcontext() as installed:
             for name, identity, is_ip, success in (
                 ("dns", "localhost", False, True),
+                ("dns", "localhost.", False, True),
+                ("exact", "redis1.example.test", False, True),
                 ("wrong-dns", "localhost", False, False),
                 ("ip", "127.0.0.1", True, True),
+                ("ip", "127.000.0.1", True, True),
                 ("wrong-ip", "127.0.0.1", True, False),
                 ("dns-ip", "127.0.0.1", True, False),
-                ("partial", "localhost", False, False),
+                ("partial", "redis1.example.test", False, False),
                 ("ipv6", "::1", True, True),
             ):
                 if args.only and args.only != name:
@@ -290,13 +351,10 @@ def main() -> None:
                 probe(args, root, (name, identity, is_ip, success))
             if not args.only:
                 if args.nginx_binary:
+                    assert installed is not None
                     installed.unlink()
                     command("openssl", "rehash", "/etc/ssl/certs")
                 probe(args, root, ("dns", "localhost", False, False), trusted=False)
-        finally:
-            if args.nginx_binary:
-                installed.unlink(missing_ok=True)
-                command("openssl", "rehash", "/etc/ssl/certs")
 
 
 if __name__ == "__main__":
