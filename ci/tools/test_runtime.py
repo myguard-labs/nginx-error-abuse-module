@@ -287,6 +287,7 @@ import atexit
 import concurrent.futures
 import hashlib
 import hmac
+import io
 import json
 import os
 import pathlib
@@ -305,6 +306,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from unittest import mock
 
 # A test that raises before stop() would orphan every child we spawned:
 # an nginx master (or redis) keeps listening on its test port, which
@@ -637,7 +639,7 @@ def test_redis_lifecycle(
     port: int,
 ) -> None:
     """RA02-EA-07: completion owns its token even after request termination."""
-    for mode in ("nil", "blocked", "timeout", "disconnect", "cancel", "shutdown"):
+    for mode in ("nil", "blocked", "timeout", "disconnect", "client-close", "shutdown"):
         peer = LifecycleRedisServer(mode)
         peer.start()
         server = Nginx(binary, module, root / mode, port, runner, False, peer.port)
@@ -673,9 +675,9 @@ http {{
 """,
             encoding="ascii",
         )
-        server.write_config = lambda: None
         try:
-            server.start()
+            with mock.patch.object(server, "write_config"):
+                server.start()
             _wait_for_log(server.root / "logs" / "error.log", b"connected to Redis")
             client = socket.create_connection(("127.0.0.1", port), timeout=5)
             client.sendall(
@@ -692,14 +694,17 @@ http {{
                     b"GET /slow.gif?hold=1 HTTP/1.0\r\nHost: localhost\r\n\r\n"
                 )
                 upstream, _ = slow_listener.accept()
-                os.kill(server.process.pid, signal.SIGQUIT)
-                server.process.wait(timeout=5)
-                _wait_for_log(
-                    server.root / "logs" / "error.log", b"http terminate request"
-                )
+                process = server.process
+                if process is None:
+                    raise AssertionError("shutdown: nginx is not running")
+                os.kill(process.pid, signal.SIGQUIT)
+                process.wait(timeout=5)
+                assert_redis_cleanup_completion(server.root / "logs" / "error.log")
                 # exit_process flushes the still-pending hiredis callback.
             else:
-                if mode == "cancel":
+                if mode == "client-close":
+                    # HTTP/1 parks with reading blocked: closing the client
+                    # exercises a live reply, not cleanup before the callback.
                     client.setsockopt(
                         socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
                     )
@@ -716,9 +721,8 @@ http {{
                         raise AssertionError(
                             f"{mode}: wrong completion response: {response!r}"
                         )
-                else:
-                    if not peer.finished.wait(5):
-                        raise AssertionError("cancel: late Redis reply was not sent")
+                if mode in ("nil", "blocked", "client-close"):
+                    peer.wait_finished()
                 _wait_for_log(server.root / "access.log", b"client=lifecycle")
                 access = (server.root / "access.log").read_text(encoding="ascii")
                 if access.count("client=lifecycle") != 1:
@@ -732,6 +736,17 @@ http {{
                     stream.close()
             peer.stop()
             server.stop()
+
+
+def assert_redis_cleanup_completion(error_log: pathlib.Path) -> None:
+    """Require the shutdown callback to observe an invalidated request token."""
+    log = error_log.read_text(encoding="utf-8", errors="replace")
+    invalidated = "error_abuse: Redis check request invalidated"
+    completed = "error_abuse: Redis check completed after cleanup (null=1)"
+    if log.count(invalidated) != 1 or log.count(completed) != 1:
+        raise AssertionError("shutdown: missing unique invalidation/late callback")
+    if log.index(invalidated) >= log.index(completed):
+        raise AssertionError("shutdown: Redis callback preceded request cleanup")
 
 
 def test_redis_backoff_cap(
@@ -1390,6 +1405,31 @@ class LifecycleRedisServer(HostileRedisServer):
         self.release = threading.Event()
         self.get = threading.Event()
         self.finished = threading.Event()
+        self.completed = threading.Event()
+        self.error: Exception | None = None
+
+    def _write_reply(
+        self, stream: io.BufferedIOBase, response: bytes, is_get: bool
+    ) -> bool:
+        try:
+            stream.write(response)
+            stream.flush()
+        except OSError as error:
+            self.error = error
+            self.completed.set()
+            return False
+        if is_get:
+            self.finished.set()
+            self.completed.set()
+        return True
+
+    def wait_finished(self, timeout: float = 5.0) -> None:
+        if not self.completed.wait(timeout):
+            raise AssertionError(f"{self.mode}: Redis reply did not finish")
+        if self.error is not None:
+            raise AssertionError(f"{self.mode}: Redis peer failed") from self.error
+        if not self.finished.is_set():
+            raise AssertionError(f"{self.mode}: Redis reply was not sent")
 
     def start(self) -> None:
         parent = self
@@ -1398,7 +1438,8 @@ class LifecycleRedisServer(HostileRedisServer):
             def handle(self) -> None:
                 try:
                     while command := parent._read_command(self.rfile):
-                        if command[0].upper() == b"GET":
+                        is_get = command[0].upper() == b"GET"
+                        if is_get:
                             parent.get.set()
                             if not parent.release.wait(10):
                                 return
@@ -1409,13 +1450,13 @@ class LifecycleRedisServer(HostileRedisServer):
                                 response = b"$%d\r\n%s\r\n" % (len(value), value)
                             else:
                                 response = b"$-1\r\n"
-                            parent.finished.set()
                         else:
                             response = parent._response(command)
-                        self.wfile.write(response)
-                        self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                        if not parent._write_reply(self.wfile, response, is_get):
+                            return
+                except (OSError, ValueError) as error:
+                    parent.error = error
+                    parent.completed.set()
 
         class Server(socketserver.ThreadingTCPServer):
             allow_reuse_address = True

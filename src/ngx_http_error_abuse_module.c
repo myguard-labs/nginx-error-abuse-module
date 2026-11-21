@@ -3403,6 +3403,8 @@ ngx_http_error_abuse_redis_check_cleanup(void *data)
     ngx_http_error_abuse_redis_check_t *check = data;
 
     check->request = NULL;
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_http_error_abuse_redis_worker.log, 0,
+                   "error_abuse: Redis check request invalidated");
 }
 
 static ngx_int_t
@@ -3500,6 +3502,10 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
 
     r = check->request;
     if (r == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP,
+                       ngx_http_error_abuse_redis_worker.log, 0,
+                       "error_abuse: Redis check completed after cleanup "
+                       "(null=%d)", data == NULL);
         ngx_free(check);
         return;
     }
