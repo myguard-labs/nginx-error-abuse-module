@@ -4,8 +4,8 @@
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 need python3 "apt-get install python3"
 root="$(repo_root)"
+selected=false
 if [ "$#" -gt 0 ]; then
-	selected=false
 	for path in "$@"; do
 		path=${path#"$root"/}
 		while [[ "$path" == ./* ]]; do path=${path#./}; done
@@ -24,7 +24,7 @@ fi
 # A graph needs every workflow from the same index, including unchanged callees.
 # Include deletions in the trigger; never refresh or write back the source index.
 changed=$(git diff --cached --name-only -- ':(top).github/workflows')
-if [ -z "$changed" ]; then
+if [ -z "$changed" ] && [ "$selected" = false ]; then
 	echo 'lint-ci-monthly: no staged workflow files to check'
 	exit 0
 fi

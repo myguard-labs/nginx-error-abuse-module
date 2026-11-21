@@ -316,6 +316,137 @@ class FuzzTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_regression_budget_does_not_double_charge_discovery(self):
+        # 18 targets and 10 fixtures admit a 60s discovery pass (21000s),
+        # even though charging regression as discovery again needs 22080s.
+        for path in self.root.glob("fuzz_*.c"):
+            path.unlink()
+        for path in (self.root / "regressions").glob("*.bin"):
+            path.unlink()
+        for index in range(18):
+            (self.root / f"fuzz_scale{index}.c").touch()
+            (self.root / f"fuzz_scale{index}").touch()
+            (self.root / f"corpus_scale{index}").mkdir()
+        for index in range(10):
+            (self.root / f"regressions/scale0-{index}.bin").touch()
+        fuzz.check_budget(self.root, "60")
+        with mock.patch.object(fuzz.subprocess, "run") as run:
+            fuzz.run(self.root, "120")
+        self.assertEqual(run.call_count, 28)
+        # The regression pass still rejects a pass that cannot fit by itself.
+        for index in range(18, 100):
+            (self.root / f"fuzz_scale{index}.c").touch()
+        with (
+            mock.patch.object(fuzz.subprocess, "run") as run,
+            self.assertRaisesRegex(ValueError, "total job budget"),
+        ):
+            fuzz.run(self.root, "120")
+        run.assert_not_called()
+
+    def test_campaign_deadline_and_timeout_continues_later_targets(self):
+        expired = subprocess.TimeoutExpired("campaign", 180)
+
+        def execute(args, **kwargs):
+            if "-max_total_time=120" in args:
+                self.assertEqual(kwargs.get("timeout"), 180)
+                if Path(args[0]).name == "fuzz_accept":
+                    raise expired
+
+        with (
+            mock.patch.object(fuzz.subprocess, "run", side_effect=execute) as run,
+            self.assertRaises(subprocess.TimeoutExpired) as raised,
+        ):
+            fuzz.run(self.root, "120", True)
+        self.assertIs(raised.exception, expired)
+        self.assertEqual(Path(run.call_args.args[0][0]).name, "fuzz_statuses")
+        self.assertEqual(run.call_count, 8)  # failed campaign is not minimized
+
+    def test_fuzz_ignore_policy_excludes_local_checkout_state(self):
+        repo = Path(__file__).resolve().parents[2]
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            hostile = Path(directory)
+            subprocess.run(
+                ["git", "init", "-q", "--template=", directory],
+                check=True,
+                env=environment,
+            )
+            shutil.copyfile(repo / ".gitignore", hostile / ".gitignore")
+            (hostile / ".git/info").mkdir(exist_ok=True)
+            (hostile / ".git/info/exclude").write_text("ci/fuzz/corpus_headers/\n")
+            # Prove the host checkout would wrongly ignore a curated seed.
+            result = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.excludesFile=/dev/null",
+                    "check-ignore",
+                    "--no-index",
+                    "-q",
+                    "ci/fuzz/corpus_headers/seed.bin",
+                ],
+                cwd=hostile,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            # Use that checkout's policy; its local exclude must not propagate
+            # into the independent policy-check repository.
+            with mock.patch.object(
+                sys.modules[__name__],
+                "__file__",
+                str(hostile / "ci/tools/test_ci_fuzz.py"),
+            ):
+                self.test_dynamic_fuzz_outputs_ignored_and_sources_addable()
+
+    def test_dynamic_fuzz_outputs_ignored_and_sources_addable(self):
+        repo = Path(__file__).resolve().parents[2]
+        paths = {
+            "ci/fuzz/fuzz_headers": True,
+            "ci/fuzz/corpus_headers/0123456789abcdef": True,
+            "ci/fuzz/corpus_headers/seed.bin": False,
+            "ci/fuzz/fuzz_headers.c": False,
+            "ci/fuzz/fuzz_headers.dict": False,
+            "ci/fuzz/corpus_statuses/typical": False,
+            "ci/fuzz/corpus_statuses/0123456789abcdef": True,
+        }
+        # Check tracked policy in a new repository with no local excludes or
+        # inherited repository environment; the active checkout is read-only.
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            shutil.copyfile(repo / ".gitignore", fixture / ".gitignore")
+            subprocess.run(
+                ["git", "init", "-q", "--template=", directory],
+                check=True,
+                env=environment,
+            )
+            for path, ignored in paths.items():
+                with self.subTest(path=path):
+                    result = subprocess.run(
+                        [
+                            "git",
+                            "-c",
+                            "core.excludesFile=/dev/null",
+                            "check-ignore",
+                            "--no-index",
+                            "-q",
+                            path,
+                        ],
+                        cwd=fixture,
+                        check=False,
+                        env=environment,
+                    )
+                    self.assertEqual(result.returncode, 0 if ignored else 1)
+
     def test_documented_budget_command_matches_workflow(self):
         repo = Path(__file__).resolve().parents[2]
         command = 'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget'
@@ -879,13 +1010,27 @@ class FuzzTests(unittest.TestCase):
                 if step["name"] == "Install validation tools"
             )
             install_command = next(
-                line for line in install.splitlines() if "apt-get install" in line
+                line
+                for line in install.replace("\\\n", " ").splitlines()
+                if "apt-get install" in line
             )
             packages = install_command.split("-y", 1)[1].split()
             for package in ("clang", "libclang-rt-dev"):
                 self.assertIn(package, packages)
 
         assert_toolchain_packages(workflow)
+        continued = yaml.safe_load(yaml.safe_dump(workflow))
+        install_step = next(
+            step
+            for step in continued["jobs"]["validation"]["steps"]
+            if step["name"] == "Install validation tools"
+        )
+        install_step["run"] = (
+            install_step["run"]
+            .replace(" clang", " \\\n  clang", 1)
+            .replace(" libclang-rt-dev", " \\\n  libclang-rt-dev", 1)
+        )
+        assert_toolchain_packages(continued)
         for missing_package in ("clang", "libclang-rt-dev"):
             fixture = yaml.safe_load(yaml.safe_dump(workflow))
             install_step = next(
@@ -983,7 +1128,7 @@ class FuzzTests(unittest.TestCase):
                 mock.patch.object(fuzz.subprocess, "run") as run,
                 self.assertRaisesRegex(ValueError, "total job budget"),
             ):
-                fuzz.run(self.root, rejected, runner_class=runner)
+                fuzz.run(self.root, rejected, True, runner_class=runner)
             run.assert_not_called()
         for runner, seconds in (
             ("unknown", "3600"),
@@ -1052,7 +1197,7 @@ class FuzzTests(unittest.TestCase):
                     mock.patch.object(fuzz.subprocess, "run") as run,
                     self.assertRaisesRegex(ValueError, "total job budget"),
                 ):
-                    fuzz.run(self.root, rejected, runner_class=runner)
+                    fuzz.run(self.root, rejected, True, runner_class=runner)
                 run.assert_not_called()
 
     def test_total_budget_accepts_current_two_target_defaults(self):
@@ -1125,11 +1270,11 @@ class FuzzTests(unittest.TestCase):
             mock.patch.object(fuzz.subprocess, "run") as run,
             self.assertRaisesRegex(ValueError, "total job budget.*15180"),
         ):
-            fuzz.run(self.root, "15240", runner_class="self-hosted")
+            fuzz.run(self.root, "15240", True, runner_class="self-hosted")
         run.assert_not_called()
         with mock.patch.object(fuzz.subprocess, "run") as run:
-            fuzz.run(self.root, "15180", runner_class="self-hosted")
-        self.assertEqual(run.call_count, 5)
+            fuzz.run(self.root, "15180", True, runner_class="self-hosted")
+        self.assertEqual(run.call_count, 7)
 
     def test_total_budget_check_cli_without_binaries_and_errors(self):
         self.budget_pair()

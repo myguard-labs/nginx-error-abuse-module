@@ -20,7 +20,10 @@ def duration(value):
 # Admission allowances include both passes and the runner-specific job limit.
 RUNNER_BUDGETS = {"github-hosted": 360 * 60, "self-hosted": 600 * 60}
 JOB_OVERHEAD_SECONDS = 60 * 60  # setup, build, artifact upload and runner overhead
-TARGET_OVERHEAD_SECONDS = 120 + 2 * 60 + 600  # regression, exit grace, minimization
+CAMPAIGN_EXIT_GRACE_SECONDS = 60
+TARGET_OVERHEAD_SECONDS = (
+    120 + 2 * CAMPAIGN_EXIT_GRACE_SECONDS + 600
+)  # regression, exit grace, minimization
 MERGE_SECONDS = 600
 REPLAY_SECONDS = 60  # per fixture, replayed once in each pass
 MERGE_EXIT_GRACE_SECONDS = 5
@@ -75,7 +78,7 @@ def regression_fixtures(root):
     return sorted(entry for entry in entries if entry.match("*.bin"))
 
 
-def check_budget(root, seconds, runner_class="github-hosted"):
+def check_budget(root, seconds, runner_class="github-hosted", *, regression=False):
     duration(seconds)
     if runner_class not in RUNNER_BUDGETS:
         raise ValueError(f"unknown runner class: {runner_class}")
@@ -90,13 +93,21 @@ def check_budget(root, seconds, runner_class="github-hosted"):
         + count * TARGET_OVERHEAD_SECONDS
         + 2 * replay_count * REPLAY_SECONDS
     )
+    if regression:
+        # A standalone pass has one campaign and replay, without discovery or
+        # minimization. Its campaign duration already is the regression charge.
+        overhead = (
+            JOB_OVERHEAD_SECONDS
+            + count * CAMPAIGN_EXIT_GRACE_SECONDS
+            + replay_count * REPLAY_SECONDS
+        )
     required = overhead + count * int(seconds)
     if required > budget:
         maximum = max(0, (budget - overhead) // count)
         raise ValueError(
             f"total job budget exceeded: {required}s required for {count} targets "
             f"including regression and overhead; limit {budget}s; "
-            f"maximum discovery duration is {maximum}s/target"
+            f"maximum {'regression' if regression else 'discovery'} duration is {maximum}s/target"
         )
 
 
@@ -164,7 +175,7 @@ def minimize(binary, corpus, root):
 
 
 def run(root, seconds, merge=False, runner_class="github-hosted"):
-    check_budget(root, seconds, runner_class)
+    check_budget(root, seconds, runner_class, regression=not merge)
     selected = targets(root)
     # Validate all routing before replay or campaigns. The longest registered
     # prefix keeps overlapping, hyphenated target names unambiguous.
@@ -204,7 +215,12 @@ def run(root, seconds, merge=False, runner_class="github-hosted"):
         if dictionary.is_file():
             args.append(f"-dict={dictionary}")
         try:
-            subprocess.run([*args, str(corpus)], check=True, cwd=root)
+            subprocess.run(
+                [*args, str(corpus)],
+                check=True,
+                cwd=root,
+                timeout=int(seconds) + CAMPAIGN_EXIT_GRACE_SECONDS,
+            )
             if merge:
                 minimize(binary, corpus, root)
         except (

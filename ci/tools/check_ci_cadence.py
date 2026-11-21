@@ -159,6 +159,20 @@ def check(root):
                 "${{ steps.asan-artifact.outputs.artifact-id }}"
             ):
                 errors.append("lost ASan artifact-id producer output")
+            uploads = [
+                step
+                for step in children.get("asan", {}).get("steps", [])
+                if step.get("id") == "asan-artifact"
+            ]
+            if (
+                len(uploads) != 1
+                or not str(uploads[0].get("uses", "")).startswith(
+                    "actions/upload-artifact@"
+                )
+                or not healthy_fuzz_step_condition(uploads[0])
+            ):
+                errors.append("lost ASan artifact upload step")
+
     basic = [
         step
         for step in workflow("build-test.yml")["jobs"]["test-nginx"].get("steps", [])
@@ -194,7 +208,10 @@ def check(root):
         errors.append("lost or unexpected monthly target")
     if jobs.get("msvc", {}).get("uses") != "./.github/workflows/windows-msvc.yml":
         errors.append("missing monthly MSVC")
-    msvc = workflow("windows-msvc.yml")["jobs"]
+    msvc_workflow = workflow("windows-msvc.yml")
+    if event_names(msvc_workflow) != {"workflow_call", "workflow_dispatch"}:
+        errors.append("MSVC monthly/manual trigger contract")
+    msvc = msvc_workflow["jobs"]
     required_steps = {
         "Build",
         "Verify module and configuration controls",

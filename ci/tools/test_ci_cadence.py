@@ -66,6 +66,50 @@ class WorkflowFixture(unittest.TestCase):
 
 
 class CadenceTests(WorkflowFixture):
+    def test_msvc_entry_points_are_only_monthly_call_and_manual(self):
+        path = self.root / ".github/workflows/windows-msvc.yml"
+        original = path.read_bytes()
+        for events in (
+            {"workflow_call": None, "workflow_dispatch": None, "push": None},
+            {"workflow_call": None},
+            {"workflow_dispatch": None},
+        ):
+            with self.subTest(events=events):
+                path.write_bytes(original)
+                self.update_workflow(
+                    "windows-msvc.yml", lambda doc, events=events: doc.update(on=events)
+                )
+                self.assertIn(
+                    "MSVC monthly/manual trigger contract", policy.check(self.root)
+                )
+        path.write_bytes(original)
+        self.assertEqual(policy.check(self.root), [])
+
+    def test_asan_output_requires_actual_upload_step(self):
+        path = self.root / ".github/workflows/asan.yml"
+        original = path.read_bytes()
+        for field, value in (
+            ("id", "renamed"),
+            ("uses", "actions/download-artifact@v7"),
+            ("if", False),
+            ("if", "failure()"),
+        ):
+            with self.subTest(field=field):
+                path.write_bytes(original)
+
+                def mutate(doc, field=field, value=value):
+                    step = next(
+                        s
+                        for s in doc["jobs"]["asan"]["steps"]
+                        if s.get("id") == "asan-artifact"
+                    )
+                    step[field] = value
+
+                self.update_workflow("asan.yml", mutate)
+                self.assertIn("lost ASan artifact upload step", policy.check(self.root))
+        path.write_bytes(original)
+        self.assertEqual(policy.check(self.root), [])
+
     def test_asan_artifact_output_mapping_required(self):
         path = self.root / ".github/workflows/asan.yml"
         original = path.read_bytes()
@@ -971,6 +1015,51 @@ class CadenceTests(WorkflowFixture):
 
 
 class StagedCadenceTests(WorkflowFixture):
+    def test_fixture_baseline_ignores_global_exclusions(self):
+        ignores = self.root / "global-ignore"
+        ignores.write_text(".github/\n")
+        config = self.root / "ignore-gitconfig"
+        config.write_text(f'[core]\n\texcludesFile = "{ignores}"\n')
+        fixture = StagedCadenceTests()
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(config)}):
+            try:
+                fixture.setUp()
+                tracked = fixture.git(
+                    "ls-files", ".github/workflows"
+                ).stdout.splitlines()
+                self.assertEqual(
+                    len(tracked),
+                    len(list((fixture.root / ".github/workflows").iterdir())),
+                )
+                path = fixture.root / ".github/workflows/ci.yml"
+                path.write_bytes(path.read_bytes() + b"\n# selected\n")
+                fixture.git("add", "-f", str(path))
+                result = fixture.lint()
+                self.assertEqual(result.returncode, 0, result.stderr)
+            finally:
+                fixture.doCleanups()
+
+    def test_explicit_staged_selection_checks_unchanged_index(self):
+        self.replace("ci-deep.yml", "FUZZ_SECS=3600", "FUZZ_SECS=60")
+        self.git("add", ".github/workflows/ci-deep.yml")
+        self.git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "invalid baseline control",
+        )
+        self.assertEqual(self.git("diff", "--cached", "--name-only").stdout, b"")
+        result = self.lint(files=(".github/workflows/ci.yml",))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"lost full fuzz duration", result.stdout + result.stderr)
+
     def test_only_fixture_baseline_disables_global_hooks(self):
         hooks = self.root / "global-hooks"
         hooks.mkdir()
@@ -1024,7 +1113,7 @@ class StagedCadenceTests(WorkflowFixture):
             [] if object_format == "sha1" else [f"--object-format={object_format}"]
         )
         self.git("init", "-q", *init_args)
-        self.git("add", ".")
+        self.git("add", "-f", ".github/workflows", "ci")
         self.git(
             "-c",
             "user.name=Fixture",

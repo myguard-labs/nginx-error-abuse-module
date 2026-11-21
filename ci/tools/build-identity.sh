@@ -33,7 +33,8 @@ fi
 # Only unset variables are eligible.
 toolchain_overrides=(GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH CPATH
     C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH
-    LD_LIBRARY_PATH PKG_CONFIG_PATH CFLAGS CPPFLAGS LDFLAGS)
+    LD_LIBRARY_PATH PKG_CONFIG_PATH CFLAGS CPPFLAGS LDFLAGS
+    MAKEFLAGS GNUMAKEFLAGS MFLAGS MAKEFILES MAKEOVERRIDES)
 if [[ "${1:-}" == --executable-cache-eligible ]]; then
     for override in "${toolchain_overrides[@]}" NGX_ERROR_ABUSE_INCS NGX_ERROR_ABUSE_LIBS; do
         if [[ -v "$override" ]]; then

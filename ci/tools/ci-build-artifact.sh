@@ -10,7 +10,25 @@ artifact="${3:?artifact directory}"
     echo 'invalid ASan artifact version' >&2; exit 2;
 }
 artifact_identity="$(bash ci/tools/build-identity.sh --portable-asan "$version")"
-tree="${BUILD_ROOT:-$PWD/.build}/nginx-${version}-asan"
+MODULE_DIR="$(pwd -P)"
+# Confine destination cleanup and writes to this physical module root.
+# Resolve missing suffixes without creating them and reject symlink redirection.
+root_input="${BUILD_ROOT:-$MODULE_DIR/.build}"
+invalid_build_root() {
+    echo 'invalid BUILD_ROOT: expected a nonsymlink directory below the module root' >&2
+    exit 2
+}
+if ! ROOT="$(realpath -m -- "$root_input")" \
+    || ! root_lexical="$(realpath -ms -- "$root_input")" \
+    || [[ "$ROOT" != "$root_lexical" || "$ROOT" != "$MODULE_DIR/"* ]]; then
+    invalid_build_root
+fi
+root_part="$ROOT"
+while [[ "$root_part" != "$MODULE_DIR" ]]; do
+    [[ ! -L "$root_part" && ( ! -e "$root_part" || -d "$root_part" ) ]] || invalid_build_root
+    root_part="${root_part%/*}"
+done
+tree="$ROOT/nginx-${version}-asan"
 
 producer_binding() {
     printf 'asan-artifact-binding-v1\0%s\0%s\0%s\0' "$1" "$2" "$3" \

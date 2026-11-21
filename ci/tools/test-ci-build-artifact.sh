@@ -91,6 +91,29 @@ export PATH="$tmp/consumer-tools:$PATH" CC=consumer-cc
 import_artifact > "$tmp/tools-import.log"
 verify_installed
 echo 'ok: consumer tools and unavailable host probes do not affect import'
+# Invalid roots must fail before cleanup, including through a .build symlink.
+valid_build_root="$BUILD_ROOT"
+mkdir -p "$tmp/external/nginx-1.31.3-asan"
+printf 'external sentinel\n' > "$tmp/external/nginx-1.31.3-asan/owned"
+for invalid_root in "$tmp/external" "$consumer" "$consumer/../external"; do
+    status=0
+    BUILD_ROOT="$invalid_root" import_artifact > "$tmp/root-error" 2>&1 || status=$?
+    [[ "$status" == 2 ]] || fail "invalid import BUILD_ROOT accepted: $invalid_root (exit $status)"
+    grep -Fq 'invalid BUILD_ROOT:' "$tmp/root-error" || fail 'wrong root rejection diagnostic'
+    [[ -f "$tmp/external/nginx-1.31.3-asan/owned" ]] || fail 'external sentinel deleted'
+done
+mv "$BUILD_ROOT" "$consumer/saved-build"
+ln -s "$tmp/external" "$BUILD_ROOT"
+status=0
+import_artifact > "$tmp/root-error" 2>&1 || status=$?
+[[ "$status" == 2 ]] || fail "symlink import BUILD_ROOT accepted (exit $status)"
+[[ -f "$tmp/external/nginx-1.31.3-asan/owned" ]] || fail 'symlink external sentinel deleted'
+rm "$BUILD_ROOT"
+mv "$consumer/saved-build" "$BUILD_ROOT"
+BUILD_ROOT="$consumer/new/nested-build" import_artifact
+[[ -x "$consumer/new/nested-build/nginx-1.31.3-asan/objs/nginx" ]] || fail 'nested root import rejected'
+[[ "$BUILD_ROOT" == "$valid_build_root" ]] || fail 'root override escaped function'
+echo 'ok: import root containment preserves external sentinels and permits nested roots'
 touch "$BUILD_ROOT/nginx-1.31.3-asan/owned"
 wrong_digest="$(printf wrong | sha256sum | cut -d' ' -f1)"
 EXPECTED_BUILD_IDENTITY="$wrong_digest" expect_failure producer 'ASan artifact producer binding mismatch' import_artifact

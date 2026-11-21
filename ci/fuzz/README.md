@@ -141,8 +141,12 @@ for each target it includes the requested discovery duration, the default
 two replay passes. Thus, with the current two targets and two fixtures,
 GitHub-hosted runners accept the 3600-second default and at most 8040 seconds per
 target. Self-hosted runners accept the same default and at most 15240 seconds per
-target. Adding a target or fixture reduces each maximum automatically. The
-matching admission allowance applies to standalone invocations, including those
-without `--merge`. These are admission allowances, not measured execution
-guarantees: the workflow's 600-minute timeout remains an independent hard upper
-bound if a phase overruns its reserve.
+target. Adding a target or fixture reduces each maximum automatically. These
+are admission allowances, not measured execution guarantees: the workflow's
+600-minute timeout remains an independent hard upper bound if a phase overruns
+its reserve.
+
+The budget preflight and `--merge` discovery include both passes. A standalone
+regression invocation admits its own campaign and replay once, without charging
+the discovery or merge allowance again. Each campaign has a wrapper deadline of
+its target duration plus 60 seconds of exit grace.
