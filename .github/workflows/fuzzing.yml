@@ -1,9 +1,9 @@
-# sync-sha: e146062db1bc0ce2f57f38fd2ed58728cd431e5d544fb77b0f8bf48a5a67398e
+# sync-sha: c21d1b1a03f97c34c4ab031864969322bc6b44303f016526ad004b64f4c3eb8f
 name: Fuzzing
 
-# Fast fuzz regression gate on every PR/push — 120s/target on the status-list
-# + snapshot validators, kept short so PR feedback stays quick. Long discovery
-# fuzz (hours/target) lives in ci-deep.yml (monthly cron + workflow_dispatch).
+# Manual/reusable regression diagnostic. CI Deep also runs this same regression
+# command before discovery, sharing one compatible sanitizer build there.
+# This workflow is never called by the PR orchestrator.
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v7.0.1        -> 3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -32,7 +32,7 @@ jobs:
   fuzz-regression:
     name: Fuzz regression (120s/target)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    timeout-minutes: 360
     steps:
       - name: Checkout module
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
+            clang build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev python3
 
       # cp7a: mostly the tarball + configure-skip stamp for mode=module.
       - name: Restore build caches
@@ -65,66 +65,8 @@ jobs:
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
-      # Replay every recorded past-crash shape before the fresh time-boxed
-      # run. libFuzzer treats a file argument (not a corpus dir) as a
-      # one-shot replay, so a returning crash aborts here in seconds instead
-      # of waiting on the 120s fresh budget below.
-      #
-      # Each fixture is dispatched to its target based on the filename prefix:
-      # snapshot-*.bin runs through fuzz_snapshot, statuses-*.bin through
-      # fuzz_statuses. A fixture with no recognized prefix causes the step
-      # to exit non-zero and fail the gate (no silent skip).
-      - name: Replay regression corpus
-        run: |
-          set -euo pipefail
-          cd ci/fuzz
-          shopt -s nullglob
-          files=(regressions/*.bin)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "no regression fixtures under ci/fuzz/regressions/"
-            exit 0
-          fi
-          fail=0
-          for f in "${files[@]}"; do
-            filename=$(basename "$f")
-            bin=""
-            if [[ "$filename" == snapshot-* ]]; then
-              bin="./fuzz_snapshot"
-            elif [[ "$filename" == statuses-* ]]; then
-              bin="./fuzz_statuses"
-            else
-              echo "❌ fixture has no recognized prefix (snapshot-* or statuses-*): $f"
-              fail=1
-              continue
-            fi
-            echo "=== replay $f ==="
-            if ! "$bin" "$f"; then
-              echo "❌ regression returned: $f"
-              fail=1
-            fi
-          done
-          [ "$fail" -eq 0 ] || exit 1
-          echo "✓ ${#files[@]} regression(s) replayed clean"
-
-      - name: Run each target 120s
-        run: |
-          set -euo pipefail
-          cd ci/fuzz
-          # target:corpus[:dict] — snapshot is binary (no dict); statuses is a
-          # token grammar (HTTP status codes / range punctuation) so it gets one.
-          targets="fuzz_snapshot:corpus: fuzz_statuses:corpus_statuses:fuzz.dict"
-          for t in $targets; do
-            bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
-            args=(-max_total_time=120 -print_final_stats=1 -artifact_prefix="crash-${bin}-")
-            [ -n "$dict" ] && args+=("-dict=$dict")
-            echo "=== $bin over $corp (120s)${dict:+ +dict} ==="
-            set +e
-            "./$bin" "${args[@]}" "$corp/"
-            rc=$?
-            set -e
-            [ $rc -eq 0 ] || { echo "❌ $bin crash (exit $rc)"; exit 1; }
-            echo "✓ $bin: no crashes in 120s"
-          done
+      - name: Replay regressions and run each target 120s
+        run: python3 ci/fuzz/run.py 120
 
       - name: Upload crash artifacts
         if: failure()

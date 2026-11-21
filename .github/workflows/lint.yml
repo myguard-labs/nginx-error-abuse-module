@@ -1,4 +1,4 @@
-# sync-sha: 172739743ecaeb26b04aee4e30e5f84a145856029378021c4fba476f46494b44
+# sync-sha: 1dadb3ce3eaf66648ace8102cc6885768ffce0adcc3149a6d06509f59d17125c
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -65,5 +65,5 @@ jobs:
         env:
           # Every checker except "c" -- adding a lint-*.sh without adding its
           # name here leaves it running locally and never in CI.
-          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift
+          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence ci-monthly ci-secrets sync-stamp docs-drift
         run: ci/linter/run-all.sh

@@ -14,60 +14,47 @@
 
 | Workflow | What it gates |
 |---|---|
-| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the eight members below |
+| `ci.yml` | orchestrator; the only `pull_request` entry point, calls the seven PR members below |
 | `build-test.yml` | build, `.so` dlopen, bad-config rejection, `-Werror`, Test::Nginx runtime suite |
 | `security-scanners.yml` | flawfinder, clang-tidy, Semgrep |
-| `fuzzing.yml` | recorded-regression replay, then a fresh time-boxed libFuzzer run against the parse targets |
+| `fuzzing.yml` | manual regression diagnostic; replay all recorded regressions then fuzz all discovered targets for 120s |
 | `valgrind.yml` | memcheck soak |
 | `codeql.yml` | CodeQL over the module TU |
 | `asan.yml` | ASan+UBSan request-storm soak (static `--add-module` build), single-process + multi-worker/reload lanes |
 | `lint.yml` | `ci/linter/` — shellcheck, ruff, perlcritic, yamllint/actionlint/zizmor, nginx-convention and repo-policy checks; same entry point as `.githooks/pre-commit` |
-| `windows.yml` | MSVC and MinGW-w64 static builds; native persistence, restart and two-worker ownership controls under MSVC |
-| `ci-deep.yml` | monthly schedule; long fuzz + memcheck + helgrind sweep, not a PR-lane member |
+| `windows.yml` | MinGW-w64 static build on PRs |
+| `windows-msvc.yml` | monthly/manual MSVC build, directive, persistence, restart and two-worker ownership controls |
+| `ci-deep.yml` | monthly/manual four-slot sweep: fuzz regression + long campaign, MSVC, Memcheck, Helgrind, deep scanners and CodeQL |
 
 ### CI caching
 
 `ci/tools/ci-build.sh` is the single chokepoint every build-test/asan/codeql/
 fuzzing/ci-deep(fuzz) job goes through — no workflow duplicates cache logic.
-Layers, cheapest first: apt/package presence check, ccache
+Layers, cheapest first: package presence checks, compiler objects through ccache
 (`CCACHE_COMPILERCHECK=content`), mold (skipped under `asan`), eatmydata
-(wraps `./configure` only), the per-mode build tree
-(`.build/<flavor>-<version>-<mode>/`, exact-match cache key —
-`hashFiles(ci/tools/ci-build.sh, config, src/**)`, deliberately no
-restore-keys ladder), the source tarball (keyed on version alone).
-`.github/actions/build-cache/action.yml` documents each layer's key and why.
+(wraps `./configure` only), and digest-verified source tarballs. Tarballs are
+verified against `.github/versions.env` after every restore or download.
 
-Measured locally on this build host (`/proc/loadavg` 1.3–1.6 at the time,
-network to nginx.org unthrottled — CI's numbers will differ, this is the
-mechanism, not a promised CI time):
+Executable trees are reused only after a fresh exact Actions cache restore on
+`main` for a push, schedule or manual run. The action removes old disk state
+before restoring and uses a full build identity with no fallback key. The
+identity includes source and patches, build scripts/configuration, compiler,
+flags, platform and installed Debian packages. PRs rebuild from pinned source
+and neither restore nor save compiler objects; other refs cannot reuse executable
+trees. Same-run ASan reload uses a separately verified producer-bound artifact.
 
-| Run | Wall clock |
-|---|---|
-| Fully cold (no tarball, no build tree, no ccache) | 6.7s |
-| Warm re-run, nothing changed (build tree hit, configure skipped, `make` no-op) | 0.02s |
-| One source file touched, warm tree (configure skipped, one TU recompiles via ccache) | 0.1s |
+Set compiler/header/library search overrides, including `LD_LIBRARY_PATH`,
+`PKG_CONFIG_PATH`, `CFLAGS`, `CPPFLAGS` and `LDFLAGS`, disable executable-tree
+reuse even when empty: paths in these variables can name mutable contents.
+These overrides remain usable for fresh builds. `NO_CACHE=1` also forces a
+fresh build; source verification remains required.
 
-nginx's `configure` ignores a bare `CC=`, so ccache is wired through the
-`--with-cc="ccache $BASE_CC"` argument instead. Verified by measurement, not by
-reading the log: with the build tree removed and ccache warm, a rebuild reports
-**132/132 hits (100.0%)**. Under those same conditions (warm cache, build tree
-removed, unchanged compiler and flags) a 0% rate means ccache is not wired
-through configure at all. A cold cache, a changed `CC_OPT`/`LD_OPT`, or a
-different `CCACHE_DIR` also produce 0% for their own reasons, so rule those out
-before reading it as a wiring fault.
-
-Note that `ci/tools/ci-build.sh` sets `CCACHE_DIR=$HOME/.cache/ccache`; a bare
-`ccache --show-stats` reads `$HOME/.ccache` instead and reports a different
-cache. Export `CCACHE_DIR` before checking these numbers by hand.
-
-The honest win here is the warm no-op case, not a claimed multi-minute save —
-this module's from-scratch build is already only a few seconds on a fast
-network, so the layers mostly buy back CI minutes on *repeat* PR pushes and
-the fuzzing/codeql "module" mode (configure-only, no core `make`), where
-skipping configure is the whole cost. Invalidation was verified directly: a
-one-byte source edit changes the `hashFiles()` build-tree key (proven with a
-standalone hash check) and, within an already-warm tree, `make` recompiles
-exactly the changed translation unit rather than serving a stale object.
+nginx's `configure` ignores a bare `CC=`, so ccache is wired through
+`--with-cc="ccache $BASE_CC"`. Local builds default to
+`CCACHE_DIR=$HOME/.cache/ccache`; Actions uses an empty ref/variant-specific
+runner-temp directory before restoring eligible compiler objects. Export the
+actual `CCACHE_DIR` when inspecting statistics. The cache action documents each
+layer's key and trust boundary.
 
 ## What is this?
 

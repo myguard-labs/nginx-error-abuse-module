@@ -87,6 +87,33 @@ if [ -n "$ARG" ] && [ ! -d "$ARG" ]; then
     build_one fuzz_snapshot.c "$ARG"
 else
     DIR="${ARG:-$FUZZ_DIR}"
-    build_one fuzz_snapshot.c "$DIR/fuzz_snapshot"
-    build_one fuzz_statuses.c "$DIR/fuzz_statuses"
+    shopt -s nullglob
+    sources=("$FUZZ_DIR"/fuzz_*.c)
+    [ "${#sources[@]}" -gt 0 ] || { echo "no fuzz target sources" >&2; exit 1; }
+    # Validate the whole output plan before the first compiler can truncate a
+    # source, including symlink/hardlink aliases in a separate output directory.
+    for source in "${sources[@]}"; do
+        target="${source##*/}"
+        if [[ ! "${target%.c}" =~ ^fuzz_[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]]; then
+            echo "unsupported fuzz target name: $target" >&2
+            exit 1
+        fi
+        output="$DIR/${target%.c}"
+        for input in "${sources[@]}"; do
+            if [ "$output" -ef "$input" ]; then
+                echo "fuzz output $output collides with source $input" >&2
+                exit 1
+            fi
+        done
+        case "$output" in
+            *.c | *.dict | *.h)
+                echo "fuzz output has a reserved source extension: $output" >&2
+                exit 1
+                ;;
+        esac
+    done
+    for source in "${sources[@]}"; do
+        target="${source##*/}"
+        build_one "$target" "$DIR/${target%.c}"
+    done
 fi
