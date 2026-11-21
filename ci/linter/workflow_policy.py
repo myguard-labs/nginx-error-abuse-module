@@ -44,6 +44,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the selftest doc
     )
     raise SystemExit(2) from None
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+from check_ci_graph import load_workflow
+
 # WORKFLOW_POLICY_ROOT points the checks at a fixture tree instead of the repo.
 # It exists so ci/linter/selftest.sh can assert the FAILING direction of every
 # check against a committed, readable fixture -- rather than by planting a file
@@ -112,7 +115,9 @@ def workflows() -> list[pathlib.Path]:
 def load(path: pathlib.Path) -> dict:
     """Parse a workflow. A file that will not parse is exit 2, never clean."""
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        doc = load_workflow(path)
+    except (OSError, UnicodeError) as exc:
+        raise PolicyError(f"{path.name}: cannot read workflow: {exc}") from exc
     except yaml.YAMLError as exc:
         raise PolicyError(f"{path.name}: unparsable YAML: {exc}") from exc
     if not isinstance(doc, dict):
@@ -538,6 +543,26 @@ def check_docs() -> int:
     ci_workflow = ROOT / ".github" / "workflows" / "ci.yml"
     if fuzz_readme.is_file():
         fuzz_text = fuzz_readme.read_text(encoding="utf-8")
+        if not deep_workflow.is_file():
+            errors.append("ci/fuzz/README.md references missing ci-deep.yml")
+        timeout = None
+        if deep_workflow.is_file():
+            deep_jobs = load(deep_workflow).get("jobs")
+            if not isinstance(deep_jobs, dict):
+                errors.append("ci-deep.yml jobs must be a mapping")
+            elif not isinstance(deep_jobs.get("fuzz"), dict):
+                errors.append("ci-deep.yml jobs.fuzz must be a mapping")
+            else:
+                timeout = deep_jobs["fuzz"].get("timeout-minutes")
+        if timeout != 600:
+            errors.append("ci-deep.yml jobs.fuzz.timeout-minutes must be 600")
+        if (
+            "600-minute timeout" not in fuzz_text
+            or "GitHub-hosted jobs stop after **360 minutes**" not in fuzz_text
+        ):
+            errors.append(
+                "ci/fuzz/README.md must state the 600-minute workflow and 360-minute hosted cutoff"
+            )
         fuzz_links = re.findall(r"\]\(([^)]+)\)", fuzz_text)
         expected_fuzz_link = "../../.github/workflows/fuzzing.yml"
         if expected_fuzz_link not in fuzz_links:
@@ -557,15 +582,15 @@ def check_docs() -> int:
         fuzz_data = load(fuzz_workflow)
         deep_data = load(deep_workflow)
         ci_jobs = ci_data.get("jobs") or {}
-        fuzz_job = ci_jobs.get("fuzzing") if isinstance(ci_jobs, dict) else None
         ci_events = events(ci_data)
         if "pull_request" not in ci_events:
             errors.append("ci.yml must retain the pull_request entry point")
-        if "pull_request" in ci_events and not (
-            isinstance(fuzz_job, dict)
-            and fuzz_job.get("uses") == "./.github/workflows/fuzzing.yml"
+        if isinstance(ci_jobs, dict) and any(
+            isinstance(job, dict)
+            and job.get("uses") == "./.github/workflows/fuzzing.yml"
+            for job in ci_jobs.values()
         ):
-            errors.append("ci.yml must call fuzzing.yml from its pull-request gate")
+            errors.append("ci.yml must not call monthly/manual fuzzing on PRs")
         fuzz_events = events(fuzz_data)
         if "workflow_call" not in fuzz_events or fuzz_events & {
             "push",

@@ -1,19 +1,10 @@
-# sync-sha: 461f2a8b85d92a9bfd2f73c94ad81f29189b95a5576a0404e3fab1312166216c
+# sync-sha: d4500c4148e3b024499a3a40e63ee7205f451d070dc9f010be06adc7eafee04e
 name: CI Deep
 
-# Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
-# The PR-time gates live in the standalone fuzzing.yml (fast fuzz regression),
-# valgrind.yml (memcheck lite soak) and security-scanners.yml workflows; THIS
-# file remains the exhaustive monthly+dispatch sweep. codeql.yml is dropped
-# entirely: CodeQL / the GitHub Security tab is GitHub-Advanced-Security only
-# and does nothing on a private repo, so the SARIF-upload path is removed too
-# — the scanners still run and GATE on findings, they just don't upload.
-#
-# Jobs: fuzz (14400s/target) · memcheck soak · helgrind soak · scanners.
-#   * memcheck AND helgrind run under ci/tools/soak.sh, which passes
-#     --suppressions=ci/tools/valgrind.supp for BOTH tools and
-#     --error-exitcode=99 (see ci/tools/soak.sh) — the drift-fix baseline for
-#     every module.
+# Monthly/manual orchestrator: fuzz regression + discovery; MSVC then Memcheck;
+# Helgrind; deep scanners then CodeQL. Expanded runner width is at most four.
+# PR gates remain in ci.yml; fuzzing and MSVC run only here or manually.
+# Both Valgrind soaks retain suppressions and --error-exitcode=99 in soak.sh.
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v7.0.1        -> 3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -21,7 +12,6 @@ name: CI Deep
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NGINX_VERSION: ""
 
 on:
   schedule:
@@ -57,7 +47,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
+            clang build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev python3
 
       # The fuzz targets link the module's real scan TU and nginx's real
       # src/core/ngx_string.c, so this job needs a CONFIGURED nginx tree for
@@ -72,12 +62,16 @@ jobs:
       # cp7a: version is resolved dynamically above, so the cache key changes
       # with it -- correct, since a new mainline release IS a new build tree.
       - name: Restore build caches
+        id: build-cache
         uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}
 
       - name: Configure nginx tree
+        env:
+          CI_BUILD_CACHE_HIT: ${{ steps.build-cache.outputs.exact-hit }}
+          CI_BUILD_CACHE_IDENTITY: ${{ steps.build-cache.outputs.identity }}
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
 
       - name: Select fuzz duration
@@ -125,31 +119,27 @@ jobs:
             printf 'FUZZ_SECS=3600\n' >> "$GITHUB_ENV"
           fi
 
+      # Includes both passes, targets, replay, minimization and setup/upload
+      # within the actual runner class limit.
+      - name: Check total fuzz job budget
+        run: python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget
+
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
+      - name: Fuzz regression (120s/target)
+        run: python3 ci/fuzz/run.py 120 --runner-class "$RUNNER_ENVIRONMENT"
+
       - name: Fuzz each target
-        run: |
-          set -euo pipefail
-          cd ci/fuzz
-          # target:corpus[:dict] — snapshot is binary (no dict); statuses is a
-          # token grammar so it gets the status-code/range dictionary.
-          targets="fuzz_snapshot:corpus: fuzz_statuses:corpus_statuses:fuzz.dict"
-          for t in $targets; do
-            bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
-            args=(-max_total_time="$FUZZ_SECS" -print_final_stats=1 -artifact_prefix="crash-${bin}-")
-            [ -n "$dict" ] && args+=("-dict=$dict")
-            echo "=== $bin over $corp (${FUZZ_SECS}s)${dict:+ +dict} ==="
-            set +e
-            "./$bin" "${args[@]}" "$corp/"
-            rc=$?
-            set -e
-            [ $rc -eq 0 ] || { echo "❌ $bin crash (exit $rc)"; exit 1; }
-            echo "✓ $bin: no crashes in ${FUZZ_SECS}s"
-            mkdir -p "${corp}-min"
-            "./$bin" -merge=1 "${corp}-min/" "$corp/"
-            echo "merged $corp: $(find "${corp}-min" -type f | wc -l) units"
-          done
+        run: python3 ci/fuzz/run.py "$FUZZ_SECS" --merge --runner-class "$RUNNER_ENVIRONMENT"
+
+      - name: Upload regression crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-fast-crashes
+          path: ${{ github.workspace }}/ci/fuzz/crash-*
+          retention-days: 14
 
       - name: Upload crash artifacts
         if: failure()
@@ -164,7 +154,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/ci/fuzz/*-min
+          path: ${{ github.workspace }}/ci/fuzz/minimized/
           retention-days: 30
 
       - name: Notify Discord on failure
@@ -181,7 +171,14 @@ jobs:
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
             -d "{\"content\":\"🔴 ${REPO} — CI Deep / fuzz FAILED. ${RUN_URL}\"}" || true
 
+  msvc:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows-msvc.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax
+
   memcheck:
+    needs: msvc
+    if: ${{ !cancelled() }}
     name: Valgrind Memcheck soak
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
@@ -385,3 +382,11 @@ jobs:
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
+
+  codeql:
+    needs: scanners
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      security-events: write # required so the CodeQL upload step can publish results
+    uses: ./.github/workflows/codeql.yml  # zizmor: ignore[self-repository] -- actionlint lacks $/ syntax

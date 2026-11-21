@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""Enforce CI04 cadence, retained gates and expanded four-runner bounds."""
+
+import re
+import runpy
+import shlex
+import sys
+from itertools import groupby, pairwise
+from pathlib import Path
+
+import yaml
+from check_ci_graph import GraphError, graph, load_workflow, width
+
+ROOT = Path(__file__).resolve().parents[2]
+PR_NEEDS = {
+    "build-test": set(),
+    "lint": set(),
+    "asan": {"build-test", "lint"},
+    "valgrind": {"build-test"},
+    "codeql": {"lint"},
+    "security-scanners": {"codeql"},
+    "windows": {"build-test", "lint"},
+}
+PR_JOBS = {
+    "build-test": {
+        "validation",
+        "build",
+        "runtime",
+        "coverage",
+        "test-nginx",
+        "snapshot-controls",
+    },
+    "asan": {"asan", "asan-reload"},
+    "valgrind": {"memcheck-lite"},
+    "codeql": {"analyze"},
+    "security-scanners": {"scanners"},
+    "lint": {"lint"},
+    "windows": {"mingw"},
+}
+
+
+def load(root, name):
+    return load_workflow(root / ".github/workflows" / name)
+
+
+def event_names(doc):
+    if not isinstance(doc, dict):
+        raise TypeError("workflow document must be a mapping")
+    events = doc.get("on", doc.get(True, {}))
+    if isinstance(events, str):
+        return {events}
+    if isinstance(events, (list, dict)) and all(
+        isinstance(event, str) for event in events
+    ):
+        return set(events)
+    raise TypeError("workflow events must be a name, a list of names or a mapping")
+
+
+def script(job):
+    return "\n".join(
+        line
+        for step in job.get("steps", [])
+        for line in str(step.get("run", "")).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def healthy_pr_condition(caller, name, job):
+    condition = str(job.get("if", "success()"))
+    condition = condition.removeprefix("${{").removesuffix("}}").strip()
+    if (caller, name) == ("asan", "asan-reload"):
+        return (
+            job.get("needs") in ("asan", ["asan"])
+            and condition == "!cancelled() && needs.asan.outputs.artifact-id != ''"
+        )
+    return condition in {"success()", "always()", "!cancelled()"}
+
+
+def healthy_fuzz_step_condition(step, *, success_only=False):
+    """Recognize a bounded healthy-run grammar, not every Actions expression."""
+    condition = step.get("if", "success()")
+    if isinstance(condition, bool):
+        return condition
+    if not isinstance(condition, str):
+        return False
+    condition = condition.strip()
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = condition[3:-2].strip()
+    # Permit redundant grouping around a single supported status/literal.
+    while condition.startswith("(") and condition.endswith(")"):
+        condition = condition[1:-1].strip()
+    pattern = r"success\s*\(\s*\)|true"
+    if not success_only:
+        pattern += r"|always\s*\(\s*\)|!\s*cancelled\s*\(\s*\)"
+    return (
+        re.fullmatch(
+            pattern,
+            condition,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def writes_fuzz_duration(body):
+    """Detect literal FUZZ_SECS environment writes per command or pipeline."""
+    if "FUZZ_SECS" not in body or "GITHUB_ENV" not in body:
+        return False
+    for line in body.replace("\\\n", " ").splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        try:
+            words = list(lexer)
+        except ValueError:
+            return True  # A malformed duration producer cannot be verified.
+        for separator, group in groupby(
+            words, lambda word: word in {";", "&&", "||", "&"}
+        ):
+            if separator:
+                continue
+            command = list(group)
+            if not any(word.startswith("FUZZ_SECS=") for word in command):
+                continue
+            for index, word in enumerate(command):
+                if word in {"$GITHUB_ENV", "${GITHUB_ENV}"} and (
+                    index > 0
+                    and command[index - 1] in {">", ">>"}
+                    or "tee" in command[:index]
+                ):
+                    return True
+    return False
+
+
+def check(root):
+    # Documents live only for this invocation; traversal and validation still run
+    # for every call. Failed reads/parses never enter the cache.
+    documents = {}
+
+    def document(path):
+        key = path.resolve()
+        if key not in documents:
+            doc = load_workflow(path)
+            if not isinstance(doc, dict) or not isinstance(doc.get("jobs", {}), dict):
+                raise TypeError(f"{path.name}: workflow and jobs must be mappings")
+            for name, job in doc.get("jobs", {}).items():
+                if not isinstance(job, dict):
+                    raise TypeError(f"{path.name}/{name}: job must be a mapping")
+                steps = job.get("steps", [])
+                if not isinstance(steps, list) or any(
+                    not isinstance(step, dict) for step in steps
+                ):
+                    raise TypeError(
+                        f"{path.name}/{name}: steps must be a list of mappings"
+                    )
+            documents[key] = doc
+        return documents[key]
+
+    def workflow(name):
+        return document(root / ".github/workflows" / name)
+
+    # Select the tree before loading executable budget policy. Staged lint
+    # supplies a snapshot root; importing this module must not read run.py.
+    check_fuzz_budget = runpy.run_path(str(root / "ci/fuzz/run.py"))["check_budget"]
+    errors = []
+    pr = workflow("ci.yml")
+    deep = workflow("ci-deep.yml")
+    for entry in ("ci.yml", "ci-deep.yml"):
+        expanded = graph(root, ".github/workflows/" + entry, document_loader=document)
+        if len(width(expanded)) > 4:
+            errors.append(f"{entry}: fifth concurrent leaf")
+    # Expand every call, including nested/matrix calls. A renamed caller cannot
+    # hide fuzz or MSVC; command signatures also reject an inline transplant.
+    leaves = graph(root, document_loader=document)
+    for path in sorted((root / ".github/workflows").glob("*.y*ml")):
+        doc = document(path)
+        triggers = event_names(doc)
+        if "schedule" in triggers and path.name not in {"ci-deep.yml", "codeql.yml"}:
+            errors.append(f"additional scheduled entry point: {path.name}")
+        if path.name == "ci.yml":
+            continue
+        if any(event in triggers for event in ("pull_request", "pull_request_target")):
+            errors.append(f"additional PR entry point: {path.name}")
+            # Also inspect every independently PR-reachable leaf, not only ci.yml.
+            for leaf in graph(
+                root, str(path.relative_to(root)), document_loader=document
+            ):
+                if re.search(r"fuzz|msvc", path.name + leaf, re.IGNORECASE):
+                    errors.append(f"PR-reachable fuzz/MSVC: {path.name}/{leaf}")
+    for leaf in leaves:
+        parts = re.findall(r"([^/]+?)\[\d+\]", leaf)
+        name = "ci.yml"
+        for part in parts:
+            job = workflow(name)["jobs"][part]
+            if "uses" in job:
+                name = Path(job["uses"]).name
+        if re.search(r"fuzz|msvc", leaf + name, re.IGNORECASE) or re.search(
+            r"ci/fuzz/(?:build.sh|run.py)|fuzz_(?:snapshot|statuses|accept)|nmake|vcvars|with-cc=cl",
+            script(job),
+            re.IGNORECASE,
+        ):
+            errors.append(f"PR-reachable fuzz/MSVC: {leaf}")
+    for caller, required in PR_JOBS.items():
+        job = pr["jobs"].get(caller, {})
+        expected = f"./.github/workflows/{caller}.yml"
+        # build-test is named the same as its caller; no conditional green stub.
+        entry = caller in {"build-test", "lint"}
+        if job.get("uses") != expected or (
+            (not entry or "if" in job) and job.get("if") != "${{ !cancelled() }}"
+        ):
+            errors.append(f"missing PR gate: {caller}")
+        if caller in {"build-test", "lint"} and "needs" in job:
+            errors.append(f"PR entry job cannot depend on other jobs: {caller}")
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        if not isinstance(needs, list) or set(needs) != PR_NEEDS[caller]:
+            errors.append(f"PR predecessor contract: {caller}")
+        children = workflow(f"{caller}.yml")["jobs"]
+        actual = set(children)
+        if actual != required:
+            errors.append(f"lost or unexpected PR target: {caller}: {actual}")
+        for name in sorted(required & actual):
+            if not healthy_pr_condition(caller, name, children[name]):
+                errors.append(f"PR target cannot run on healthy PR: {caller}/{name}")
+        if (
+            caller == "build-test"
+            and "runtime" in children
+            and children["runtime"].get("continue-on-error", False) is not False
+        ):
+            errors.append("required runtime job can suppress failure")
+        if caller == "build-test" and "runtime" in children:
+            runtime = [
+                step
+                for step in children["runtime"].get("steps", [])
+                if step.get("name") == "Run multi-worker runtime suite"
+            ]
+            if (
+                len(runtime) != 1
+                or runtime[0].get("continue-on-error", False) is not False
+            ):
+                errors.append("required runtime step can suppress failure")
+            if len(runtime) == 1 and (
+                not healthy_fuzz_step_condition(runtime[0])
+                or re.fullmatch(
+                    r"chmod \+x nginx-bin/nginx\n"
+                    r"python3 ci/tools/test_runtime\.py\s+"
+                    r'--port "\$TEST_BASE_PORT"\s+'
+                    r'--nginx-binary "\$GITHUB_WORKSPACE/nginx-bin/nginx"\s+'
+                    r'--module "\$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module\.so"\s+'
+                    r"--redis-server /usr/bin/redis-server",
+                    script({"steps": runtime}).replace("\\\n", "").strip(),
+                )
+                is None
+            ):
+                errors.append(
+                    "required runtime suite command or healthy condition missing"
+                )
+        if caller == "asan":
+            outputs = children.get("asan", {}).get("outputs")
+            if not isinstance(outputs, dict) or outputs.get("artifact-id") != (
+                "${{ steps.asan-artifact.outputs.artifact-id }}"
+            ):
+                errors.append("lost ASan artifact-id producer output")
+            metadata = {
+                "build-identity": ("identity", "EXPECTED_BUILD_IDENTITY"),
+                "binary-sha256": ("sha256", "EXPECTED_BINARY_SHA256"),
+                "artifact-identity": (
+                    "artifact-identity",
+                    "EXPECTED_ARTIFACT_IDENTITY",
+                ),
+                "artifact-sha256": ("artifact-sha256", "EXPECTED_ARTIFACT_SHA256"),
+            }
+            importers = [
+                step
+                for step in children.get("asan-reload", {}).get("steps", [])
+                if step.get("name") == "Verify plain ASan artifact"
+            ]
+            bindings = importers[0].get("env") if len(importers) == 1 else None
+            if (
+                not isinstance(outputs, dict)
+                or not isinstance(bindings, dict)
+                or any(
+                    outputs.get(output)
+                    != "${{ steps.asan-identity.outputs." + source + " }}"
+                    or bindings.get(variable)
+                    != "${{ needs.asan.outputs." + output + " }}"
+                    for output, (source, variable) in metadata.items()
+                )
+            ):
+                errors.append("lost ASan importer metadata contract")
+            exporters = [
+                step
+                for step in children.get("asan", {}).get("steps", [])
+                if step.get("id") == "asan-identity"
+            ]
+            if (
+                len(exporters) != 1
+                or not healthy_fuzz_step_condition(exporters[0])
+                or exporters[0].get("continue-on-error", False) is not False
+                or str(exporters[0].get("run", "")).strip()
+                != 'bash ci/tools/ci-build-artifact.sh export "$NGINX_VERSION" .build/asan-artifact'
+            ):
+                errors.append("lost ASan metadata export step")
+            uploads = [
+                step
+                for step in children.get("asan", {}).get("steps", [])
+                if step.get("id") == "asan-artifact"
+            ]
+            if (
+                len(uploads) != 1
+                or not str(uploads[0].get("uses", "")).startswith(
+                    "actions/upload-artifact@"
+                )
+                or not healthy_fuzz_step_condition(uploads[0])
+                or not isinstance(uploads[0].get("with"), dict)
+                or uploads[0]["with"].get("path") != ".build/asan-artifact/nginx"
+                or uploads[0]["with"].get("if-no-files-found") != "error"
+            ):
+                errors.append("lost ASan artifact upload step")
+
+    basic_job = workflow("build-test.yml")["jobs"].get("test-nginx")
+    if basic_job is not None:
+        if basic_job.get("continue-on-error", False) is not False:
+            errors.append("required basic.t job can suppress failure")
+        basic = [
+            step
+            for step in basic_job.get("steps", [])
+            if step.get("name") == "Run ci/t/basic.t"
+        ]
+        if len(basic) != 1 or basic[0].get("continue-on-error", False) is not False:
+            errors.append("required basic.t step can suppress failure")
+        if len(basic) == 1 and not healthy_fuzz_step_condition(basic[0]):
+            errors.append("required basic.t step cannot run")
+        if len(basic) == 1 and not re.fullmatch(
+            r"prove(?:[ \t]+-v)?[ \t]+ci/t/basic\.t",
+            str(basic[0].get("run", "")).strip(),
+        ):
+            errors.append("required basic.t command missing")
+    events = deep.get("on", deep.get(True, {}))
+    if (
+        not isinstance(events, dict)
+        or event_names(deep) != {"schedule", "workflow_dispatch"}
+        or events.get("schedule") != [{"cron": "30 3 4 * *"}]
+    ):
+        errors.append("monthly/manual trigger contract")
+    dispatch = events.get("workflow_dispatch") if isinstance(events, dict) else None
+    inputs = dispatch.get("inputs") if isinstance(dispatch, dict) else None
+    fuzz_input = inputs.get("fuzz_seconds") if isinstance(inputs, dict) else None
+    if not isinstance(fuzz_input, dict) or fuzz_input.get("type", "string") != "string":
+        errors.append("manual fuzz_seconds must allow free entry")
+    default = str(fuzz_input.get("default", "")) if isinstance(fuzz_input, dict) else ""
+    if not re.fullmatch(r"[0-9]{1,5}", default) or not 1 <= int(default) <= 86400:
+        errors.append("missing or invalid manual fuzz_seconds default")
+    else:
+        try:
+            # A no-override manual run must work on the hosted fallback too.
+            check_fuzz_budget(root / "ci/fuzz", default, "github-hosted")
+        except ValueError as exc:
+            errors.append(f"manual fuzz_seconds default exceeds runner budget: {exc}")
+    try:
+        check_fuzz_budget(root / "ci/fuzz", "3600", "github-hosted")
+    except ValueError as exc:
+        errors.append(f"scheduled fuzz duration exceeds runner budget: {exc}")
+    codeql = workflow("codeql.yml")
+    if "schedule" in event_names(codeql):
+        errors.append("duplicate CodeQL schedule")
+    jobs = deep["jobs"]
+    if set(jobs) != {"fuzz", "msvc", "memcheck", "helgrind", "scanners", "codeql"}:
+        errors.append("lost or unexpected monthly target")
+    if jobs.get("msvc", {}).get("uses") != "./.github/workflows/windows-msvc.yml":
+        errors.append("missing monthly MSVC")
+    msvc_workflow = workflow("windows-msvc.yml")
+    if event_names(msvc_workflow) != {"workflow_call", "workflow_dispatch"}:
+        errors.append("MSVC monthly/manual trigger contract")
+    msvc = msvc_workflow["jobs"]
+    required_steps = {
+        "Build",
+        "Verify module and configuration controls",
+        "Test persistence and singleton ownership",
+    }
+    if set(msvc) != {"msvc"} or not required_steps <= {
+        step.get("name") for step in msvc.get("msvc", {}).get("steps", [])
+    }:
+        errors.append("lost MSVC native control")
+    for label, job in (
+        ("monthly MSVC", jobs.get("msvc", {})),
+        ("MSVC", msvc.get("msvc", {})),
+        ("helgrind", jobs.get("helgrind", {})),
+    ):
+        if not healthy_fuzz_step_condition(job):
+            errors.append(f"{label} job cannot run on healthy monthly run")
+        if label != "helgrind" and job.get("continue-on-error", False) is not False:
+            errors.append(f"{label} job can suppress failure")
+    for step in msvc.get("msvc", {}).get("steps", []):
+        if (
+            step.get("name") in required_steps
+            and step.get("continue-on-error", False) is not False
+        ):
+            errors.append(f"MSVC native control can suppress failure: {step['name']}")
+        if step.get("name") in required_steps and not healthy_fuzz_step_condition(step):
+            errors.append(f"MSVC native control cannot run: {step['name']}")
+    for name in ("fuzz", "msvc", "helgrind", "scanners"):
+        if jobs.get(name, {}).get("needs", []) != []:
+            errors.append(f"monthly starting job has predecessors: {name}")
+    for job, predecessor in (("memcheck", "msvc"), ("codeql", "scanners")):
+        if (
+            jobs.get(job, {}).get("needs") not in (predecessor, [predecessor])
+            or jobs[job].get("if") != "${{ !cancelled() }}"
+        ):
+            errors.append(f"monthly ordering/diagnostics: {job}")
+    if jobs.get("codeql", {}).get("uses") != "./.github/workflows/codeql.yml":
+        errors.append("lost monthly CodeQL")
+    scanners = jobs.get("scanners", {})
+    if (
+        not healthy_fuzz_step_condition(scanners)
+        or scanners.get("continue-on-error", False) is not False
+    ):
+        errors.append("monthly scanner job cannot enforce its checks")
+    scanner_steps = scanners.get("steps", [])
+    source_pattern = r'"\$GITHUB_WORKSPACE"/src/ngx_http_error_abuse_\*\.c'
+    # Bound the whole script: a matching line after exit/false branches cannot
+    # prove that a scanner ran. Comments and continuations remain harmless.
+    for name, signature in (
+        (
+            "flawfinder",
+            (
+                rf"flawfinder --minlevel=1[ \t]+{source_pattern} 2>&1 \| tee flawfinder\.log\n"
+                rf"if flawfinder --minlevel=4 --quiet[ \t]+{source_pattern}[ \t]+"
+                r"2>/dev/null \| grep -Eq 'Hits = \[1-9\]'; then\n"
+                r'echo "[^"\n]+" >&2\nexit 1\nfi\necho "[^"\n]+"'
+            ),
+        ),
+        (
+            "clang-tidy (cert-*, security.*)",
+            (
+                r'set -euo pipefail\nN="\$NGINX_SRC_TREE"\n'
+                r'INCLUDES="(?:-I[A-Za-z0-9_$/.-]+[ \t]*)+"\n'
+                rf"clang-tidy {source_pattern}[ \t]+"
+                r"--checks='-\*,cert-\*,clang-analyzer-security\.\*,"
+                r"-clang-analyzer-security\.insecureAPI\.DeprecatedOrUnsafeBufferHandling'[ \t]+"
+                r"--warnings-as-errors='\*'[ \t]+-- \$INCLUDES "
+                r"\$\(pkg-config --cflags hiredis 2>/dev/null\)[ \t]+"
+                r"2>&1 \| tee clang-tidy\.log"
+            ),
+        ),
+        (
+            "semgrep",
+            (
+                r"semgrep scan --config p/c --config p/security-audit[ \t]+"
+                rf"--jobs=1 --metrics=off[ \t]+{source_pattern} "
+                r"2>&1 \| tee semgrep\.log \|\| true"
+            ),
+        ),
+    ):
+        matches = [step for step in scanner_steps if step.get("name") == name]
+        command = (
+            str(matches[0].get("run", "")).replace("\\\n", " ")
+            if len(matches) == 1
+            else ""
+        )
+        command = "\n".join(
+            line.strip()
+            for line in command.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if (
+            len(matches) != 1
+            or not re.fullmatch(signature, command)
+            or not healthy_fuzz_step_condition(matches[0])
+            or matches[0].get("continue-on-error", False) is not False
+        ):
+            errors.append(f"lost monthly scanner command: {name}")
+    uploads = [step for step in scanner_steps if step.get("name") == "Upload reports"]
+    if (
+        len(uploads) != 1
+        or not str(uploads[0].get("uses", "")).startswith("actions/upload-artifact@")
+        or uploads[0].get("if") != "always()"
+        or any(
+            scanner_steps.index(step) >= scanner_steps.index(uploads[0])
+            for step in scanner_steps
+            if step.get("name")
+            in {"flawfinder", "clang-tidy (cert-*, security.*)", "semgrep"}
+        )
+        or not isinstance(uploads[0].get("with"), dict)
+        or set(str(uploads[0]["with"].get("path", "")).splitlines())
+        != {
+            f"${{{{ github.workspace }}}}/{name}.log"
+            for name in ("flawfinder", "clang-tidy", "semgrep")
+        }
+    ):
+        errors.append("lost monthly scanner report upload")
+    fuzz = jobs.get("fuzz", {})
+    if "continue-on-error" in fuzz and fuzz["continue-on-error"] is not False:
+        errors.append("fuzz job can suppress failure")
+    if not healthy_fuzz_step_condition(fuzz):
+        errors.append("fuzz job cannot run on healthy monthly run")
+    commands = [step.get("run") for step in fuzz.get("steps", [])]
+    build = 'bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"'
+    preflight = 'python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT" --check-budget'
+    regression = 'python3 ci/fuzz/run.py 120 --runner-class "$RUNNER_ENVIRONMENT"'
+    discovery = 'python3 ci/fuzz/run.py "$FUZZ_SECS" --merge --runner-class "$RUNNER_ENVIRONMENT"'
+    required_fuzz = (preflight, build, regression, discovery)
+    if any(commands.count(command) != 1 for command in required_fuzz) or (
+        all(command in commands for command in required_fuzz)
+        and any(
+            commands.index(first) > commands.index(second)
+            for first, second in pairwise(required_fuzz)
+        )
+    ):
+        errors.append("lost fuzz regression/discovery or shared build")
+    for name, phase in (
+        ("Upload regression crash artifacts", regression),
+        ("Upload crash artifacts", discovery),
+    ):
+        uploads = [step for step in fuzz.get("steps", []) if step.get("name") == name]
+        upload = uploads[0] if len(uploads) == 1 else {}
+        condition = (
+            str(upload.get("if", "")).removeprefix("${{").removesuffix("}}").strip()
+        )
+        if (
+            len(uploads) != 1
+            or condition != "failure()"
+            or not str(upload.get("uses", "")).startswith("actions/upload-artifact@")
+            or upload.get("continue-on-error", False) is not False
+            or not isinstance(upload.get("with"), dict)
+            or upload["with"].get("path") != "${{ github.workspace }}/ci/fuzz/crash-*"
+            or phase not in commands
+            or fuzz["steps"].index(upload) <= commands.index(phase)
+        ):
+            errors.append(f"lost failure-only fuzz crash upload: {name}")
+    corpus_uploads = [
+        step
+        for step in fuzz.get("steps", [])
+        if step.get("name") == "Upload minimized corpus"
+    ]
+    if (
+        len(corpus_uploads) != 1
+        or not str(corpus_uploads[0].get("uses", "")).startswith(
+            "actions/upload-artifact@"
+        )
+        or not healthy_fuzz_step_condition(corpus_uploads[0])
+        or corpus_uploads[0].get("continue-on-error", False) is not False
+        or not isinstance(corpus_uploads[0].get("with"), dict)
+        or corpus_uploads[0]["with"].get("path")
+        != "${{ github.workspace }}/ci/fuzz/minimized/"
+        or discovery not in commands
+        or fuzz["steps"].index(corpus_uploads[0]) <= commands.index(discovery)
+    ):
+        errors.append("lost minimized corpus upload after discovery")
+    for step in fuzz.get("steps", []):
+        if (
+            step.get("run") in required_fuzz
+            and "continue-on-error" in step
+            and step["continue-on-error"] is not False
+        ):
+            errors.append(f"fuzz step can suppress failure: {step['run']}")
+        if step.get("run") in required_fuzz and not healthy_fuzz_step_condition(
+            step, success_only=step.get("run") == discovery
+        ):
+            errors.append(f"fuzz step cannot run on healthy monthly run: {step['run']}")
+        if step.get("run") in {preflight, discovery} and "FUZZ_SECS" in step.get(
+            "env", {}
+        ):
+            errors.append("fuzz phase overrides selected duration")
+    # This is a deliberately bounded shell contract, not a shell interpreter.
+    # Match the selector's final scheduled branch and its actual environment
+    # write; comments and literals elsewhere cannot satisfy the contract.
+    selectors = [
+        step
+        for step in fuzz.get("steps", [])
+        if step.get("name") == "Select fuzz duration"
+    ]
+    selection = (
+        "\n".join(
+            line.strip()
+            for line in str(selectors[0].get("run", "")).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if len(selectors) == 1
+        else ""
+    )
+    if not re.fullmatch(
+        r'set -euo pipefail\nif \[ "\$EVENT_NAME" = "workflow_dispatch" \]; then\n'
+        r'.*\nelse\nprintf \'FUZZ_SECS=3600\\n\' >> "\$GITHUB_ENV"\nfi',
+        selection,
+        re.DOTALL,
+    ) or not healthy_fuzz_step_condition(selectors[0]):
+        errors.append("lost full fuzz duration")
+    manual = (
+        r'set -euo pipefail\nif \[ "\$EVENT_NAME" = "workflow_dispatch" \]; then\n'
+        r'if ! printf \'%s\' "\$\{FUZZ_SECONDS_INPUT\}" \| '
+        r"grep -qzE '\^\[0-9\]\{1,5\}\$'; then\n"
+        r'echo "[^"\n]*"\nexit 1\nfi\n'
+        r'if \[ "\$\{FUZZ_SECONDS_INPUT\}" -lt 1 \] \|\| '
+        r'\[ "\$\{FUZZ_SECONDS_INPUT\}" -gt 86400 \]; then\n'
+        r'echo "[^"\n]*"\nexit 1\nfi\n'
+        r'printf \'FUZZ_SECS=%s\\n\' "\$\{FUZZ_SECONDS_INPUT\}" >> "\$GITHUB_ENV"\n'
+    )
+    selector_env = selectors[0].get("env") if len(selectors) == 1 else None
+    if (
+        not re.fullmatch(manual, selection.partition("else\n")[0])
+        or not isinstance(selector_env, dict)
+        or selector_env.get("FUZZ_SECONDS_INPUT")
+        != "${{ github.event.inputs.fuzz_seconds }}"
+        or selector_env.get("EVENT_NAME") != "${{ github.event_name }}"
+    ):
+        errors.append("lost validated manual fuzz duration")
+    if (
+        len(selectors) == 1
+        and preflight in commands
+        and fuzz["steps"].index(selectors[0]) > commands.index(preflight)
+    ):
+        errors.append("fuzz duration selected after budget preflight")
+    if len(selectors) == 1 and discovery in commands:
+        # Duration selection is the sole environment producer through discovery.
+        # Keep this literal shell contract bounded like the selector checks.
+        start = fuzz["steps"].index(selectors[0]) + 1
+        for step in fuzz["steps"][start : commands.index(discovery) + 1]:
+            if writes_fuzz_duration(str(step.get("run", ""))):
+                errors.append("fuzz duration changed after selection")
+    for name, variable in (("memcheck", "USE_VALGRIND"), ("helgrind", "USE_HELGRIND")):
+        if jobs.get(name, {}).get("continue-on-error", False) is not False:
+            errors.append(f"{name} job can suppress failure")
+        soaks = [
+            step
+            for step in jobs.get(name, {}).get("steps", [])
+            if re.search(
+                r'^bash ci/tools/soak\.sh \\\n[ \t]*"[^"\n]+" 600 4[ \t]*$',
+                str(step.get("run", "")),
+                re.MULTILINE,
+            )
+        ]
+        if not soaks:
+            errors.append(f"lost {name} full duration")
+        for step in soaks:
+            if step.get("continue-on-error", False) is not False:
+                errors.append(f"{name} soak can suppress failure")
+            env = step.get("env")
+            if not isinstance(env, dict) or env.get(variable) != "1":
+                errors.append(f"lost {name} instrumentation")
+            if not healthy_fuzz_step_condition(step):
+                errors.append(f"{name} soak cannot run on healthy monthly run")
+    for event in event_names(pr) - {"pull_request", "workflow_dispatch"}:
+        errors.append(f"unexpected PR entry point: {event}")
+    if "pull_request" not in event_names(pr):
+        errors.append("lost PR entry point")
+    elif not isinstance(pr.get("on"), dict) or pr["on"]["pull_request"] != {
+        "branches": ["main"]
+    }:
+        errors.append("PR trigger must target main without filters")
+    return errors
+
+
+def main():
+    try:
+        errors = check(ROOT)
+    except (
+        GraphError,
+        SyntaxError,
+        OSError,
+        UnicodeError,
+        KeyError,
+        TypeError,
+        yaml.YAMLError,
+    ) as exc:
+        print(f"CI cadence cannot be checked: {exc}", file=sys.stderr)
+        return 2
+    for error in errors:
+        print(error, file=sys.stderr)
+    if not errors:
+        print(
+            "CI cadence: retained PR gates; monthly/manual campaigns; both widths <= 4"
+        )
+    return int(bool(errors))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

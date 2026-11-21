@@ -30,7 +30,7 @@ exactly the truncation / over-read bug class the Perl suite cannot reach.
 
 ## The contract under test
 
-```
+```text
 validate_snapshot() == NGX_OK  =>  every byte load() later reads is < last
 ```
 
@@ -99,11 +99,13 @@ A crash drops a `crash-*` reproducer. Replay it with:
 ## CI
 
 [`.github/workflows/fuzzing.yml`](../../.github/workflows/fuzzing.yml) is the
-reusable PR member called by `ci.yml`; the long campaign belongs to
+manual regression diagnostic; the monthly regression and long campaign belong to
 [`ci-deep.yml`](../../.github/workflows/ci-deep.yml):
 
-- **PR** — 2-min bounded regression run on every pull request through `ci.yml`
-- **Deep monthly** — long discovery run on the 4th, with corpus upload
+- **PR** — deterministic parser/runtime tests and sanitizers remain in `ci.yml`;
+  fuzz campaigns run monthly/manual
+- **Deep monthly** — regression replay + 120s/target, then 3600s/target discovery
+  on the 4th, sharing one sanitizer build, with crash/corpus upload
 - **Manual** — `workflow_dispatch` on either workflow (the deep workflow accepts
   a custom duration)
 
@@ -111,3 +113,51 @@ ASAN+UBSAN are compiled in, so memory and undefined-behaviour bugs abort the
 run and fail the job. The harness also traps if the validator ever returns a
 value other than `NGX_OK`/`NGX_ERROR`, or breaks its lockstep contract with
 `load()`.
+
+`build.sh` and `run.py` discover every `fuzz_*.c`, including future targets.
+Target binary names must not end in `.dict`, `.c`, or `.h`, which are reserved
+for input files. Dotted source names such as `fuzz_headers.v2.c` remain valid.
+Each target requires a matching executable and `corpus_<name>/` directory;
+`fuzz_snapshot` retains `corpus/`. `fuzz_statuses` retains `fuzz.dict`;
+other targets may provide `<binary-name>.dict` (for example,
+`fuzz_accept.dict`). A target named `fuzz_fuzz` uses `fuzz_fuzz.dict`,
+leaving the statuses dictionary exclusive to `fuzz_statuses`. Regression fixtures
+use
+`regressions/<full-target-name>-<suffix>.bin` with a nonempty suffix. Exactly one
+registered target name followed by `-` must match. Ambiguous prefixes fail before
+any execution, so adding `snapshot-record-length` cannot steal an existing
+`snapshot-record-length-bound-exact.bin` fixture from `snapshot`. Bare target
+names, unknown prefixes and missing suffixes also fail; missing targets/corpora
+fail visibly. Existing `snapshot-<suffix>.bin` names remain valid.
+
+The deep job has a total admission budget of **360 minutes on GitHub-hosted
+runners** and **600 minutes on self-hosted runners**. Before building,
+`python3 ci/fuzz/run.py "$FUZZ_SECS" --runner-class "$RUNNER_ENVIRONMENT"
+--check-budget` counts all `fuzz_*.c`
+sources and regression fixtures, without needing binaries. Every normal runner
+invocation repeats the check before starting any replay or campaign. The requested
+per-target duration remains unchanged; an oversized request fails with the target
+count, required total and maximum discovery duration.
+
+Admission reserves 3600 seconds for setup, build, uploads and runner overhead;
+for each target it includes the requested discovery duration, the default
+120-second regression campaign, 60 seconds of exit grace for each campaign, and
+600 seconds for minimization. Each fixture reserves 60 seconds in each of the
+two replay passes. Thus, with the current two targets and two fixtures,
+GitHub-hosted runners accept the 3600-second default and at most 8040 seconds per
+target. Self-hosted runners accept the same default and at most 15240 seconds per
+target. Adding a target or fixture reduces each maximum automatically. These
+are admission allowances, not measured execution guarantees: the workflow's
+600-minute timeout remains an independent hard upper bound on self-hosted
+runners. GitHub-hosted jobs stop after **360 minutes**, even when the workflow
+allows 600 minutes. Either cutoff can end an overrun before corpus upload.
+See [GitHub Actions limits](https://docs.github.com/en/actions/reference/limits).
+
+The budget preflight and `--merge` discovery include both passes. A standalone
+regression invocation admits its own campaign and replay once, without charging
+the discovery or merge allowance again. Each campaign has a wrapper deadline of
+its target duration plus 60 seconds of exit grace.
+
+Discovered target stems must match `fuzz_[A-Za-z0-9_][A-Za-z0-9_.-]*`.
+Spaces and shell metacharacters cannot be passed safely to libFuzzer merge
+workers; dotted names such as `fuzz_headers.v2.c` remain supported.
