@@ -2499,7 +2499,8 @@ ngx_http_error_abuse_redis_host_valid(ngx_str_t *host)
     size_t      i, len, label;
     u_char      c;
 #if (NGX_HAVE_INET6)
-    u_char      address[16];
+    u_char      address[16], *p;
+    size_t      n;
 #endif
 
     len = host->len;
@@ -2510,7 +2511,17 @@ ngx_http_error_abuse_redis_host_valid(ngx_str_t *host)
     if (host->data[0] == '[') {
 #if (NGX_HAVE_INET6)
         if (len > 2 && host->data[len - 1] == ']') {
-            return ngx_inet6_addr(host->data + 1, len - 2, address);
+            /* ngx_inet6_addr() skips one leading colon and tolerates a
+             * single trailing one, so "[:0:0:0:0:0:0:0:1]" or "[1::2:]"
+             * would parse; only a "::" may start or end the address. */
+            p = host->data + 1;
+            n = len - 2;
+            if ((p[0] == ':' && (n < 2 || p[1] != ':'))
+                || (p[n - 1] == ':' && (n < 2 || p[n - 2] != ':')))
+            {
+                return NGX_ERROR;
+            }
+            return ngx_inet6_addr(p, n, address);
         }
 #endif
         return NGX_ERROR;
