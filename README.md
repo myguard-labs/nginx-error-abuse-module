@@ -144,6 +144,16 @@ control it through nginx's error-log configuration and log file permissions.
 Redis and hiredis failures retain numeric status, reply type and detail length
 for diagnosis, but omit backend-provided error text.
 
+When `nginx -t` rejects an invalid or duplicate parameter of `error_abuse_zone`,
+`error_abuse` or `error_abuse_redis`, the error log shows the full token only
+for that directive's known non-secret options (for example `threshold=0`).
+Every other token prints as `name=<redacted>`: `persist_secret=`, `password=`,
+`user=`, the zone's `redis=`, any unknown name, such as `passwd=`, and a known
+option whose value holds another `=`, such as `port=6390password=...`. A token
+with no `=`, or whose name is not 1–32 lowercase letters, digits or
+underscores starting with a letter (for example `PASSWORD=`), prints as
+`<redacted>`. The `in file:line` suffix still locates it.
+
 **Good news:** almost everything has a sensible default. The shortest config
 that actually works is just:
 
