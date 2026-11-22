@@ -137,3 +137,239 @@ f00dcafebabe5a5a
 ["GET /ok"]
 --- error_code eval
 [200]
+
+=== TEST 10: mixed-case persist_secret name does not leak the value
+--- http_config
+    error_abuse_zone zone=test10:1m key=$binary_remote_addr
+                     persist=/tmp/test10.bin
+                     Persist_Secret=a1b2c3d4e5f60718293a4b5c6d7e8f90;  # gitleaks:allow (test canary)
+--- config
+    location = /ok {
+        error_abuse zone=test10;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "<redacted>"
+--- no_error_log
+a1b2c3d4e5f60718293a4b5c6d7e8f90
+
+=== TEST 11: upper-case redis password name does not leak the value
+--- http_config
+    error_abuse_redis host=127.0.0.1 port=6390 PASSWORD=canary11upperpass;  # gitleaks:allow (test canary)
+    error_abuse_zone zone=test11:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test11;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_redis parameter "<redacted>"
+--- no_error_log
+canary11upperpass
+
+=== TEST 12: misspelled persist_secret keeps the name but redacts the value
+--- http_config
+    error_abuse_zone zone=test12:1m key=$binary_remote_addr
+                     persist=/tmp/test12.bin
+                     persist_secrt=0f1e2d3c4b5a69788796a5b4c3d2e1f0;
+--- config
+    location = /ok {
+        error_abuse zone=test12;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "persist_secrt=<redacted>"
+--- no_error_log
+0f1e2d3c4b5a69788796a5b4c3d2e1f0
+
+=== TEST 13: misspelled redis password keeps the name but redacts the value
+--- http_config
+    error_abuse_redis host=127.0.0.1 port=6390 passwd=canary13typopass;  # gitleaks:allow (test canary)
+    error_abuse_zone zone=test13:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test13;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_redis parameter "passwd=<redacted>"
+--- no_error_log
+canary13typopass
+
+=== TEST 14: password on error_abuse_zone does not leak the value
+--- http_config
+    error_abuse_zone zone=test14:1m key=$binary_remote_addr
+                     password=canary14zonepass;  # gitleaks:allow (test canary)
+--- config
+    location = /ok {
+        error_abuse zone=test14;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "password=<redacted>"
+--- no_error_log
+canary14zonepass
+
+=== TEST 15: persist_secret on error_abuse_redis does not leak the value
+--- http_config
+    error_abuse_redis host=127.0.0.1 port=6390
+                      persist_secret=1234abcd5678ef901234abcd5678ef90;  # gitleaks:allow (test canary)
+    error_abuse_zone zone=test15:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test15;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_redis parameter "persist_secret=<redacted>"
+--- no_error_log
+1234abcd5678ef901234abcd5678ef90
+
+=== TEST 16: password on error_abuse does not leak the value
+--- http_config
+    error_abuse_zone zone=test16:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test16 password=canary16enablepass;  # gitleaks:allow (test canary)
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse parameter "password=<redacted>"
+--- no_error_log
+canary16enablepass
+
+=== TEST 17: duplicate persist_secret does not leak the value
+--- http_config
+    error_abuse_zone zone=test17:1m key=$binary_remote_addr
+                     persist=/tmp/test17.bin
+                     persist_secret=00112233445566778899aabbccddeeff  # gitleaks:allow (test canary)
+                     persist_secret=ffeeddccbbaa99887766554433221100;  # gitleaks:allow (test canary)
+--- config
+    location = /ok {
+        error_abuse zone=test17;
+        empty_gif;
+    }
+--- must_die
+--- error_log: duplicate error_abuse_zone parameter "persist_secret=<redacted>"
+--- no_error_log
+00112233445566778899aabbccddeeff
+ffeeddccbbaa99887766554433221100
+
+=== TEST 18: base64-padded value is redacted whole
+--- http_config
+    error_abuse_redis host=127.0.0.1 port=6390 Y2FuYXJ5MThCYXNlNjQ=;
+    error_abuse_zone zone=test18:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test18;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_redis parameter "<redacted>"
+--- no_error_log
+Y2FuYXJ5MThCYXNlNjQ
+
+=== TEST 19: bare token without "=" is redacted whole
+--- http_config
+    error_abuse_zone zone=test19:1m key=$binary_remote_addr
+                     canary19baretoken;
+--- config
+    location = /ok {
+        error_abuse zone=test19;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "<redacted>"
+--- no_error_log
+canary19baretoken
+
+=== TEST 20: a 32-byte unknown name is kept, its value redacted
+--- http_config
+    error_abuse_zone zone=test20:1m key=$binary_remote_addr
+                     abcdefghijklmnopqrstuvwxyz_01234=canary20value;
+--- config
+    location = /ok {
+        error_abuse zone=test20;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "abcdefghijklmnopqrstuvwxyz_01234=<redacted>"
+--- no_error_log
+canary20value
+
+=== TEST 21: a 33-byte unknown name is redacted whole
+--- http_config
+    error_abuse_zone zone=test21:1m key=$binary_remote_addr
+                     abcdefghijklmnopqrstuvwxyz_012345=canary21value;
+--- config
+    location = /ok {
+        error_abuse zone=test21;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "<redacted>"
+--- no_error_log
+canary21value
+abcdefghijklmnopqrstuvwxyz_012345
+
+=== TEST 22: known non-secret error_abuse_zone value still prints
+--- http_config
+    error_abuse_zone zone=test22:1m key=$binary_remote_addr threshold=0;
+--- config
+    location = /ok {
+        error_abuse zone=test22;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "threshold=0"
+
+=== TEST 23: known non-secret error_abuse_redis value still prints
+--- http_config
+    error_abuse_redis host=127.0.0.1 port=6390 timeout=0;
+    error_abuse_zone zone=test23:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test23;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_redis parameter "timeout=0"
+
+=== TEST 24: known non-secret error_abuse duplicate still prints
+--- http_config
+    error_abuse_zone zone=test24:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test24 status=429 status=403;
+        empty_gif;
+    }
+--- must_die
+--- error_log: duplicate error_abuse parameter "status=403"
+
+=== TEST 25: rejected zone redis= value is redacted
+--- http_config
+    error_abuse_zone zone=test25:1m key=$binary_remote_addr
+                     redis=redis://:canary25urlpass@127.0.0.1;  # gitleaks:allow (test canary)
+--- config
+    location = /ok {
+        error_abuse zone=test25;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "redis=<redacted>"
+--- no_error_log
+canary25urlpass
+
+=== TEST 26: known name joined to a second option is redacted
+--- http_config
+    error_abuse_redis host=127.0.0.1 port=6390password=canary26joined;  # gitleaks:allow (test canary)
+    error_abuse_zone zone=test26:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test26;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse_redis parameter "port=<redacted>"
+--- no_error_log
+canary26joined

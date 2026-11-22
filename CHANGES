@@ -1,5 +1,13 @@
 Changes with ngx_http_error_abuse_module                         (unreleased)
 
+    *) Bugfix: an invalid or duplicate "error_abuse_zone", "error_abuse" or
+       "error_abuse_redis" parameter could echo secret material into the
+       error log when its name was misspelled or differently cased (for
+       example "PASSWORD=" or "persist_secrt="). Only known non-secret
+       options without a second "=" in their value now print it; every
+       other parameter prints as "name=<redacted>", or as "<redacted>" when
+       the name does not look like an option name.
+
     *) Bugfix: documentation overstated client privacy. "client_sha256" is an
        unkeyed SHA-256 digest and is pseudonymous, not anonymous: with the
        default key=$binary_remote_addr it can be reversed by brute force. The
