@@ -194,8 +194,15 @@ that case — the origin's `dry_run` wins for the whole request.
 ### `error_abuse_redis host=name|tls://name|rediss://name [port=number] [user=name] [password=value] [db=number] [prefix=value] [timeout=time]` — context: `http`
 
 Points the module at one Redis server (see below). `host=` is required; every
-other option is optional and must use the `key=value` form shown above. The
-`tls://` and `rediss://` host schemes both enable TLS. TLS verifies the peer's
+other option is optional and must use the `key=value` form shown above.
+`host=` accepts a DNS name, an IPv4 address, or a bracketed IPv6 address
+(for example `[::1]`). DNS labels contain ASCII letters, digits and interior
+hyphens, with at most 63 characters per label and 253 characters overall,
+excluding an optional final root dot. Set the TCP port only with `port=`
+(1–65535, default 6379). Embedded ports are rejected even when they match a
+separate `port=`. URLs, paths, queries, fragments, userinfo, unbracketed IPv6
+and IPv6 scope identifiers are rejected. Only the optional `tls://` and
+`rediss://` prefixes are accepted; both enable TLS. TLS verifies the peer's
 certificate chain against `/etc/ssl/certs` and checks the original `host=`
 identity before sending Redis commands (including AUTH). DNS names use hostname
 verification and SNI; numeric IPv4/IPv6 hosts require a matching IP SAN and do

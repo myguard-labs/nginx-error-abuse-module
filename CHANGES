@@ -1,5 +1,12 @@
 Changes with ngx_http_error_abuse_module                         (unreleased)
 
+    *) Change: "error_abuse_redis host=" accepts only a DNS name, an IPv4
+       address or a bracketed IPv6 address. A port embedded in host= (for
+       example "host=127.0.0.1:6380") was silently ignored in favour of
+       port=; such configurations, and URLs, userinfo, paths or scoped IPv6
+       hosts, now fail "nginx -t" without echoing the host value. Set the
+       port only with port=.
+
     *) Feature: the $error_abuse_matched variable is "1" for requests that
        matched a zone's rule (counted, blocked, or observed in dry-run) and
        empty otherwise, so "access_log ... if=$error_abuse_matched" logs

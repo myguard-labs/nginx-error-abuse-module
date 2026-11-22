@@ -2490,6 +2490,64 @@ duplicate:
     return NGX_CONF_ERROR;
 }
 
+/* host= is an address only; port= is the sole source of the TCP port.
+ * Validate before resolution so syntax errors cannot enter the DNS fallback
+ * or expose URL credentials in its warning. TLS schemes are stripped first. */
+static ngx_int_t
+ngx_http_error_abuse_redis_host_valid(ngx_str_t *host)
+{
+    size_t      i, len, label;
+    u_char      c;
+#if (NGX_HAVE_INET6)
+    u_char      address[16];
+#endif
+
+    len = host->len;
+    if (len == 0) {
+        return NGX_ERROR;
+    }
+
+    if (host->data[0] == '[') {
+#if (NGX_HAVE_INET6)
+        if (len > 2 && host->data[len - 1] == ']') {
+            return ngx_inet6_addr(host->data + 1, len - 2, address);
+        }
+#endif
+        return NGX_ERROR;
+    }
+
+    /* DNS labels use ASCII letters, digits and interior hyphens. Keep an
+     * optional final root dot; reject ports, URLs, userinfo and scoped IPs. */
+    if (host->data[len - 1] == '.') {
+        len--;
+    }
+    if (len == 0 || len > 253) {
+        return NGX_ERROR;
+    }
+
+    label = 0;
+    for (i = 0; i < len; i++) {
+        c = host->data[i];
+        if (c == '.') {
+            if (label == 0 || host->data[i - 1] == '-') {
+                return NGX_ERROR;
+            }
+            label = 0;
+            continue;
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+              || (c >= '0' && c <= '9') || (c == '-' && label != 0)))
+        {
+            return NGX_ERROR;
+        }
+        if (++label > 63) {
+            return NGX_ERROR;
+        }
+    }
+
+    return (label != 0 && host->data[len - 1] != '-') ? NGX_OK : NGX_ERROR;
+}
+
 static char *
 ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -2530,7 +2588,9 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     for (i = 1; i < cf->args->nelts; i++) {
         if (ngx_strncmp(value[i].data, "host=", 5) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST) {
-                goto duplicate;
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "duplicate error_abuse_redis parameter host");
+                return NGX_CONF_ERROR;
             }
             seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST;
             host.data = value[i].data + 5;
@@ -2549,8 +2609,12 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 host.data += 9;
                 host.len -= 9;
             }
-            if (host.len == 0) {
-                goto invalid;
+            if (ngx_http_error_abuse_redis_host_valid(&host) != NGX_OK) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "invalid error_abuse_redis parameter host; use a DNS "
+                    "name, IPv4 or bracketed IPv6 address and a separate "
+                    "port=");
+                return NGX_CONF_ERROR;
             }
         } else if (ngx_strncmp(value[i].data, "port=", 5) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PORT) {
