@@ -20,6 +20,8 @@ import tempfile
 import threading
 from contextlib import contextmanager, nullcontext
 
+from test_redis_host import configs
+
 
 def command(*args: str) -> None:
     subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -310,6 +312,7 @@ def main() -> None:
         certificates(root)
         if args.nginx_binary and not args.only:
             reject_numeric_shorthand(args, root)
+            configs(args.nginx_binary, args.module, root, None)
         if not args.nginx_binary:
             repo = pathlib.Path(__file__).resolve().parents[2]
             command(

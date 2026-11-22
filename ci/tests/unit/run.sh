@@ -233,5 +233,6 @@ fi
 echo "OK: production deadline call sites use saturating time helper"
 
 python3 "$ROOT/ci/tools/test_redis_durations.py" --negative-controls
+python3 "$ROOT/ci/tools/test_redis_host.py" --core "$NGX_SRC" --negative-controls
 
 # The socket/OpenSSL/hiredis integration probe runs separately in CI.
