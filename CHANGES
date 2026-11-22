@@ -1,5 +1,12 @@
 Changes with ngx_http_error_abuse_module                         (unreleased)
 
+    *) Bugfix: documentation overstated client privacy. "client_sha256" is an
+       unkeyed SHA-256 digest and is pseudonymous, not anonymous: with the
+       default key=$binary_remote_addr it can be reversed by brute force. The
+       README now states that nginx may append the client address and request
+       to error-log lines written during a request, which the module does not
+       suppress.
+
     *) Change: "error_abuse_redis host=" accepts only a DNS name, an IPv4
        address or a bracketed IPv6 address. A port embedded in host= (for
        example "host=127.0.0.1:6380") was silently ignored in favour of
