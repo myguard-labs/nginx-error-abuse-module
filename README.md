@@ -131,10 +131,18 @@ HMAC-SHA256. The key must be at least 16 bytes (32 hex characters); 32 bytes
 
 Client identities are stored as a fixed 32-byte SHA-256 digest of the `key`, so
 a large key variable (`$request_uri`, `$http_*`) costs the same memory and Redis
-traffic as a small one — there is no per-key amplification. Log records use the
-64-character lowercase digest as `client_sha256`; raw identity bytes are never
-written to the log. Redis and hiredis failures retain numeric status, reply type
-and detail length for diagnosis, but omit backend-provided error text.
+traffic as a small one — there is no per-key amplification. The digest is
+unkeyed, so `client_sha256` is a pseudonymous identifier, not anonymization:
+with the default `key=$binary_remote_addr` the input space is only the IPv4 or
+IPv6 address space, and a digest can be reversed by brute force. Module log
+records use the 64-character lowercase digest as `client_sha256` and do not
+write the raw key bytes themselves. However, nginx appends request context to
+error-log lines written while a request is active (for example
+`client: <addr>, server: ..., request: ...`), so the client address and request
+line may still appear in the error log. The module does not suppress this;
+control it through nginx's error-log configuration and log file permissions.
+Redis and hiredis failures retain numeric status, reply type and detail length
+for diagnosis, but omit backend-provided error text.
 
 **Good news:** almost everything has a sensible default. The shortest config
 that actually works is just:
