@@ -2521,6 +2521,18 @@ ngx_http_error_abuse_redis_host_valid(ngx_str_t *host)
             {
                 return NGX_ERROR;
             }
+            /* ngx_inet_addr() reads an empty dotted octet as zero, so
+             * "[::ffff:127..0.1]" would parse; each dot needs digits on
+             * both sides. */
+            for (i = 0; i < n; i++) {
+                if (p[i] == '.'
+                    && (i == 0 || i + 1 == n
+                        || p[i - 1] < '0' || p[i - 1] > '9'
+                        || p[i + 1] < '0' || p[i + 1] > '9'))
+                {
+                    return NGX_ERROR;
+                }
+            }
             return ngx_inet6_addr(p, n, address);
         }
 #endif
