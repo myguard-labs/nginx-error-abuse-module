@@ -1,5 +1,14 @@
 Changes with ngx_http_error_abuse_module                         (unreleased)
 
+    *) Bugfix: a Redis ban could stay in force for up to a second after the
+       deadline it stored, because the deadline was rounded down to whole
+       seconds while the key expired in milliseconds. During that last
+       second the 429 or 503 carried no "Retry-After" header and
+       $error_abuse_blocked_until showed a past time. The deadline is now
+       rounded up, and a live ban whose stored deadline has already passed
+       (for example one written by an older worker) now reports a deadline
+       one second away.
+
     *) Security: with persist_secret, a snapshot authenticated for one
        error_abuse_zone was accepted by another zone sharing the secret and
        threshold if it was copied to that zone's persist path. The snapshot
