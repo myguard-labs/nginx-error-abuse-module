@@ -253,7 +253,8 @@ Redis behind volatile DNS.
 - `$error_abuse_count` — matching responses currently in the window.
 - `$error_abuse_blocked_until` — Unix timestamp the ban ends, or `0`. Populated
   for both local and Redis bans (Redis stores the absolute deadline as the block
-  value).
+  value, rounded up to a whole second so a live ban never reports a past
+  deadline).
 - `$error_abuse_matched` — `1` when the request matched the zone's rule
   (`$error_abuse_status` is `COUNTED`, `BLOCKED` or `DRY_RUN`), otherwise
   empty. Use it with `access_log ... if=` to log only matching requests. That
