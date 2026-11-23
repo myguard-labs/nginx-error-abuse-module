@@ -38,7 +38,7 @@ def main() -> None:
         build = pathlib.Path(directory)
         generated = build / "snapshot_open.c"
         regular = build / "regular"
-        regular.write_bytes(struct.pack("<8sIIII", b"NGEAB01", 2, 3, 0, 0))
+        regular.write_bytes(struct.pack("<8sIIII", b"NGEAB01", 3, 3, 0, 0))
         (build / "empty").touch()
         (build / "directory").mkdir()
         os.mkfifo(build / "fifo")

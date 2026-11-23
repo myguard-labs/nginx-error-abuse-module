@@ -208,6 +208,19 @@ places an active LRU-tail ban before exactly one reclaimable entry. Changing
 were evicted instead of preserving a full zone; restoring the predicate returned
 `OK: mixed blocked/unblocked eviction control`.
 
+RA02-EA-11 snapshot zone/key binding control (2026-11-23) --
+`--snapshot-binding-only` seeds v3 snapshots in two authenticated zones that
+share secret, threshold and key, then checks same-zone restore, a zone A file
+at zone B's path, a key expression change that keeps the identity bytes, an
+authenticated v2 file (ignored with the legacy line and kept), an unknown
+version, and an unauthenticated v2 restore. Reverting only the HMAC input to
+header+payload (both serialize and load) failed the documented-input check
+first; with each assertion recorded instead of raised, the cross-zone and
+cross-key cases failed (`/bindb-ok` and `/bindk-ok` expected 200, got 429, and
+no HMAC failure line) while same-zone, migration, unknown-version and
+unauthenticated-v2 cases passed. Restoring the bound input returned
+`OK: snapshot zone/key binding control`.
+
 SP-2 scan-budget control (2026-08-19) -- rebuild the fault module with
 `bash ci/tools/ci-build.sh nginx 1.31.3 fault-evict-scan-budget`, which keeps
 the production eviction path but sets `NGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT=1`.
@@ -364,6 +377,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-eviction-only", action="store_true")
     parser.add_argument("--evict-scan-budget-only", action="store_true")
     parser.add_argument("--oversized-snapshot-only", action="store_true")
+    parser.add_argument("--snapshot-binding-only", action="store_true")
     parser.add_argument(
         "--deadline-clamp",
         choices=("snapshot-crc", "snapshot-hmac", "redis"),
@@ -1648,10 +1662,31 @@ def _assert_bounded_retry_after(
         )
 
 
+SNAPSHOT_MAC_DOMAIN = b"NGEAB-HMAC-v3"
+
+
+def _snapshot_mac(secret: bytes, zone: str, key: str, covered: bytes) -> bytes:
+    """Version 3 snapshot HMAC: bound to the zone name and key expression."""
+    zone_raw = zone.encode("ascii")
+    key_raw = key.encode("ascii")
+    return hmac.new(
+        secret,
+        SNAPSHOT_MAC_DOMAIN
+        + struct.pack("<I", len(zone_raw))
+        + zone_raw
+        + struct.pack("<I", len(key_raw))
+        + key_raw
+        + covered,
+        hashlib.sha256,
+    ).digest()
+
+
 def _set_snapshot_deadline(
     state: pathlib.Path,
     deadline: int,
     secret: bytes | None,
+    zone: str = "secret",
+    key: str = "$binary_remote_addr",
 ) -> None:
     header_len = 24
     mac_len = hashlib.sha256().digest_size if secret is not None else 0
@@ -1669,9 +1704,7 @@ def _set_snapshot_deadline(
     struct.pack_into("<q", data, blocked_until_off, deadline)
     struct.pack_into("<I", data, 20, zlib.crc32(data[header_len:payload_end]))
     if secret is not None:
-        data[payload_end:] = hmac.new(
-            secret, data[:payload_end], hashlib.sha256
-        ).digest()
+        data[payload_end:] = _snapshot_mac(secret, zone, key, bytes(data[:payload_end]))
 
     state.write_bytes(data)
     os.chmod(state, 0o600)
@@ -1685,9 +1718,272 @@ def _set_snapshot_deadline(
         raise AssertionError("deadline snapshot fixture CRC32 is invalid")
     if secret is not None and not hmac.compare_digest(
         written[payload_end:],
-        hmac.new(secret, written[:payload_end], hashlib.sha256).digest(),
+        _snapshot_mac(secret, zone, key, written[:payload_end]),
     ):
         raise AssertionError("deadline snapshot fixture HMAC is invalid")
+
+
+SNAPSHOT_BINDING_KEY = "$binary_remote_addr"
+
+
+def _snapshot_binding_config(
+    root: pathlib.Path, port: int, module: pathlib.Path | None, bindk_key: str
+) -> str:
+    # RA02-EA-11: binda/bindb share secret, threshold and key, so only the
+    # zone binding in the v3 HMAC tells their snapshots apart. bindk's key
+    # expression is swapped between runs; "${binary_remote_addr}" evaluates
+    # to the same identity bytes as "$binary_remote_addr", so only the key
+    # binding (not the hashed identity) can reject a cross-key restore. A
+    # 1h persist_interval means snapshots are written only at exit, so a file
+    # left on disk can be inspected while nginx runs.
+    load = f"load_module {module};\n" if module else ""
+    secret = PERSIST_SECRET.hex()
+    common = "statuses=404 interval=30s threshold=2 block=30s persist_interval=1h"
+    zones = (
+        ("binda", SNAPSHOT_BINDING_KEY, f" persist_secret={secret}"),
+        ("bindb", SNAPSHOT_BINDING_KEY, f" persist_secret={secret}"),
+        ("bindk", bindk_key, f" persist_secret={secret}"),
+        ("bindplain", SNAPSHOT_BINDING_KEY, ""),
+    )
+    zone_conf = "".join(
+        f"    error_abuse_zone zone={name}:1m key={key} {common}\n"
+        f"                     persist={root}/{name}.state{auth};\n"
+        for name, key, auth in zones
+    )
+    locations = "".join(
+        f"""        location = /{name}-error {{
+            error_abuse zone={name} status=429;
+            root {root}/empty;
+        }}
+        location = /{name}-ok {{
+            error_abuse zone={name} status=429;
+            empty_gif;
+        }}
+"""
+        for name, _, _ in zones
+    )
+    return f"""{load}worker_processes 1;
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log notice;
+
+events {{
+    worker_connections 64;
+}}
+
+http {{
+    access_log off;
+
+{zone_conf}
+    server {{
+        listen 127.0.0.1:{port};
+
+{locations}    }}
+}}
+"""
+
+
+class _SnapshotBindingNginx(Nginx):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.bindk_key = SNAPSHOT_BINDING_KEY
+        self.states = {
+            name: self.root / f"{name}.state"
+            for name in ("binda", "bindb", "bindk", "bindplain")
+        }
+
+    def write_config(self, keyed_key: str = "$arg_client") -> None:
+        del keyed_key
+        for sub in ("conf", "logs", "empty"):
+            (self.root / sub).mkdir(parents=True, exist_ok=True)
+        (self.root / "conf" / "nginx.conf").write_text(
+            _snapshot_binding_config(self.root, self.port, self.module, self.bindk_key),
+            encoding="ascii",
+        )
+
+    def log_offset(self) -> int:
+        log = self.root / "logs" / "error.log"
+        return log.stat().st_size if log.exists() else 0
+
+    def log_since(self, offset: int) -> str:
+        log = self.root / "logs" / "error.log"
+        return log.read_bytes()[offset:].decode("utf-8", "replace")
+
+    def run_checks(self, label: str, checks: list[tuple[str, int]]) -> str:
+        """Start, expect each status, stop; return the error log of this run."""
+        offset = self.log_offset()
+        self.start()
+        try:
+            for path, status in checks:
+                got = request(self.port, path)
+                if got != status:
+                    raise AssertionError(
+                        f"{label}: {path} expected {status}, got {got}"
+                    )
+        finally:
+            self.stop()
+        return self.log_since(offset)
+
+    def set_version(self, name: str, version: int, legacy_mac: bool = False) -> bytes:
+        data = bytearray(self.states[name].read_bytes())
+        struct.pack_into("<I", data, 8, version)
+        if legacy_mac:
+            # Version 2 HMAC: header + payload only, no zone binding.
+            mac_len = hashlib.sha256().digest_size
+            data[-mac_len:] = hmac.new(
+                PERSIST_SECRET, bytes(data[:-mac_len]), hashlib.sha256
+            ).digest()
+        self.states[name].write_bytes(bytes(data))
+        os.chmod(self.states[name], 0o600)
+        return bytes(data)
+
+
+def _snapshot_version(state: pathlib.Path) -> int:
+    data = state.read_bytes()
+    if len(data) < 24 or data[:8] != b"NGEAB01\x00":
+        raise AssertionError(f"{state.name}: not a snapshot")
+    return struct.unpack_from("<I", data, 8)[0]
+
+
+def _expect_snapshot_log(
+    label: str,
+    text: str,
+    state: pathlib.Path,
+    present: str | None,
+    absent: tuple[str, ...],
+) -> None:
+    prefix = f'error_abuse persistence file "{state}" '
+    if present is not None and prefix + present not in text:
+        raise AssertionError(f"{label}: expected {present!r} for {state.name}")
+    for marker in absent:
+        if prefix + marker in text:
+            raise AssertionError(f"{label}: unexpected {marker!r} for {state.name}")
+
+
+SNAPSHOT_HMAC_FAILED = "failed HMAC verification; ignoring"
+SNAPSHOT_LEGACY_V2 = (
+    "is a legacy version 2 authenticated snapshot not bound to its zone; ignoring"
+)
+SNAPSHOT_INCOMPATIBLE = "is incompatible"
+
+
+def _snapshot_binding_seed(nginx: _SnapshotBindingNginx) -> None:
+    """Seed a ban in every zone; the exit save writes v3 snapshots."""
+    checks = []
+    for name in nginx.states:
+        checks += [
+            (f"/{name}-error", 404),
+            (f"/{name}-error", 404),
+            (f"/{name}-ok", 429),
+        ]
+    nginx.run_checks("seed", checks)
+    for name, state in nginx.states.items():
+        if _snapshot_version(state) != 3:
+            raise AssertionError(f"{name}: exit save did not write a v3 snapshot")
+    written = nginx.states["binda"].read_bytes()
+    mac_len = hashlib.sha256().digest_size
+    if not hmac.compare_digest(
+        written[-mac_len:],
+        _snapshot_mac(
+            PERSIST_SECRET, "binda", SNAPSHOT_BINDING_KEY, written[:-mac_len]
+        ),
+    ):
+        raise AssertionError("binda: v3 HMAC does not match the documented input")
+
+
+def _snapshot_binding_restores(nginx: _SnapshotBindingNginx) -> None:
+    states = nginx.states
+
+    # (a) positive: an authenticated v3 snapshot restores in its own zone.
+    text = nginx.run_checks("same-zone", [("/binda-ok", 429), ("/bindk-ok", 429)])
+    for name in ("binda", "bindk"):
+        _expect_snapshot_log(
+            "same-zone", text, states[name], None, (SNAPSHOT_HMAC_FAILED,)
+        )
+
+    # (b) attack: zone A's snapshot at zone B's path (same secret, threshold
+    # and key) must fail HMAC verification and restore nothing.
+    states["bindb"].write_bytes(states["binda"].read_bytes())
+    os.chmod(states["bindb"], 0o600)
+    text = nginx.run_checks("cross-zone", [("/bindb-ok", 200), ("/binda-ok", 429)])
+    _expect_snapshot_log(
+        "cross-zone", text, states["bindb"], SNAPSHOT_HMAC_FAILED, (SNAPSHOT_LEGACY_V2,)
+    )
+    _expect_snapshot_log(
+        "cross-zone", text, states["binda"], None, (SNAPSHOT_HMAC_FAILED,)
+    )
+
+    # (c) key binding: same zone name, different key expression that yields
+    # the same identity -- only the bound key expression can reject it.
+    nginx.bindk_key = "${binary_remote_addr}"
+    text = nginx.run_checks("cross-key", [("/bindk-ok", 200)])
+    _expect_snapshot_log("cross-key", text, states["bindk"], SNAPSHOT_HMAC_FAILED, ())
+    nginx.bindk_key = SNAPSHOT_BINDING_KEY
+
+
+def _snapshot_binding_versions(nginx: _SnapshotBindingNginx) -> None:
+    states = nginx.states
+
+    # (d) migration: an authenticated v2 snapshot (unbound HMAC over header +
+    # payload) is ignored with the legacy line and kept, not deleted. The
+    # binda ban is still live, so a restore would answer 429.
+    legacy = nginx.set_version("binda", 2, legacy_mac=True)
+    offset = nginx.log_offset()
+    nginx.start()
+    try:
+        expect(nginx.port, "/binda-ok", 200)
+        if states["binda"].read_bytes() != legacy:
+            raise AssertionError("migration: legacy v2 snapshot was not kept as-is")
+    finally:
+        nginx.stop()
+    _expect_snapshot_log(
+        "migration",
+        nginx.log_since(offset),
+        states["binda"],
+        SNAPSHOT_LEGACY_V2,
+        (SNAPSHOT_HMAC_FAILED, SNAPSHOT_INCOMPATIBLE),
+    )
+    if _snapshot_version(states["binda"]) != 3:
+        raise AssertionError("migration: next save did not rewrite a v3 snapshot")
+
+    # Boundary: an unknown version under a secret takes the incompatible path.
+    nginx.set_version("binda", 4)
+    _expect_snapshot_log(
+        "future-version",
+        nginx.run_checks("future-version", [("/binda-ok", 200)]),
+        states["binda"],
+        SNAPSHOT_INCOMPATIBLE,
+        (SNAPSHOT_HMAC_FAILED, SNAPSHOT_LEGACY_V2),
+    )
+
+    # (e) without a secret a v2 snapshot still loads (same layout; the CRC
+    # covers only the payload), and the next save writes v3.
+    nginx.set_version("bindplain", 2)
+    _expect_snapshot_log(
+        "plain-v2",
+        nginx.run_checks("plain-v2", [("/bindplain-ok", 429)]),
+        states["bindplain"],
+        None,
+        (SNAPSHOT_LEGACY_V2, SNAPSHOT_INCOMPATIBLE, SNAPSHOT_HMAC_FAILED),
+    )
+    if _snapshot_version(states["bindplain"]) != 3:
+        raise AssertionError("plain-v2: next save did not rewrite a v3 snapshot")
+
+
+def test_snapshot_zone_binding(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> None:
+    """RA02-EA-11: an authenticated snapshot is bound to its zone and key."""
+    nginx = _SnapshotBindingNginx(
+        binary, module, root / "snapshot-binding", port, runner, True
+    )
+    _snapshot_binding_seed(nginx)
+    _snapshot_binding_restores(nginx)
+    _snapshot_binding_versions(nginx)
+    nginx.assert_clean_logs()
 
 
 def test_snapshot_deadline_clamp(
@@ -3928,6 +4224,7 @@ def main() -> int:
             args.mixed_eviction_only,
             args.evict_scan_budget_only,
             args.oversized_snapshot_only,
+            args.snapshot_binding_only,
         )
         if any(single_runtime_controls):
             if module is None:
@@ -3940,6 +4237,9 @@ def main() -> int:
             elif args.evict_scan_budget_only:
                 test_evict_scan_budget(binary, module, root, args.runner, args.port)
                 print("OK: LRU eviction scan budget/progress control")
+            elif args.snapshot_binding_only:
+                test_snapshot_zone_binding(binary, module, root, args.runner, args.port)
+                print("OK: snapshot zone/key binding control")
             else:
                 test_oversized_snapshot_rejected(
                     binary, module, root, args.runner, args.port
@@ -4027,6 +4327,7 @@ def main() -> int:
         test_oversized_snapshot_rejected(
             binary, module, root, args.runner, args.port + 16
         )
+        test_snapshot_zone_binding(binary, module, root, args.runner, args.port + 18)
         test_error_page_redirect(binary, module, root, args.runner, args.port + 20)
         if args.redis_server:
             test_redis_multi_host(

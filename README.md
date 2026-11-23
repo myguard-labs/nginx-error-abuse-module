@@ -129,6 +129,15 @@ dump). Set `persist_secret=<hex>` to additionally authenticate the file with
 HMAC-SHA256. The key must be at least 16 bytes (32 hex characters); 32 bytes
 (64 hex characters) is recommended. Generate with `openssl rand -hex 32`.
 
+The HMAC binds a snapshot to its zone name and `key` expression (snapshot
+format version 3), so a file copied from another zone, or written under a
+different `key`, fails verification and is ignored even when both zones share
+the secret and threshold. Upgrading from a version 2 module resets the saved
+bans of authenticated zones once: their version 2 snapshot is not bound to a
+zone, so it is ignored with a "legacy version 2 authenticated snapshot" warning
+(the file is kept) and replaced by a version 3 snapshot on the next save.
+Zones without `persist_secret` still restore version 2 snapshots.
+
 Client identities are stored as a fixed 32-byte SHA-256 digest of the `key`, so
 a large key variable (`$request_uri`, `$http_*`) costs the same memory and Redis
 traffic as a small one — there is no per-key amplification. The digest is

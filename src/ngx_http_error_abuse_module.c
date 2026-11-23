@@ -51,7 +51,10 @@
 #endif
 #define NGX_HTTP_ERROR_ABUSE_LOG_KEY_LEN  (NGX_HTTP_ERROR_ABUSE_DIGEST_LEN * 2)
 
-#define NGX_HTTP_ERROR_ABUSE_VERSION       2  /* RFC-3: portable LE format */
+/* RFC-3: portable LE format. v3 (RA02-EA-11) binds the HMAC to the zone name
+ * and key expression; the on-disk layout is the same as v2. */
+#define NGX_HTTP_ERROR_ABUSE_VERSION       3
+#define NGX_HTTP_ERROR_ABUSE_VERSION_V2    2  /* same layout, unbound HMAC */
 #define NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN  24 /* magic8+ver4+thr4+rec4+crc4 */
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
 /* F-5: min HMAC-SHA256 key size (bytes) */
@@ -330,6 +333,10 @@ static void ngx_http_error_abuse_rbtree_insert(ngx_rbtree_node_t *temp,
 static void ngx_http_error_abuse_persist_handler(ngx_event_t *ev);
 static ngx_int_t ngx_http_error_abuse_save(
     ngx_http_error_abuse_zone_t *zone, ngx_log_t *log);
+static size_t ngx_http_error_abuse_mac_bind_len(
+    ngx_http_error_abuse_zone_t *zone);
+static ngx_int_t ngx_http_error_abuse_snapshot_mac(
+    ngx_http_error_abuse_zone_t *zone, u_char *in, size_t len, u_char *mac);
 static u_char *ngx_http_error_abuse_serialize(
     ngx_http_error_abuse_zone_t *zone, ngx_log_t *log, size_t *outlen);
 static ngx_int_t ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
@@ -4857,6 +4864,65 @@ ngx_http_error_abuse_platform_sync_parent(u_char *path, ngx_log_t *log)
 #endif
 }
 
+/* RA02-EA-11: with persist_secret, the v3 HMAC input is
+ *   "NGEAB-HMAC-v3" || u32le(len(zone name)) || zone name
+ *   || u32le(len(key expression)) || key expression || header || payload
+ * so a snapshot authenticated for one zone (or one key expression) fails
+ * verification in any other zone that shares the secret and threshold. */
+static ngx_str_t  ngx_http_error_abuse_mac_domain =
+    ngx_string("NGEAB-HMAC-v3");
+
+/* Bytes the caller reserves in front of the snapshot header for the binding
+ * prefix; zero when no secret is configured. */
+static size_t
+ngx_http_error_abuse_mac_bind_len(ngx_http_error_abuse_zone_t *zone)
+{
+    if (zone->persist_secret.len == 0) {
+        return 0;
+    }
+
+    return ngx_http_error_abuse_mac_domain.len
+           + 4 + zone->name.len + 4 + zone->key.value.len;
+}
+
+/* Compute the v3 HMAC of the `len` snapshot bytes at `in` into `mac`. The
+ * binding prefix is built in the mac_bind_len() bytes the caller reserved
+ * directly before `in`, so one contiguous HMAC() call covers prefix, header
+ * and payload without copying the payload. */
+static ngx_int_t
+ngx_http_error_abuse_snapshot_mac(ngx_http_error_abuse_zone_t *zone,
+    u_char *in, size_t len, u_char *mac)
+{
+    u_char        *start, *p;
+    size_t         bind;
+    unsigned int   maclen;
+
+    if (zone->persist_secret.len > INT_MAX) {
+        return NGX_ERROR;
+    }
+
+    bind = ngx_http_error_abuse_mac_bind_len(zone);
+    start = in - bind;
+
+    p = ngx_cpymem(start, ngx_http_error_abuse_mac_domain.data,
+                   ngx_http_error_abuse_mac_domain.len);
+    p = ngx_http_error_abuse_put_u32(p, (uint32_t) zone->name.len);
+    p = ngx_cpymem(p, zone->name.data, zone->name.len);
+    p = ngx_http_error_abuse_put_u32(p, (uint32_t) zone->key.value.len);
+    (void) ngx_cpymem(p, zone->key.value.data, zone->key.value.len);
+
+    maclen = NGX_HTTP_ERROR_ABUSE_MAC_LEN;
+    if (HMAC(EVP_sha256(), zone->persist_secret.data,
+             (int) zone->persist_secret.len, start, bind + len, mac, &maclen)
+        == NULL
+        || maclen != NGX_HTTP_ERROR_ABUSE_MAC_LEN)
+    {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
 /* PERF-1: serialize the whole zone into the zone-owned grow-only buffer while
  * holding the slab mutex only for the copy (no I/O under the lock). Returns the
  * borrowed buffer and its length, or NULL; the caller must not free it. */
@@ -4865,7 +4931,7 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
     ngx_log_t *log, size_t *outlen)
 {
     u_char                       *buffer, *p, *last, *h;
-    size_t                        capacity, key_len, total;
+    size_t                        capacity, key_len, total, bind;
     uint32_t                      records, crc;
     ngx_uint_t                    i;
     ngx_queue_t                  *q;
@@ -4873,13 +4939,15 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
     ngx_http_error_abuse_node_t  *ean;
 
     capacity = zone->shm_zone->shm.size;
-    /* SEC-5: reserve room for the trailing HMAC when a secret is configured.
+    bind = ngx_http_error_abuse_mac_bind_len(zone);
+    /* SEC-5: reserve room for the trailing HMAC when a secret is configured,
+     * and (RA02-EA-11) for the v3 HMAC binding prefix in front of the header.
      * PERF: serialize runs single-threaded (event loop, never concurrent with
      * an in-flight write — persist_busy gates that), so keep one grow-only
      * buffer per zone instead of mmap/munmap-ing the whole shm size every
      * persist tick. Owned by the zone; never freed by the caller. */
     {
-        size_t  need = capacity + NGX_HTTP_ERROR_ABUSE_MAC_LEN;
+        size_t  need = bind + capacity + NGX_HTTP_ERROR_ABUSE_MAC_LEN;
 
         if (zone->persist_buf == NULL || zone->persist_buf_cap < need) {
             u_char  *nb = ngx_alloc(need, log);
@@ -4893,7 +4961,7 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
             zone->persist_buf_cap = need;
         }
     }
-    buffer = zone->persist_buf;
+    buffer = zone->persist_buf + bind;
 
     p = buffer + NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN;
     last = buffer + capacity;
@@ -4947,13 +5015,11 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
 
     total = (size_t) (p - buffer);
 
-    /* SEC-5: authenticate header + payload with HMAC-SHA256 (appended). */
+    /* SEC-5: authenticate header + payload with HMAC-SHA256 (appended);
+     * RA02-EA-11: the MAC is bound to this zone (see snapshot_mac()). */
     if (zone->persist_secret.len != 0) {
-        unsigned int maclen = NGX_HTTP_ERROR_ABUSE_MAC_LEN;
-        if (HMAC(EVP_sha256(), zone->persist_secret.data,
-                 (int) zone->persist_secret.len, buffer, total,
-                 p, &maclen) == NULL
-            || maclen != NGX_HTTP_ERROR_ABUSE_MAC_LEN)
+        if (ngx_http_error_abuse_snapshot_mac(zone, buffer, total, p)
+            != NGX_OK)
         {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "error_abuse: HMAC computation failed for \"%V\"",
@@ -5121,10 +5187,10 @@ ngx_http_error_abuse_open_snapshot(ngx_str_t *path, ngx_file_info_t *fi,
 static ngx_int_t
 ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 {
-    u_char                       *buffer, *p, *last;
+    u_char                       *base, *buffer, *p, *last;
     off_t                         file_size;
-    size_t                        mac_len, payload_size;
-    uint32_t                      hash, record_index;
+    size_t                        mac_len, payload_size, bind;
+    uint32_t                      hash, record_index, version;
     uint32_t                      loaded, dropped, f_records;
     uint16_t                      rec_key_len, rec_event_count;
     int64_t                       rec_blocked, rec_seen, stored_when;
@@ -5154,11 +5220,15 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         return NGX_OK;
     }
 
-    buffer = ngx_alloc((size_t) file_size, log);
-    if (buffer == NULL) {
+    /* RA02-EA-11: leave room for the v3 HMAC binding prefix in front of the
+     * file bytes so the MAC is computed over one contiguous buffer. */
+    bind = ngx_http_error_abuse_mac_bind_len(zone);
+    base = ngx_alloc(bind + (size_t) file_size, log);
+    if (base == NULL) {
         (void) ngx_close_file(fd);
         return NGX_ERROR;
     }
+    buffer = base + bind;
 
     if (ngx_http_error_abuse_read_all(fd, buffer, (size_t) file_size)
         != NGX_OK)
@@ -5166,7 +5236,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
                       ngx_read_fd_n " \"%V\" failed", &zone->persist);
         (void) ngx_close_file(fd);
-        ngx_free(buffer);
+        ngx_free(base);
         return NGX_OK;
     }
 
@@ -5174,39 +5244,62 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 
     payload_size = (size_t) file_size - mac_len;
 
-    /* SEC-5: verify the trailing HMAC over header+payload before trusting any
-     * field. A mismatch means tampering or wrong key — ignore the file (do not
-     * delete; the operator may have rotated the key). */
-    if (mac_len != 0) {
-        u_char        mac[NGX_HTTP_ERROR_ABUSE_MAC_LEN];
-        unsigned int  maclen = NGX_HTTP_ERROR_ABUSE_MAC_LEN;
+    /* RFC-3: peek the magic and version before the HMAC so an authenticated
+     * v2 snapshot can be told apart from a forged or foreign v3 one. Nothing
+     * else in the header is trusted until the HMAC (if any) verifies. v2 and
+     * v3 share the on-disk layout. */
+    version = ngx_http_error_abuse_get_u32(buffer + 8);
+    if (ngx_memcmp(buffer, NGX_HTTP_ERROR_ABUSE_FILE_MAGIC,
+                   NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN) != 0
+        || (version != NGX_HTTP_ERROR_ABUSE_VERSION
+            && version != NGX_HTTP_ERROR_ABUSE_VERSION_V2))
+    {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "error_abuse persistence file \"%V\" is incompatible",
+                      &zone->persist);
+        ngx_free(base);
+        return NGX_OK;
+    }
 
-        if (HMAC(EVP_sha256(), zone->persist_secret.data,
-                 (int) zone->persist_secret.len, buffer, payload_size,
-                 mac, &maclen) == NULL
-            || maclen != NGX_HTTP_ERROR_ABUSE_MAC_LEN
+    /* SEC-5: verify the trailing HMAC before trusting any further field. A
+     * mismatch means tampering, a wrong key, or (RA02-EA-11) a snapshot from
+     * another zone or key expression — ignore the file (do not delete; the
+     * operator may have rotated the key). */
+    if (mac_len != 0) {
+        u_char  mac[NGX_HTTP_ERROR_ABUSE_MAC_LEN];
+
+        /* RA02-EA-11: a v2 HMAC is not bound to its zone, so it cannot prove
+         * the file belongs here. Ignore it (keep the file); the next save
+         * rewrites it as v3. */
+        if (version == NGX_HTTP_ERROR_ABUSE_VERSION_V2) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "error_abuse persistence file \"%V\" is a legacy "
+                          "version 2 authenticated snapshot not bound to its "
+                          "zone; ignoring", &zone->persist);
+            ngx_free(base);
+            return NGX_OK;
+        }
+
+        if (ngx_http_error_abuse_snapshot_mac(zone, buffer, payload_size, mac)
+            != NGX_OK
             || CRYPTO_memcmp(mac, buffer + payload_size,
                              NGX_HTTP_ERROR_ABUSE_MAC_LEN) != 0)
         {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "error_abuse persistence file \"%V\" failed HMAC "
                           "verification; ignoring", &zone->persist);
-            ngx_free(buffer);
+            ngx_free(base);
             return NGX_OK;
         }
     }
 
-    /* RFC-3: parse the little-endian header. */
-    if (ngx_memcmp(buffer, NGX_HTTP_ERROR_ABUSE_FILE_MAGIC,
-                   NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN) != 0
-        || ngx_http_error_abuse_get_u32(buffer + 8)
-           != NGX_HTTP_ERROR_ABUSE_VERSION
-        || ngx_http_error_abuse_get_u32(buffer + 12) != zone->threshold)
-    {
+    /* RFC-3: parse the rest of the little-endian header. Without a secret,
+     * v2 and v3 snapshots both load (no authentication to lose). */
+    if (ngx_http_error_abuse_get_u32(buffer + 12) != zone->threshold) {
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "error_abuse persistence file \"%V\" is incompatible",
                       &zone->persist);
-        ngx_free(buffer);
+        ngx_free(base);
         return NGX_OK;
     }
     f_records = ngx_http_error_abuse_get_u32(buffer + 16);
@@ -5222,7 +5315,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
                       "error_abuse persistence file \"%V\" is corrupted "
                       "(CRC32 mismatch), deleting",
                       &zone->persist);
-        ngx_free(buffer);
+        ngx_free(base);
         (void) ngx_delete_file((u_char *) zone->persist.data);
         return NGX_OK;
     }
@@ -5234,7 +5327,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "error_abuse persistence file \"%V\" is malformed",
                       &zone->persist);
-        ngx_free(buffer);
+        ngx_free(base);
         return NGX_OK;
     }
 
@@ -5315,7 +5408,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     }
 
     ngx_shmtx_unlock(&zone->shpool->mutex);
-    ngx_free(buffer);
+    ngx_free(base);
 
     if (dropped != 0) {
         ngx_log_error(NGX_LOG_WARN, log, 0,
