@@ -373,3 +373,88 @@ canary25urlpass
 --- error_log: invalid error_abuse_redis parameter "port=<redacted>"
 --- no_error_log
 canary26joined
+
+=== TEST 27: status list joined to a secret option is redacted
+--- http_config
+    error_abuse_zone zone=test27:1m key=$binary_remote_addr
+                     statuses=404,password=canary27statuses;  # gitleaks:allow (test canary)
+--- config
+    location = /ok {
+        error_abuse zone=test27;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse status list "<redacted>"
+--- no_error_log
+canary27statuses
+
+=== TEST 28: status list with an empty element and a joined secret is redacted
+--- http_config
+    error_abuse_zone zone=test28:1m key=$binary_remote_addr
+                     statuses=404,,password=canary28statuses;  # gitleaks:allow (test canary)
+--- config
+    location = /ok {
+        error_abuse zone=test28;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse status list "<redacted>" (empty element)
+--- no_error_log
+canary28statuses
+
+=== TEST 29: status list with an empty element still prints
+--- http_config
+    error_abuse_zone zone=test29:1m key=$binary_remote_addr statuses=404,,500;
+--- config
+    location = /ok {
+        error_abuse zone=test29;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse status list "404,,500" (empty element)
+
+=== TEST 30: status list with a trailing comma still prints
+--- http_config
+    error_abuse_zone zone=test30:1m key=$binary_remote_addr statuses=404,;
+--- config
+    location = /ok {
+        error_abuse zone=test30;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse status list "404," (trailing comma)
+
+=== TEST 31: non-numeric status list still prints
+--- http_config
+    error_abuse_zone zone=test31:1m key=$binary_remote_addr statuses=abc;
+--- config
+    location = /ok {
+        error_abuse zone=test31;
+        empty_gif;
+    }
+--- must_die
+--- error_log: invalid error_abuse status list "abc"
+
+=== TEST 32: unknown zone name joined to a secret option is redacted
+--- http_config
+    error_abuse_zone zone=test32:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=test32password=canary32zonepass;  # gitleaks:allow (test canary)
+        empty_gif;
+    }
+--- must_die
+--- error_log: unknown error_abuse zone "<redacted>"
+--- no_error_log
+canary32zonepass
+
+=== TEST 33: ordinary unknown zone name still prints
+--- http_config
+    error_abuse_zone zone=test33:1m key=$binary_remote_addr;
+--- config
+    location = /ok {
+        error_abuse zone=nosuch;
+        empty_gif;
+    }
+--- must_die
+--- error_log: unknown error_abuse zone "nosuch"
