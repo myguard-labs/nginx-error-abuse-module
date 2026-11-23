@@ -1,5 +1,15 @@
 Changes with ngx_http_error_abuse_module                         (unreleased)
 
+    *) Security: with persist_secret, a snapshot authenticated for one
+       error_abuse_zone was accepted by another zone sharing the secret and
+       threshold if it was copied to that zone's persist path. The snapshot
+       HMAC now also covers the zone name and key expression (snapshot
+       format version 3). On upgrade, authenticated zones ignore their
+       version 2 snapshot once, logging a "legacy version 2 authenticated
+       snapshot" warning, so saved bans start empty; the file is kept and
+       rewritten as version 3 on the next save. Zones without persist_secret
+       still restore version 2 snapshots.
+
     *) Bugfix: a rejected "error_abuse_zone statuses=" list or an unknown
        "error_abuse zone=" name was echoed whole into the error log, so a
        second option joined without a space (for example
