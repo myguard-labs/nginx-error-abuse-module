@@ -1852,14 +1852,39 @@ ngx_http_error_abuse_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 }
 
 /*
+ * RA02-EA-12b/12c: the text after "statuses=" or "zone=" is echoed into the
+ * error log when it is rejected. A valid status list never contains "=" and
+ * a zone name normally does not, so a rejected value that does is most likely
+ * a second option joined without a space ("statuses=404,password=...",
+ * "zone=testpassword=..."), which may carry a secret. Such a value prints as
+ * "<redacted>" as a whole, since the joined option's boundary is unknown;
+ * any other rejected value prints unchanged, and nginx's "in file:line"
+ * suffix still locates it.
+ */
+static ngx_str_t *
+ngx_http_error_abuse_log_safe_value(ngx_str_t *value)
+{
+    static ngx_str_t  redacted = ngx_string("<redacted>");
+
+    if (ngx_strlchr(value->data, value->data + value->len, '=') != NULL) {
+        return &redacted;
+    }
+
+    return value;
+}
+
+/*
  * Render the scan core's status-list rejection as a config error. The parse
  * itself lives in ngx_http_error_abuse_scan.c, which cannot log; this keeps the
- * operator-facing text identical to what it emitted before the split.
+ * operator-facing text identical to what it emitted before the split, except
+ * that a list containing "=" is redacted (RA02-EA-12b).
  */
 static ngx_int_t
 ngx_http_error_abuse_parse_statuses_conf(ngx_conf_t *cf,
     ngx_http_error_abuse_zone_t *zone, ngx_str_t *value)
 {
+    ngx_str_t  *safe;
+
     switch (ngx_http_error_abuse_parse_statuses(value->data, value->len,
                                                 zone->statuses))
     {
@@ -1867,20 +1892,23 @@ ngx_http_error_abuse_parse_statuses_conf(ngx_conf_t *cf,
         return NGX_OK;
 
     case NGX_HTTP_ERROR_ABUSE_STATUSES_EMPTY_ELEMENT:
+        safe = ngx_http_error_abuse_log_safe_value(value);
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid error_abuse status list \"%V\" "
-                           "(empty element)", value);
+                           "(empty element)", safe);
         return NGX_ERROR;
 
     case NGX_HTTP_ERROR_ABUSE_STATUSES_TRAILING_COMMA:
+        safe = ngx_http_error_abuse_log_safe_value(value);
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid error_abuse status list \"%V\" "
-                           "(trailing comma)", value);
+                           "(trailing comma)", safe);
         return NGX_ERROR;
 
     default:
+        safe = ngx_http_error_abuse_log_safe_value(value);
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "invalid error_abuse status list \"%V\"", value);
+                           "invalid error_abuse status list \"%V\"", safe);
         return NGX_ERROR;
     }
 }
@@ -2495,7 +2523,8 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             lcf->zone = ngx_http_error_abuse_find_zone(mcf, &name);
             if (lcf->zone == NULL) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "unknown error_abuse zone \"%V\"", &name);
+                                   "unknown error_abuse zone \"%V\"",
+                                   ngx_http_error_abuse_log_safe_value(&name));
                 return NGX_CONF_ERROR;
             }
 

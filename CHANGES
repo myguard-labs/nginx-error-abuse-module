@@ -1,5 +1,13 @@
 Changes with ngx_http_error_abuse_module                         (unreleased)
 
+    *) Bugfix: a rejected "error_abuse_zone statuses=" list or an unknown
+       "error_abuse zone=" name was echoed whole into the error log, so a
+       second option joined without a space (for example
+       "statuses=404,password=..." or "zone=testpassword=...") could leak
+       its secret. Such a value, which contains "=", now prints as
+       "<redacted>"; other invalid lists and unknown zone names still print
+       in full.
+
     *) Bugfix: an invalid or duplicate "error_abuse_zone", "error_abuse" or
        "error_abuse_redis" parameter could echo secret material into the
        error log when its name was misspelled or differently cased (for
