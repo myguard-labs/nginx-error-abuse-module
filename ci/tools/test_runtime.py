@@ -2468,7 +2468,7 @@ def test_redis_auth(
 
 def test_redis_block_deadline_ceil(
     binary: pathlib.Path,
-    module: pathlib.Path,
+    module: pathlib.Path | None,
     root: pathlib.Path,
     runner: str,
     port: int,
@@ -4449,6 +4449,14 @@ def main() -> int:
                 root,
                 args.runner,
                 args.single_process,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
+            )
+            test_redis_block_deadline_ceil(
+                binary,
+                module,
+                root,
+                args.runner,
                 args.port,
                 pathlib.Path(args.redis_server).absolute(),
             )
