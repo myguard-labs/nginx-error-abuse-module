@@ -5197,7 +5197,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     off_t                         file_size;
     size_t                        mac_len, payload_size, bind;
     uint32_t                      hash, record_index, version;
-    uint32_t                      loaded, dropped, f_records;
+    uint32_t                      loaded, retained, dropped, f_records;
     uint16_t                      rec_key_len, rec_event_count;
     int64_t                       rec_blocked, rec_seen, stored_when;
     ngx_fd_t                      fd;
@@ -5205,6 +5205,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     ngx_uint_t                    i;
     time_t                        now, *events;
     ngx_str_t                     key;
+    ngx_queue_t                  *q;
     ngx_http_error_abuse_node_t  *ean;
 
     fd = ngx_http_error_abuse_open_snapshot(&zone->persist, &fi, log);
@@ -5382,6 +5383,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
                 dropped += f_records - record_index;
                 break;
             }
+            loaded++;
         }
 
         /* Clamp a restored ban to at most now+block so a forged or stale
@@ -5410,8 +5412,22 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
                 events[ean->event_count++] = (time_t) stored_when;
             }
         }
-        loaded++;
     }
+
+    /* init_zone() loads only into a fresh, empty zone. Count distinct nodes
+     * still retained: later allocations can expire/evict earlier restores,
+     * and duplicate records update an existing node rather than add one.
+     * Each lost admission counts once as dropped, even if its key reappears;
+     * failed/unprocessed records were already counted above. */
+    retained = 0;
+    for (q = ngx_queue_head(&zone->sh->queue);
+         q != ngx_queue_sentinel(&zone->sh->queue);
+         q = ngx_queue_next(q))
+    {
+        retained++;
+    }
+    dropped += loaded - retained;
+    loaded = retained;
 
     ngx_shmtx_unlock(&zone->shpool->mutex);
     ngx_free(base);
@@ -5420,7 +5436,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "error_abuse persistence file \"%V\" partially loaded: "
                       "%uD records restored, %uD dropped (insufficient shared "
-                      "memory or truncated file)",
+                      "memory, eviction, expiry or truncated file)",
                       &zone->persist, loaded, dropped);
     } else {
         ngx_log_error(NGX_LOG_INFO, log, 0,
