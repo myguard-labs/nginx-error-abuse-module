@@ -86,7 +86,40 @@ default for every single-version PR job and currently tracks mainline
 deep-pass matrix. Each version has an adjacent SHA-256 pin, and
 `load-versions.sh` validates and exports the file into `$GITHUB_ENV`.
 There is no automatic bump workflow: update the file with
-`compute-versions.sh`, verify the digest, and run the linter.
+`compute-versions.sh`, review the versions and authenticated digests, and run
+changed-file lint. The resolver requires `gpg`, `curl`, `jq`, and `sha256sum`.
+Before deriving each SHA-256 it verifies the exact nginx.org or
+download.angie.software archive against its adjacent `.asc` signature. All
+resolver metadata, archives and signatures require HTTPS, including redirects.
+Any download, key or verification failure leaves `versions.env` unchanged.
+Pinned-hash downloads and warm caches still verify their existing SHA-256 pins.
+
+Release trust anchors are checked in under `.github/scripts/release-keys/`:
+
+| Upstream | Reviewed full primary fingerprint | Official key source |
+| --- | --- | --- |
+| nginx (Roman Arutyunyan) | `43387825DDB1BB97EC36BA5D007C8D7C15D87369` | <https://nginx.org/keys/arut.key> (listed at <https://nginx.org/en/pgp_keys.html>) |
+| Angie signing key | `EB8EAF3D4EF1B1ECF34865A2617AB978CB849A76` | <https://angie.software/keys/angie-signing.gpg.asc> |
+
+The full public keys are stored as binary OpenPGP packets (`.gpg`), decoded
+from the official ASCII armor without changing key material. They were reviewed
+against the official sources on 2026-11-26;
+nginx 1.31.3 and 1.30.4 signatures identify the nginx primary key, and Angie
+1.12.1 identifies signing subkey `D4DF5DF7DDB989180D9C7210D6CEC4C8B65E8484`.
+Verification uses a fresh private keyring, requires a cryptographically valid
+signature bound to the allowed full primary fingerprint, and performs no key
+retrieval. Expired signatures and expired or revoked keys in the pinned material
+are rejected even when GPG reports a valid signature. Review upstream key and
+revocation updates deliberately; an offline pinned key cannot discover a newly
+published revocation. A new signer fails closed until a reviewed change updates
+both the pinned key and fingerprint. Do not substitute a package-repository
+signing key or fetch a key during resolution. The other nginx release authors
+are not
+implicitly trusted.
+
+Run `python3 ci/tools/test_release_provenance.py` for isolated signature,
+transport, hash/cache integrity and unchanged-pin controls. It generates
+throwaway fixture keys and certificates; it never uses real release secrets.
 
 ## Local commands
 

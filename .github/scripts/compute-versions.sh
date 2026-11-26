@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# sync-sha: dec2234912aea677cbd8ccf84ac3229cac6315ba82c363054b30d5ada87c7dba
+# sync-sha: fe12131cbd0926217e751a2ee879ba6205c82e7b83455ab2fcda123e1b2bea25
 # compute-versions.sh -- resolve the latest upstream versions + their sha256 and
-# rewrite .github/versions.env in place. Used by bump.yml (weekly). Prints a
-# short summary of what it resolved to stdout, which bump.yml quotes into the
-# PR body.
+# rewrite .github/versions.env in place after authenticating release archives.
+# Run manually and review the resulting pins; no automatic bump workflow exists.
 #
 # Resolves:
 #   nginx mainline (odd minor) + stable (even minor)  -- nginx.org download page
@@ -16,9 +15,9 @@
 # tag archive here would pin a sha that never matches at build time.
 #
 # Run locally to preview a bump:  bash .github/scripts/compute-versions.sh
-# (it rewrites versions.env; `git diff` to review, `git checkout` to discard).
+# (it rewrites versions.env; use `git diff` to review the candidate).
 #
-# Requires: curl, jq, sha256sum. GITHUB_TOKEN honoured for API rate limits --
+# Requires: curl, jq, sha256sum, gpg. GITHUB_TOKEN honoured for API rate limits --
 # unauthenticated api.github.com from a shared runner IP gets 403-throttled.
 set -euo pipefail
 
@@ -30,8 +29,8 @@ trap 'rm -rf "$tmp"' EXIT
 api() {
   local url="$1"
   # Same resilience budget as fetch-verify.sh: a transient blip or a stalled
-  # connection must retry, not fail the weekly bump job or hang the runner.
-  local -a opts=(-fsSL --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 300)
+  # connection must retry, not fail resolution or hang the runner.
+  local -a opts=(--disable --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 300)
   if [ -n "${GITHUB_TOKEN:-}" ]; then
     curl "${opts[@]}" -H "Authorization: Bearer $GITHUB_TOKEN" "$url"
   else
@@ -41,12 +40,13 @@ api() {
 
 # sha256 of a URL (download to scratch, hash). Fails the job on download error.
 sha_of_url() {
-  local url="$1" out="$tmp/dl.$RANDOM" sha
+  local url="$1" upstream="$2" out="$tmp/dl.$RANDOM" sha result
   # In "-" mode fetch-verify.sh sends progress text to stderr, so stdout is
   # exactly one "SHA  OUTFILE" line. Read the first field directly rather than
   # picking the last line out of mixed output -- an extra stdout line there
   # would otherwise be captured as a digest with no error.
-  read -r sha _ < <(bash "$FV" "$url" - "$out")
+  result="$(bash "$FV" "$url" - "$out" "$upstream")" || return 1
+  read -r sha _ <<< "$result"
   # Validate the shape rather than trusting position. Moving the progress text
   # to stderr fixes today's contamination; this catches the next one, because a
   # non-digest silently written into versions.env would pin every future build
@@ -59,7 +59,7 @@ sha_of_url() {
 }
 
 echo "resolving nginx versions from nginx.org..."
-dl_html="$(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 300 \
+dl_html="$(curl --disable --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 300 \
   https://nginx.org/en/download.html)"
 # nginx numbers mainline with an odd minor and stable with an even one. Take
 # the highest of each rather than trusting page order.
@@ -79,18 +79,18 @@ if ! printf '%s' "$ANGIE" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
   exit 1
 fi
 
-echo "hashing archives..."
-NGX_MAINLINE_SHA="$(sha_of_url "https://nginx.org/download/nginx-${NGX_MAINLINE}.tar.gz")"
-NGX_STABLE_SHA="$(sha_of_url "https://nginx.org/download/nginx-${NGX_STABLE}.tar.gz")"
-ANGIE_SHA="$(sha_of_url "https://download.angie.software/files/angie-${ANGIE}.tar.gz")"
+echo "authenticating and hashing archives..."
+NGX_MAINLINE_SHA="$(sha_of_url "https://nginx.org/download/nginx-${NGX_MAINLINE}.tar.gz" nginx)"
+NGX_STABLE_SHA="$(sha_of_url "https://nginx.org/download/nginx-${NGX_STABLE}.tar.gz" nginx)"
+ANGIE_SHA="$(sha_of_url "https://download.angie.software/files/angie-${ANGIE}.tar.gz" angie)"
 
 cat > "$VERSIONS_FILE" <<EOF
 # Central version + sha256 pins for all CI workflows.
 #
 # SINGLE SOURCE OF TRUTH. Every workflow loads this file into \$GITHUB_ENV as its
-# first step (via .github/scripts/load-versions.sh); the weekly bump.yml job
-# rewrites it and opens a PR. Tarballs are pinned by version string (release
-# archives are immutable) AND verified against the sha256 recorded here, so a
+# first step (via .github/scripts/load-versions.sh). Tarballs are pinned by
+# version string (release archives are immutable) AND verified against the
+# sha256 recorded here, so a
 # compromised or changed upstream archive fails the build instead of being
 # compiled.
 #
@@ -98,7 +98,8 @@ cat > "$VERSIONS_FILE" <<EOF
 # writer (compute-versions.sh) in one file, so a version can no longer move
 # while its digest stays behind.
 #
-# Regenerate with .github/scripts/compute-versions.sh (bump.yml runs it weekly).
+# Regenerate manually with .github/scripts/compute-versions.sh, then review
+# the versions and authenticated digests. No automatic bump workflow exists.
 # Keep KEY=value, no spaces, no quotes -- this file is both \`source\`d by
 # ci/tools/ci-build.sh and \`cat\`d into \$GITHUB_ENV.
 
