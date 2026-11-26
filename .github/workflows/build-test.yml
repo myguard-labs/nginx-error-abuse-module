@@ -1,4 +1,4 @@
-# sync-sha: 4ffa3d0809bec40cc4b2759a52f998651064f62ca93ce6ebfb3ebf9dad2dc774
+# sync-sha: fe3a3306d48af2607480863ec0a1c42c79a6f1ab72a6a51e2acd440e1a5f4e03
 name: Build and Test
 
 env:
@@ -207,6 +207,12 @@ jobs:
                 -o "/tmp/${tu}.o"
             done
           )
+
+      - name: Snapshot retained-count controls
+        env:
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+          CC: ${{ matrix.cc }}
+        run: python3 ci/tools/test_snapshot_retained.py --core ".build/${MATRIX_FLAVOR}-${NGINX_VERSION}-debug" --negative-controls
 
       - name: Build deterministic fault-control modules
         run: |
