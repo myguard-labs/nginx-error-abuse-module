@@ -1183,6 +1183,16 @@ class Nginx:
             return
         if self.process.poll() is None:
             self.process.terminate()
+            if self.single_process:
+                # A signal handled just before epoll_wait can leave nginx's
+                # single-process loop asleep until its next timer (1h in the
+                # snapshot fixtures). Wake our listener so it checks the flag.
+                try:
+                    with socket.create_connection(("127.0.0.1", self.port), 0.25):
+                        pass
+                except OSError:
+                    # The process may already have closed its listener.
+                    pass
             try:
                 self.process.wait(timeout=15)
             except subprocess.TimeoutExpired:
