@@ -428,7 +428,7 @@ static const char ngx_http_error_abuse_redis_record_script[] =
     "local n=redis.call('ZCARD',KEYS[1]) "
     "redis.call('PEXPIRE',KEYS[1],ARGV[4]) "
     "if n>=tonumber(ARGV[2]) then "
-    "local deadline=math.floor((now+ARGV[3])/1000) "
+    "local deadline=math.ceil((now+ARGV[3])/1000) "
     "redis.call('SET',KEYS[2],deadline,'PX',ARGV[3]) "
     "redis.call('DEL',KEYS[1]) return {1,n,deadline} end "
     "return {0,n}";
@@ -3792,6 +3792,12 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
         ctx->blocked_until = (deadline > 0)
                              ? (time_t) deadline
                              : max_deadline;
+        /* A live key outlives a floored seconds deadline by up to ~1 s (older
+         * writers floor; the key TTL is in ms). Never let a live ban carry a
+         * deadline that is already due, or Retry-After would be omitted. */
+        if (deadline > 0 && ctx->blocked_until <= now) {
+            ctx->blocked_until = now + 1;
+        }
         /* Clamp a Redis-provided deadline to now+block (mirrors the snapshot
          * SNAP-CLAMP on load) so a rogue or corrupt block value cannot drive a
          * multi-decade Retry-After or local deadline. */

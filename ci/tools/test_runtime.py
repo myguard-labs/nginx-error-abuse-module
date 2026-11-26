@@ -374,6 +374,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="replay only the bounded malformed-configuration seed corpus",
     )
+    parser.add_argument(
+        "--redis-deadline-ceil-only",
+        action="store_true",
+        help="run only the Redis block deadline round-up control",
+    )
     parser.add_argument("--mixed-eviction-only", action="store_true")
     parser.add_argument("--evict-scan-budget-only", action="store_true")
     parser.add_argument("--oversized-snapshot-only", action="store_true")
@@ -2461,6 +2466,116 @@ def test_redis_auth(
         redis.stop()
 
 
+def test_redis_block_deadline_ceil(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+    redis_binary: pathlib.Path,
+) -> None:
+    """A live Redis ban always carries a future deadline and Retry-After >= 1."""
+    redis = RedisServer(redis_binary, root / "redis-ceil", port + 1)
+    prefix = f"error-abuse-ceil-{os.getpid()}:"
+    server: Nginx | None = None
+    redis.start()
+    try:
+        server = Nginx(
+            binary,
+            module,
+            root / "redis-ceil-nginx",
+            port,
+            runner,
+            True,
+            redis.port,
+            prefix,
+        )
+        server.start()
+        _wait_for_script_loads(redis, 1)
+
+        def seeded(client: str, deadline: int) -> tuple[int, dict[str, str]]:
+            redis.command(
+                "SET",
+                _redis_state_key(prefix, client, "block"),
+                str(deadline),
+                "PX",
+                "30000",
+            )
+            return fetch(port, f"/redis-ok?client={client}")
+
+        # positive: an active ban reports a bounded Retry-After >= 1
+        status, headers = seeded("ceil-active", int(time.time()) + 5)
+        _assert_bounded_retry_after("ceil active", status, headers, 10)
+
+        # boundary: key still live while the stored seconds deadline is due
+        # (== now) or already past (now-1): still blocked, Retry-After is 1
+        for label, delta in (("now", 0), ("past", -1)):
+            status, headers = seeded(f"ceil-{label}", int(time.time()) + delta)
+            _assert_bounded_retry_after(f"ceil {label}", status, headers, 10)
+            if headers.get("retry-after") != "1":
+                raise AssertionError(
+                    f"ceil {label}: expected Retry-After 1, got "
+                    f"{headers.get('retry-after')!r}"
+                )
+
+        # expired: no key means not blocked
+        expect(port, "/redis-ok?client=ceil-expired", 200)
+
+        # Lua path: the record script stores ceil((now_ms+block_ms)/1000)
+        for attempt in range(5):
+            client = f"ceil-record-{attempt}"
+            before_seconds, before_micros = redis.command("TIME").splitlines()
+            before_ms = int(before_seconds) * 1000 + int(before_micros) // 1000
+            t0 = int(time.time() * 1000)
+            for _ in range(3):
+                expect(port, f"/redis-error?client={client}", 404)
+            key = _redis_state_key(prefix, client, "block")
+            _wait_for_redis_value(redis, "1", "EXISTS", key)
+            stored_text, seconds, micros, ttl_text = redis.command(
+                "EVAL",
+                "local t=redis.call('TIME'); "
+                "return {redis.call('GET',KEYS[1]),t[1],t[2],"
+                "redis.call('PTTL',KEYS[1])}",
+                "1",
+                key,
+            ).splitlines()
+            t1 = int(time.time() * 1000)
+            stored, pttl = int(stored_text), int(ttl_text)
+            if pttl <= 0:
+                raise AssertionError(
+                    f"record block key expired or has no expiry: pttl={pttl}"
+                )
+            after_ms = int(seconds) * 1000 + int(micros) // 1000
+            earliest = -(-(before_ms + 10_000) // 1000)
+            latest = -(-(after_ms + 10_000) // 1000)
+            # The script ran between these Redis timestamps. Avoid a second
+            # boundary so that floor and ceil have distinct results throughout.
+            if before_ms % 1000 and after_ms % 1000 and earliest == latest:
+                break
+        else:
+            raise AssertionError("record requests repeatedly crossed a second boundary")
+        expected = earliest
+        if stored != expected:
+            raise AssertionError(
+                f"record deadline {stored} differs from ceil deadline {expected} "
+                f"(before_ms={before_ms}, after_ms={after_ms}, pttl={pttl})"
+            )
+        low = -(-(t0 + 10_000) // 1000)
+        high = -(-(t1 + 10_000) // 1000)
+        if not low <= stored <= high:
+            raise AssertionError(
+                f"record script deadline {stored} outside ceil range [{low}, {high}]"
+            )
+        status, headers = fetch(port, f"/redis-ok?client={client}")
+        _assert_bounded_retry_after("ceil record", status, headers, 10)
+    finally:
+        if server is not None:
+            server.stop()
+        redis.stop()
+    if server is not None:
+        server.assert_clean_logs()
+
+
 def test_redis_state_controls(
     binary: pathlib.Path,
     module: pathlib.Path,
@@ -4286,6 +4401,21 @@ def main() -> int:
                 )
             print(f"OK: {args.deadline_clamp} deadline clamp control")
             return 0
+        if args.redis_deadline_ceil_only:
+            if module is None or not args.redis_server:
+                raise ValueError(
+                    "Redis deadline ceil control requires --module and --redis-server"
+                )
+            test_redis_block_deadline_ceil(
+                binary,
+                module,
+                root,
+                args.runner,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
+            )
+            print("OK: Redis block deadline ceil control")
+            return 0
         if args.redis_state_controls:
             if module is None or not args.redis_server:
                 raise ValueError(
@@ -4345,6 +4475,14 @@ def main() -> int:
                 root,
                 args.runner,
                 args.single_process,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
+            )
+            test_redis_block_deadline_ceil(
+                binary,
+                module,
+                root,
+                args.runner,
                 args.port,
                 pathlib.Path(args.redis_server).absolute(),
             )
