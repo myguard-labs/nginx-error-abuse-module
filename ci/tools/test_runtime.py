@@ -2491,6 +2491,7 @@ def test_redis_block_deadline_ceil(
             prefix,
         )
         server.start()
+        _wait_for_script_loads(redis, 1)
 
         def seeded(client: str, deadline: int) -> tuple[int, dict[str, str]]:
             redis.command(
@@ -2521,24 +2522,49 @@ def test_redis_block_deadline_ceil(
         expect(port, "/redis-ok?client=ceil-expired", 200)
 
         # Lua path: the record script stores ceil((now_ms+block_ms)/1000)
-        client = "ceil-record"
-        t0 = int(time.time() * 1000)
-        for _ in range(3):
-            expect(port, f"/redis-error?client={client}", 404)
-        key = _redis_state_key(prefix, client, "block")
-        _wait_for_redis_value(redis, "1", "EXISTS", key)
-        stored = int(redis.command("GET", key))
-        pttl = int(redis.command("PTTL", key))
-        t1 = int(time.time() * 1000)
+        for attempt in range(5):
+            client = f"ceil-record-{attempt}"
+            before_seconds, before_micros = redis.command("TIME").splitlines()
+            before_ms = int(before_seconds) * 1000 + int(before_micros) // 1000
+            t0 = int(time.time() * 1000)
+            for _ in range(3):
+                expect(port, f"/redis-error?client={client}", 404)
+            key = _redis_state_key(prefix, client, "block")
+            _wait_for_redis_value(redis, "1", "EXISTS", key)
+            stored_text, seconds, micros, ttl_text = redis.command(
+                "EVAL",
+                "local t=redis.call('TIME'); "
+                "return {redis.call('GET',KEYS[1]),t[1],t[2],"
+                "redis.call('PTTL',KEYS[1])}",
+                "1",
+                key,
+            ).splitlines()
+            t1 = int(time.time() * 1000)
+            stored, pttl = int(stored_text), int(ttl_text)
+            if pttl <= 0:
+                raise AssertionError(
+                    f"record block key expired or has no expiry: pttl={pttl}"
+                )
+            after_ms = int(seconds) * 1000 + int(micros) // 1000
+            earliest = -(-(before_ms + 10_000) // 1000)
+            latest = -(-(after_ms + 10_000) // 1000)
+            # The script ran between these Redis timestamps. Avoid a second
+            # boundary so that floor and ceil have distinct results throughout.
+            if before_ms % 1000 and after_ms % 1000 and earliest == latest:
+                break
+        else:
+            raise AssertionError("record requests repeatedly crossed a second boundary")
+        expected = earliest
+        if stored != expected:
+            raise AssertionError(
+                f"record deadline {stored} differs from ceil deadline {expected} "
+                f"(before_ms={before_ms}, after_ms={after_ms}, pttl={pttl})"
+            )
         low = -(-(t0 + 10_000) // 1000)
         high = -(-(t1 + 10_000) // 1000)
         if not low <= stored <= high:
             raise AssertionError(
                 f"record script deadline {stored} outside ceil range [{low}, {high}]"
-            )
-        if stored * 1000 < t0 + pttl:
-            raise AssertionError(
-                f"record deadline {stored} earlier than key expiry (pttl={pttl})"
             )
         status, headers = fetch(port, f"/redis-ok?client={client}")
         _assert_bounded_retry_after("ceil record", status, headers, 10)
