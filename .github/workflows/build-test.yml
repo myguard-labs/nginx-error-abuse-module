@@ -1,4 +1,4 @@
-# sync-sha: 8620713d4a09c5ae6337f93e1db8e99255908f2a42316eae04d293b373203cc4
+# sync-sha: 4ffa3d0809bec40cc4b2759a52f998651064f62ca93ce6ebfb3ebf9dad2dc774
 name: Build and Test
 
 env:
@@ -51,7 +51,8 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cppcheck libclang-rt-dev libhiredis-dev python3-yaml shellcheck
+          sudo apt-get install -y clang cppcheck libclang-rt-dev libhiredis-dev \
+            python3-yaml shellcheck curl gnupg jq openssl
 
       - name: Validate scripts and source
         run: |
@@ -63,6 +64,7 @@ jobs:
           shellcheck ci/tools/ci-build.sh ci/tools/build-identity.sh ci/tools/ci-build-artifact.sh ci/tools/test-ci-build-source.sh ci/tools/test-ci-build-cache.sh ci/tools/test-ci-build-cache-containment.sh ci/tools/test-ci-build-artifact.sh
           bash ci/tools/test-ci-build-cache-containment.sh
           bash ci/tools/test-ci-build-artifact.sh
+          python3 ci/tools/test_release_provenance.py
           python3 ci/tools/test_ci_cache_policy.py
           python3 ci/tools/check_ci_graph.py
           python3 ci/tools/test_ci_graph.py
