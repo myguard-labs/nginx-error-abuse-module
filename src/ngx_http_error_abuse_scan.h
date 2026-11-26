@@ -145,8 +145,9 @@ u_char *ngx_http_error_abuse_redis_key_write(u_char *buf,
  * cannot wrap size_t. The module's only caller reads key_len from
  * ngx_http_error_abuse_node_t.key_len (a uint16_t, bounded by
  * NGX_HTTP_ERROR_ABUSE_DIGEST_LEN in practice) and event_count from
- * ean->event_count (a uint16_t, bounded by the configured threshold), so this
- * holds by construction there. Stated rather than checked for the same reason
+ * ean->event_count (an ngx_uint_t bounded by zone->threshold, which
+ * configuration caps at 1024), so this holds by construction there. Stated
+ * rather than checked for the same reason
  * redis_key_len states it: a size_t return has no error value, and the
  * allocation this guards cannot survive the wrap anyway.
  */

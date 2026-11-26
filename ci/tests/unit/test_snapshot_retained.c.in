@@ -1,0 +1,215 @@
+/*
+ * Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * The runner inserts production node layout, allocation/eviction helpers, and
+ * the complete post-validation restore loop and report. Only slab capacity,
+ * clock, mutex and log boundaries are substituted. Real nginx queues/rbtree
+ * and production record codecs exercise duplicates, expiration and eviction.
+ * File validation/authentication are outside this accounting unit's scope.
+ */
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include "ngx_http_error_abuse_scan.h"
+#include "ngx_http_error_abuse_time.h"
+
+/* NODE_LAYOUT */
+
+typedef struct {
+    ngx_rbtree_t rbtree;
+    ngx_rbtree_node_t sentinel;
+    ngx_queue_t queue;
+    struct { unsigned evictions; } stats;
+} test_shctx_t;
+
+typedef struct {
+    test_shctx_t *sh;
+    ngx_slab_pool_t *shpool;
+    ngx_uint_t threshold;
+    time_t interval, block, inactive;
+    ngx_str_t persist;
+} ngx_http_error_abuse_zone_t;
+
+#define NGX_HTTP_ERROR_ABUSE_EVICT_SCAN_LIMIT 64
+static unsigned capacity, allocated, attempts, fail_after;
+static unsigned reported_loaded, reported_dropped, reports, report_level;
+static unsigned lock_depth;
+
+static void
+require(int ok, const char *message)
+{
+    if (!ok) {
+        fprintf(stderr, "FAIL: %s\n", message);
+        exit(1);
+    }
+}
+
+static void *
+test_alloc(ngx_slab_pool_t *pool, size_t size)
+{
+    (void) pool;
+    require(lock_depth == 1, "allocation outside restore lock");
+    if (attempts++ >= fail_after || allocated == capacity) {
+        return NULL;
+    }
+    void *p = calloc(1, size);
+    require(p != NULL, "fixture allocation failed");
+    allocated++;
+    return p;
+}
+
+static void
+test_free(ngx_slab_pool_t *pool, void *p)
+{
+    (void) pool;
+    require(lock_depth == 1 && allocated > 0, "invalid node release");
+    allocated--;
+    free(p);
+}
+
+static void
+test_log(ngx_uint_t level, ngx_log_t *log, int err, const char *fmt, ...)
+{
+    va_list args;
+    (void) log;
+    (void) err;
+    require(lock_depth == 0, "report emitted while locked");
+    require(strstr(fmt, "records") != NULL, "unexpected restore log");
+    va_start(args, fmt);
+    (void) va_arg(args, ngx_str_t *);
+    reported_loaded = va_arg(args, uint32_t);
+    reported_dropped = strstr(fmt, "partially loaded") != NULL
+                       ? va_arg(args, uint32_t) : 0;
+    va_end(args);
+    report_level = (unsigned) level;
+    reports++;
+}
+
+#undef ngx_time
+#define ngx_time() ((time_t) 1000)
+#undef ngx_shmtx_lock
+#define ngx_shmtx_lock(m) do { require(lock_depth == 0, "nested lock"); lock_depth++; } while (0)
+#undef ngx_shmtx_unlock
+#define ngx_shmtx_unlock(m) do { require(lock_depth == 1, "unbalanced lock"); lock_depth--; } while (0)
+#undef ngx_log_error
+#define ngx_log_error test_log
+#define ngx_slab_alloc_locked test_alloc
+#define ngx_slab_free_locked test_free
+
+/* NODE_HELPERS */
+
+static ngx_int_t
+test_restore(ngx_http_error_abuse_zone_t *zone, u_char *base, size_t size,
+    uint32_t f_records)
+{
+    u_char *p = base, *last = base + size;
+    uint32_t hash, record_index, loaded, retained, dropped;
+    uint16_t rec_key_len, rec_event_count;
+    int64_t rec_blocked, rec_seen, stored_when;
+    ngx_uint_t i;
+    time_t now, *events;
+    ngx_str_t key;
+    ngx_queue_t *q;
+    ngx_http_error_abuse_node_t *ean;
+    ngx_log_t *log = NULL;
+
+    /* RESTORE_BODY */
+}
+
+int
+main(int argc, char **argv)
+{
+    ngx_http_error_abuse_zone_t zone;
+    test_shctx_t shared;
+    ngx_slab_pool_t pool;
+    ngx_queue_t *q;
+    ngx_http_error_abuse_node_t *ean;
+    unsigned expected_loaded, expected_dropped, expected_nodes, index;
+    unsigned count = 3, ban = 0, stale = 0;
+    const char *keys = "ABC";
+    u_char *payload, *p;
+    size_t size;
+
+    if (argc != 2) { return 2; }
+    capacity = 3;
+    fail_after = UINT_MAX;
+    expected_loaded = 3;
+    expected_dropped = 0;
+    if (strcmp(argv[1], "constrained") == 0) {
+        capacity = 2; expected_loaded = 2; expected_dropped = 1;
+    } else if (strcmp(argv[1], "duplicates") == 0) {
+        keys = "AAB"; expected_loaded = 2;
+    } else if (strcmp(argv[1], "readmitted") == 0) {
+        keys = "ABA"; capacity = 1; expected_loaded = 1; expected_dropped = 2;
+    } else if (strcmp(argv[1], "protected-error") == 0) {
+        capacity = 1; ban = 1; expected_loaded = 1; expected_dropped = 2;
+    } else if (strcmp(argv[1], "first-error") == 0) {
+        fail_after = 0; expected_loaded = 0; expected_dropped = 3;
+    } else if (strcmp(argv[1], "evict-error") == 0) {
+        fail_after = 1; expected_loaded = 0; expected_dropped = 3;
+    } else if (strcmp(argv[1], "duplicate-error") == 0) {
+        keys = "AAB"; capacity = 1; ban = 1;
+        expected_loaded = 1; expected_dropped = 1;
+    } else if (strcmp(argv[1], "expired") == 0) {
+        capacity = 1; stale = 1; expected_loaded = 1; expected_dropped = 2;
+    } else if (strcmp(argv[1], "inactive-records") == 0) {
+        stale = 2; expected_loaded = 0;
+    } else if (strcmp(argv[1], "empty") == 0) {
+        count = 0; expected_loaded = 0;
+    } else {
+        require(strcmp(argv[1], "sufficient") == 0, "unknown case");
+    }
+    memset(&zone, 0, sizeof(zone));
+    memset(&shared, 0, sizeof(shared));
+    memset(&pool, 0, sizeof(pool));
+    zone.sh = &shared;
+    zone.shpool = &pool;
+    zone.threshold = 3;
+    zone.interval = 60;
+    zone.block = 30;
+    zone.inactive = 60;
+    ngx_rbtree_init(&shared.rbtree, &shared.sentinel,
+                   ngx_http_error_abuse_rbtree_insert);
+    ngx_queue_init(&shared.queue);
+    size = count * (NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN
+                   + NGX_HTTP_ERROR_ABUSE_DIGEST_LEN + (stale == 2 ? 0 : 8));
+    payload = malloc(size == 0 ? 1 : size);
+    require(payload != NULL, "fixture payload allocation failed");
+    p = payload;
+    for (index = 0; index < count; index++) {
+        p = ngx_http_error_abuse_put_u16(p, NGX_HTTP_ERROR_ABUSE_DIGEST_LEN);
+        p = ngx_http_error_abuse_put_u16(p, stale == 2 ? 0 : 1);
+        p = ngx_http_error_abuse_put_u64(p, ban ? 1030 : 0);
+        p = ngx_http_error_abuse_put_u64(p, stale ? 1 : 1000);
+        memset(p, keys[index], NGX_HTTP_ERROR_ABUSE_DIGEST_LEN);
+        p += NGX_HTTP_ERROR_ABUSE_DIGEST_LEN;
+        if (stale != 2) { p = ngx_http_error_abuse_put_u64(p, 1000); }
+    }
+    require(ngx_http_error_abuse_validate_snapshot(payload, p, count, 3) == NGX_OK,
+            "invalid fixture snapshot");
+    require(test_restore(&zone, payload, size, count) == NGX_OK,
+            "restore failed");
+    require(reports == 1, "expected one restore report");
+    require(reported_loaded == expected_loaded,
+            "restored count differs from retained identities");
+    require(reported_dropped == expected_dropped,
+            "dropped count double-counts or misses lost admissions/errors");
+    require(report_level == (expected_dropped ? NGX_LOG_WARN : NGX_LOG_INFO),
+            "restore report severity mismatch");
+    expected_nodes = 0;
+    lock_depth = 1;
+    while (!ngx_queue_empty(&shared.queue)) {
+        q = ngx_queue_head(&shared.queue);
+        ean = ngx_queue_data(q, ngx_http_error_abuse_node_t, queue);
+        require(ean->event_count == 1, "retained event was lost or duplicated");
+        require(ngx_http_error_abuse_events(ean)[0] == 1000,
+                "retained event content changed");
+        expected_nodes++;
+        ngx_http_error_abuse_delete(&zone, ean);
+    }
+    require(expected_nodes == expected_loaded && allocated == 0,
+            "reported count differs from actual queue");
+    printf("OK: %s restored=%u dropped=%u\n", argv[1], reported_loaded,
+           reported_dropped);
+    return 0;
+}

@@ -1,12 +1,104 @@
 #!/usr/bin/env python3
-"""Controls for the Redis lifecycle test's completion and ordering oracles."""
+"""Controls for runtime shutdown and Redis completion/ordering oracles."""
 
 import pathlib
+import signal
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
-from test_runtime import LifecycleRedisServer, assert_redis_cleanup_completion
+from test_runtime import LifecycleRedisServer, Nginx, assert_redis_cleanup_completion
+
+
+class NginxShutdown(unittest.TestCase):
+    def fixture(self, root: pathlib.Path, single: bool = True) -> Nginx:
+        nginx = Nginx(pathlib.Path("nginx"), None, root, 18962, "", single)
+        nginx.process = mock.Mock()
+        nginx.process.poll.return_value = None
+        nginx.process.returncode = 0
+        return nginx
+
+    @mock.patch("test_runtime.socket.create_connection")
+    def test_single_process_wakes_after_term_before_wait(
+        self, connect: mock.Mock
+    ) -> None:
+        nginx = self.fixture(pathlib.Path("unused"))
+        process = nginx.process
+        order = mock.Mock()
+        order.attach_mock(process.terminate, "terminate")
+        order.attach_mock(connect, "connect")
+        order.attach_mock(process.wait, "wait")
+        nginx.stop()
+        self.assertEqual(order.mock_calls[0], mock.call.terminate())
+        self.assertEqual(
+            order.mock_calls[1], mock.call.connect(("127.0.0.1", 18962), 0.25)
+        )
+        self.assertEqual(order.mock_calls[-1], mock.call.wait(timeout=15))
+        connect.return_value.__exit__.assert_called_once_with(None, None, None)
+        process.kill.assert_not_called()
+        self.assertIsNone(nginx.process)
+
+    @mock.patch("test_runtime.socket.create_connection")
+    def test_closed_listener_still_waits(self, connect: mock.Mock) -> None:
+        connect.side_effect = ConnectionRefusedError("listener already closed")
+        nginx = self.fixture(pathlib.Path("unused"))
+        process = nginx.process
+        nginx.stop()
+        process.wait.assert_called_once_with(timeout=15)
+        process.kill.assert_not_called()
+
+    @mock.patch("test_runtime.socket.create_connection")
+    def test_master_or_exited_process_does_not_wake(self, connect: mock.Mock) -> None:
+        nginx = self.fixture(pathlib.Path("unused"), single=False)
+        process = nginx.process
+        nginx.stop()
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=15)
+        nginx = self.fixture(pathlib.Path("unused"))
+        process = nginx.process
+        process.poll.return_value = 0
+        nginx.stop()
+        process.terminate.assert_not_called()
+        process.wait.assert_not_called()
+        nginx.stop()  # Already stopped is also a no-op.
+        connect.assert_not_called()
+
+    @mock.patch("test_runtime.socket.create_connection")
+    def test_crash_and_timeout_remain_failures(self, _connect: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for rc in (1, -signal.SIGSEGV, -signal.SIGKILL):
+                with self.subTest(rc=rc):
+                    nginx = self.fixture(root)
+                    process = nginx.process
+                    process.returncode = rc
+                    nginx.output_path.write_text("crash diagnostic", encoding="ascii")
+                    if rc == -signal.SIGKILL:
+                        process.wait.side_effect = [
+                            subprocess.TimeoutExpired("nginx", 15),
+                            rc,
+                        ]
+                    with self.assertRaisesRegex(RuntimeError, "crash diagnostic"):
+                        nginx.stop()
+                    if rc == -signal.SIGKILL:
+                        process.kill.assert_called_once()
+                        self.assertEqual(
+                            process.wait.call_args_list,
+                            [mock.call(timeout=15), mock.call(timeout=5)],
+                        )
+                    self.assertIsNone(nginx.process)
+
+    @mock.patch("test_runtime.socket.create_connection")
+    def test_clean_exit_does_not_hide_sanitizer_output(
+        self, _connect: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            nginx = self.fixture(pathlib.Path(directory))
+            nginx.output_path.write_text("AddressSanitizer: injected", encoding="ascii")
+            nginx.stop()
+            with self.assertRaisesRegex(AssertionError, "AddressSanitizer"):
+                nginx.assert_clean_logs()
 
 
 class ReplyCompletion(unittest.TestCase):
