@@ -6,9 +6,9 @@ run_tests();
 
 __DATA__
 
-=== TEST 1: block after configured error threshold
+=== TEST 1: omitted key uses the default client identity
 --- http_config
-    error_abuse_zone zone=test:1m key=$binary_remote_addr
+    error_abuse_zone zone=test:1m
                      statuses=403,404 interval=10s threshold=3 block=30s;
 --- config
     location = /missing {
@@ -458,3 +458,49 @@ canary32zonepass
     }
 --- must_die
 --- error_log: unknown error_abuse zone "nosuch"
+
+=== TEST 34: empty key is rejected
+--- http_config
+    error_abuse_zone zone=test34:1m key=;
+--- config
+    location = /ok { empty_gif; }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "key="
+
+=== TEST 35: quoted empty key is rejected
+--- http_config
+    error_abuse_zone zone=test35:1m "key=";
+--- config
+    location = /ok { empty_gif; }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "key="
+
+=== TEST 36: one-byte literal key remains valid
+--- http_config
+    error_abuse_zone zone=test36:1m key=x statuses=404 threshold=1;
+--- config
+    location = /missing { error_abuse zone=test36; return 404; }
+    location = /ok { error_abuse zone=test36; empty_gif; }
+--- pipelined_requests eval
+["GET /missing", "GET /ok"]
+--- error_code eval
+[404, 429]
+
+=== TEST 37: malformed key expression remains invalid
+--- http_config
+    error_abuse_zone zone=test37:1m key=${};
+--- config
+    location = /ok { empty_gif; }
+--- must_die
+--- error_log: invalid variable name
+
+=== TEST 38: valid key expression preserves empty request values
+--- http_config
+    error_abuse_zone zone=test38:1m key=$arg_id statuses=404 threshold=1;
+--- config
+    location = /missing { error_abuse zone=test38; return 404; }
+    location = /ok { error_abuse zone=test38; empty_gif; }
+--- pipelined_requests eval
+["GET /missing", "GET /ok", "GET /missing?id=a", "GET /ok?id=a", "GET /ok?id=b"]
+--- error_code eval
+[404, 200, 404, 429, 200]
