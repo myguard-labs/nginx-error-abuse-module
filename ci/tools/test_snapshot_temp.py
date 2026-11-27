@@ -48,16 +48,20 @@ def main():
         "ngx_http_error_abuse_platform_create_temp(tmp, log)",
         "paused_create(tmp, log)",
     )
+    final = function("ngx_http_error_abuse_save_final")
+    assert "ngx_http_error_abuse_save_final(zones[i], cycle->log);" in function(
+        "ngx_http_error_abuse_exit_process"
+    ), "shutdown retry helper is not called"
     template = (ROOT / "ci/tests/unit/test_snapshot_temp.c.in").read_text()
     with tempfile.TemporaryDirectory(prefix="snapshot-temp-") as directory:
         build = pathlib.Path(directory)
 
-        def compile_body(body, label):
+        def compile_body(body, label, final_body=final):
             generated = build / (label + ".c")
             generated.write_text(
-                template.replace("/* PRODUCTION_HELPERS */", body).replace(
-                    "/* PRODUCTION_WRITER */", writer
-                )
+                template.replace("/* PRODUCTION_HELPERS */", body)
+                .replace("/* PRODUCTION_WRITER */", writer)
+                .replace("/* PRODUCTION_FINAL */", final_body)
             )
             binary = build / label
             command = [
@@ -94,7 +98,11 @@ def main():
                 check=False,
                 env={**os.environ, **env},
             )
-            print(f"exit={result.returncode}", flush=True)
+            print(
+                f"exit={result.returncode} {result.stdout.decode().strip()}", flush=True
+            )
+            if result.returncode:
+                print(result.stderr.decode().strip(), flush=True)
             return result.returncode
 
         def initial_race(binary, path):
@@ -146,7 +154,31 @@ def main():
                 legacy = parent / "state.tmp.1.deadbeef"
                 legacy.write_bytes(b"unrelated legacy")
                 path.write_bytes(b"old snapshot")
-                if case in ("marker-write-error", "marker-short-error"):
+                if case.startswith("shutdown-"):
+                    env = {"EA_FINAL": "busy"}
+                    if case in ("shutdown-release", "shutdown-last-retry"):
+                        env["EA_RELEASE_AFTER"] = (
+                            "2" if case == "shutdown-release" else "10"
+                        )
+                    elif case == "shutdown-immediate":
+                        env = {"EA_FINAL": "success"}
+                    elif case == "shutdown-error":
+                        env = {"EA_FINAL": "error", "EA_SAVE_ERROR": "1"}
+                    elif case == "shutdown-invalid":
+                        namespace.mkdir(mode=0o700)
+                        (namespace / "owner").write_bytes(b"x" * len(MAGIC))
+                        (namespace / "owner").chmod(0o600)
+                        env = {"EA_FINAL": "invalid"}
+                    assert run(binary, path, **env) == 0, (
+                        "shutdown: retry, error, or bound contract failed"
+                    )
+                    saved = (
+                        b"new snapshot"
+                        if "EA_RELEASE_AFTER" in env or case == "shutdown-immediate"
+                        else b"old snapshot"
+                    )
+                    assert path.read_bytes() == saved, "shutdown snapshot incorrect"
+                elif case in ("marker-write-error", "marker-short-error"):
                     failure = "zero" if case == "marker-write-error" else "partial"
                     assert run(binary, path, EA_MARKER_WRITE_FAIL=failure) == 1
                     assert path.read_bytes() == b"old snapshot"
@@ -260,7 +292,12 @@ def main():
                         assert not slot.exists()
                         assert unrelated.read_bytes() == b"keep"
                 assert legacy.read_bytes() == b"unrelated legacy", "legacy file changed"
-                if case != "slot-directory":
+                if case not in (
+                    "slot-directory",
+                    "shutdown-busy",
+                    "shutdown-invalid",
+                    "shutdown-error",
+                ):
                     assert path.read_bytes() == b"new snapshot", "new snapshot missing"
                 print(f"OK: {case}", flush=True)
 
@@ -272,6 +309,12 @@ def main():
             "same-process",
             "interrupted",
             "concurrent",
+            "shutdown-immediate",
+            "shutdown-release",
+            "shutdown-last-retry",
+            "shutdown-busy",
+            "shutdown-invalid",
+            "shutdown-error",
             "owned-stale",
             "invalid",
             "partial",
@@ -283,6 +326,69 @@ def main():
             "directory-symlink",
             "slot-directory",
         )
+        win_source = (ROOT / "src/ngx_http_error_abuse_win32.c").read_text()
+        start = win_source.index("ngx_fd_t\nngx_http_error_abuse_win32_temp_lease(")
+        win_lease = win_source[start : win_source.index("\n}\n", start) + 3]
+        win_template = (
+            ROOT / "ci/tests/unit/test_snapshot_temp_win32.c.in"
+        ).read_text()
+        win_variants = [("green", win_lease, None)]
+        if args.negative_controls:
+            win_variants += [
+                (
+                    "busy-status",
+                    win_lease.replace("*status = NGX_AGAIN;", "*status = NGX_ERROR;"),
+                    "2",
+                ),
+                (
+                    "directory-log",
+                    win_lease.replace(
+                        "ngx_log_error(NGX_LOG_ERR", "if (0) ngx_log_error(NGX_LOG_ERR"
+                    ),
+                    "1",
+                ),
+            ]
+        for label, body, red_case in win_variants:
+            generated = build / ("windows-" + label + ".c")
+            generated.write_text(
+                win_template.replace("/* PRODUCTION_WINDOWS_LEASE */", body)
+            )
+            binary = build / ("windows-" + label)
+            command = [
+                *shlex.split(os.environ.get("CC", "cc")),
+                "-std=c11",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                str(generated),
+                "-o",
+                str(binary),
+            ]
+            print(shlex.join(command), flush=True)
+            subprocess.run(command, check=True)
+            info = binary.stat()
+            print(
+                f"binary={binary} mtime_ns={info.st_mtime_ns} size={info.st_size} "
+                f"sha256={hashlib.sha256(binary.read_bytes()).hexdigest()}",
+                flush=True,
+            )
+            for case in [red_case] if red_case else map(str, range(7)):
+                result = subprocess.run(
+                    [str(binary), case], capture_output=True, check=False
+                )
+                if red_case:
+                    assert (
+                        result.returncode == 3
+                        and b"Windows lease error classification" in result.stderr
+                    )
+                    print(
+                        f"OBSERVED RED: windows-{label}: {result.stderr.decode().strip()}",
+                        flush=True,
+                    )
+                else:
+                    assert result.returncode == 0, result.stderr.decode()
+                    print(f"OK: windows-lease-{case}", flush=True)
         binary = compile_body(helpers, "green")
         for case in cases:
             check(binary, case)
@@ -351,6 +457,52 @@ def main():
                 except AssertionError as error:
                     assert str(error) == message, str(error)
                     print(f"OBSERVED RED: {case}: {error}", flush=True)
+                else:
+                    raise AssertionError(label + ": mutation survived")
+            for label, old, new, case in (
+                (
+                    "busy-status",
+                    "*status = NGX_AGAIN;",
+                    "*status = NGX_ERROR;",
+                    "shutdown-release",
+                ),
+                (
+                    "invalid-retry",
+                    "*status = NGX_ERROR;",
+                    "*status = NGX_AGAIN;",
+                    "shutdown-invalid",
+                ),
+            ):
+                assert old in helpers, label + ": mutation site changed"
+                mutant = compile_body(helpers.replace(old, new), label)
+                try:
+                    check(mutant, case)
+                except AssertionError as error:
+                    assert (
+                        str(error) == "shutdown: retry, error, or bound contract failed"
+                    )
+                    print(f"OBSERVED RED: {label}: {error}", flush=True)
+                else:
+                    raise AssertionError(label + ": mutation survived")
+            for label, old, new, case in (
+                (
+                    "final-no-retry",
+                    "rc != NGX_AGAIN || attempt == 10",
+                    "attempt == 0",
+                    "shutdown-release",
+                ),
+                ("final-bound", "attempt == 10", "attempt == 9", "shutdown-last-retry"),
+                ("final-no-error", "if (rc != NGX_OK)", "if (0)", "shutdown-busy"),
+            ):
+                assert old in final, label + ": mutation site changed"
+                mutant = compile_body(helpers, label, final.replace(old, new))
+                try:
+                    check(mutant, case)
+                except AssertionError as error:
+                    assert (
+                        str(error) == "shutdown: retry, error, or bound contract failed"
+                    )
+                    print(f"OBSERVED RED: {label}: {error}", flush=True)
                 else:
                     raise AssertionError(label + ": mutation survived")
             restored = compile_body(helpers, "restored")

@@ -303,7 +303,7 @@ ngx_http_error_abuse_win32_socket_readable(ngx_socket_t fd, ngx_log_t *log)
  */
 ngx_fd_t
 ngx_http_error_abuse_win32_temp_lease(u_char *directory, u_char *owner,
-    ngx_uint_t *fresh, ngx_log_t *log)
+    ngx_uint_t *fresh, ngx_int_t *status, ngx_log_t *log)
 {
     DWORD                       attrs, err;
     HANDLE                      fd;
@@ -317,6 +317,7 @@ ngx_http_error_abuse_win32_temp_lease(u_char *directory, u_char *owner,
     descriptor = NULL;
     fd = NGX_INVALID_FILE;
     *fresh = 0;
+    *status = NGX_ERROR;
     if (dir == NULL || path == NULL) {
         goto done;
     }
@@ -330,6 +331,8 @@ ngx_http_error_abuse_win32_temp_lease(u_char *directory, u_char *owner,
     sa.bInheritHandle = FALSE;
     *fresh = CreateDirectoryW(dir, &sa) != 0;
     if (!*fresh && GetLastError() != ERROR_ALREADY_EXISTS) {
+        ngx_log_error(NGX_LOG_ERR, log, GetLastError(),
+                      "CreateDirectory() \"%s\" failed", directory);
         goto done;
     }
     attrs = GetFileAttributesW(dir);
@@ -343,6 +346,9 @@ ngx_http_error_abuse_win32_temp_lease(u_char *directory, u_char *owner,
                      FILE_SHARE_DELETE, &sa,
                      *fresh ? CREATE_NEW : OPEN_EXISTING,
                      FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (fd == NGX_INVALID_FILE && GetLastError() == ERROR_SHARING_VIOLATION) {
+        *status = NGX_AGAIN;
+    }
     if (fd != NGX_INVALID_FILE
         && (!GetFileInformationByHandle(fd, &info)
             || (info.dwFileAttributes

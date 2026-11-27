@@ -24,6 +24,7 @@ typedef struct { size_t len; u_char *data; } ngx_str_t;
 #define NGX_HTTP_ERROR_ABUSE_HAVE_FLOCK 1
 #define NGX_OK 0
 #define NGX_ERROR (-1)
+#define NGX_AGAIN (-2)
 #define NGX_INVALID_FILE (-1)
 #define NGX_FILE_ERROR (-1)
 #define NGX_FILE_RDWR O_RDWR
@@ -32,6 +33,7 @@ typedef struct { size_t len; u_char *data; } ngx_str_t;
 #define NGX_EEXIST EEXIST
 #define NGX_ENOENT ENOENT
 #define NGX_EINTR EINTR
+#define NGX_EAGAIN EAGAIN
 #define NGX_LOG_ERR 3
 #define NGX_LOG_WARN 4
 #define NGX_MAX_PATH 4096
@@ -56,7 +58,23 @@ typedef struct { size_t len; u_char *data; } ngx_str_t;
 #define ngx_write_fd test_write
 #define ngx_delete_file(path) unlink((char *) path)
 #define ngx_rename_file(a, b) rename((char *) a, (char *) b)
-#define ngx_log_error(...) ((void) 0)
+static int final_errors, attempts, sleeps, held_lease = -1;
+static void test_log(const char *format, ...)
+{
+    if (strstr(format, "final snapshot save failed") != NULL) { final_errors++; }
+}
+#define ngx_log_error(level, log, err, ...) test_log(__VA_ARGS__)
+static void ngx_msleep(int delay)
+{
+    const char *release = getenv("EA_RELEASE_AFTER");
+    if (delay != 10) { abort(); }
+    sleeps++;
+    if (release != NULL && sleeps == atoi(release)) {
+        close(held_lease);
+        held_lease = -1;
+    }
+}
+typedef struct { ngx_str_t persist; } ngx_http_error_abuse_zone_t;
 
 static u_char *
 ngx_sprintf(u_char *out, const char *format, ngx_str_t *path)
@@ -150,22 +168,62 @@ paused_create(u_char *path, ngx_log_t *log)
 
 /* PRODUCTION_WRITER */
 
+static ngx_int_t
+ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
+{
+    attempts++;
+    if (getenv("EA_SAVE_ERROR") != NULL) { return NGX_ERROR; }
+    return ngx_http_error_abuse_write_file((u_char *) "new snapshot", 12,
+                                           &zone->persist, log);
+}
+
+/* PRODUCTION_FINAL */
+
 int main(int argc, char **argv)
 {
     ngx_str_t path;
     if (argc != 2) { return 2; }
     path.data = (u_char *) argv[1];
     path.len = strlen(argv[1]);
+    if (getenv("EA_FINAL") != NULL) {
+        u_char temporary[4096];
+        ngx_int_t status;
+        ngx_http_error_abuse_zone_t zone = {path};
+        const char *release = getenv("EA_RELEASE_AFTER");
+        int expected = release != NULL ? atoi(release) + 1 : 11;
+        if (strcmp(getenv("EA_FINAL"), "busy") == 0) {
+            held_lease = ngx_http_error_abuse_prepare_temp(&path, temporary,
+                                                          &status, NULL);
+            if (held_lease == -1) { return 2; }
+        } else { expected = 1; }
+        ngx_http_error_abuse_save_final(&zone, NULL);
+        if (held_lease != -1) { close(held_lease); }
+        printf("attempts=%d sleeps=%d final_errors=%d\n", attempts, sleeps,
+               final_errors);
+        if (attempts != expected || sleeps != expected - 1) {
+            fputs("FAIL: shutdown retry attempts or bound incorrect\n", stderr);
+            return 3;
+        }
+        if (final_errors != (release == NULL
+            && strcmp(getenv("EA_FINAL"), "success") != 0))
+        {
+            fputs("FAIL: shutdown final failure diagnostic incorrect\n", stderr);
+            return 3;
+        }
+        return 0;
+    }
     if (getenv("EA_SAME_PROCESS") != NULL) {
         u_char temporary[4096];
         int fd, lease;
-        lease = ngx_http_error_abuse_prepare_temp(&path, temporary, NULL);
+        ngx_int_t status;
+        lease = ngx_http_error_abuse_prepare_temp(&path, temporary, &status,
+                                                  NULL);
         if (lease == -1) { return 2; }
         fd = ngx_http_error_abuse_platform_create_temp(temporary, NULL);
         if (fd == -1) { close(lease); return 2; }
         close(fd);
         if (ngx_http_error_abuse_write_file((u_char *) "other", 5,
-                                            &path, NULL) == NGX_OK
+                                            &path, NULL) != NGX_AGAIN
             || access((char *) temporary, F_OK) != 0)
         {
             close(lease);

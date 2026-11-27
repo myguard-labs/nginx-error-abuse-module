@@ -4594,6 +4594,29 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
     return NGX_OK;
 }
 
+/* Keep periodic writes nonblocking; only shutdown waits briefly for a peer.
+ * Invalid ownership and I/O errors are permanent for this attempt. */
+static void
+ngx_http_error_abuse_save_final(ngx_http_error_abuse_zone_t *zone,
+    ngx_log_t *log)
+{
+    ngx_uint_t  attempt;
+    ngx_int_t   rc;
+
+    for (attempt = 0; /* void */; attempt++) {
+        rc = ngx_http_error_abuse_save(zone, log);
+        if (rc != NGX_AGAIN || attempt == 10) {
+            break;
+        }
+        ngx_msleep(10);
+    }
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "error_abuse: final snapshot save failed for \"%V\"",
+                      &zone->persist);
+    }
+}
+
 static void
 ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
 {
@@ -4640,7 +4663,7 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
                 continue;
             }
 #endif
-            (void) ngx_http_error_abuse_save(zones[i], cycle->log);
+            ngx_http_error_abuse_save_final(zones[i], cycle->log);
             /* Release the reused serialize buffer (the thread pool has already
              * been drained by its own earlier exit handler, so no in-flight
              * write still references it). */
@@ -5052,15 +5075,17 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
  * same worker delete one another's active slot. */
 static ngx_fd_t
 ngx_http_error_abuse_temp_lease(u_char *directory, u_char *owner,
-    ngx_uint_t *fresh, ngx_log_t *log)
+    ngx_uint_t *fresh, ngx_int_t *status, ngx_log_t *log)
 {
 #if (NGX_WIN32)
-    return ngx_http_error_abuse_win32_temp_lease(directory, owner, fresh, log);
+    return ngx_http_error_abuse_win32_temp_lease(directory, owner, fresh,
+                                                status, log);
 #else
     ngx_fd_t         fd;
     ngx_file_info_t  fi;
 
     (void) log;
+    *status = NGX_ERROR;
     *fresh = ngx_create_dir(directory, 0700) == 0;
     if (!*fresh && ngx_errno != NGX_EEXIST) {
         return NGX_INVALID_FILE;
@@ -5082,9 +5107,18 @@ ngx_http_error_abuse_temp_lease(u_char *directory, u_char *owner,
     if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR || !ngx_is_file(&fi)
         || fi.st_uid != geteuid() || (fi.st_mode & 0777) != 0600
         || fi.st_nlink != 1
-        || (!*fresh && fi.st_size != sizeof("NGEAB-TEMP-v1\n") - 1)
-        || flock(fd, LOCK_EX|LOCK_NB) != 0)
+        || (!*fresh && fi.st_size != sizeof("NGEAB-TEMP-v1\n") - 1))
     {
+        if (*fresh) {
+            (void) ngx_delete_file(owner);
+        }
+        (void) ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+    }
+    if (flock(fd, LOCK_EX|LOCK_NB) != 0) {
+        if (ngx_errno == NGX_EAGAIN) {
+            *status = NGX_AGAIN;
+        }
         if (*fresh) {
             (void) ngx_delete_file(owner);
         }
@@ -5097,7 +5131,7 @@ ngx_http_error_abuse_temp_lease(u_char *directory, u_char *owner,
 
 static ngx_fd_t
 ngx_http_error_abuse_prepare_temp(ngx_str_t *persist, u_char *tmp,
-    ngx_log_t *log)
+    ngx_int_t *status, ngx_log_t *log)
 {
     static const u_char  magic[] = "NGEAB-TEMP-v1\n";
     u_char               marker[sizeof(magic)], *directory, *owner;
@@ -5105,6 +5139,7 @@ ngx_http_error_abuse_prepare_temp(ngx_str_t *persist, u_char *tmp,
     ngx_uint_t           fresh;
     ssize_t              n;
 
+    *status = NGX_ERROR;
     directory = ngx_alloc(2 * persist->len + 64, log);
     if (directory == NULL) {
         return NGX_INVALID_FILE;
@@ -5114,7 +5149,8 @@ ngx_http_error_abuse_prepare_temp(ngx_str_t *persist, u_char *tmp,
     ngx_sprintf(owner, "%V.eab-tmp/owner%Z", persist);
     ngx_sprintf(tmp, "%V.eab-tmp/snapshot%Z", persist);
 
-    lease = ngx_http_error_abuse_temp_lease(directory, owner, &fresh, log);
+    lease = ngx_http_error_abuse_temp_lease(directory, owner, &fresh, status,
+                                             log);
     if (lease == NGX_INVALID_FILE) {
         if (fresh) {
             (void) ngx_delete_dir(directory);
@@ -5169,19 +5205,22 @@ ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
 {
     u_char     *tmp;
     ngx_fd_t    fd, lease;
+    ngx_int_t   status;
 
     tmp = ngx_alloc(persist->len + 64, log);
     if (tmp == NULL) {
         return NGX_ERROR;
     }
 
-    lease = ngx_http_error_abuse_prepare_temp(persist, tmp, log);
+    lease = ngx_http_error_abuse_prepare_temp(persist, tmp, &status, log);
     if (lease == NGX_INVALID_FILE) {
-        ngx_log_error(NGX_LOG_WARN, log, 0,
-                      "error_abuse: temporary snapshot ownership unavailable "
-                      "for \"%V\"", persist);
+        if (status != NGX_AGAIN) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "error_abuse: temporary snapshot ownership "
+                          "unavailable for \"%V\"", persist);
+        }
         ngx_free(tmp);
-        return NGX_ERROR;
+        return status;
     }
     fd = ngx_http_error_abuse_platform_create_temp(tmp, log);
     if (fd == NGX_INVALID_FILE) {

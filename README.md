@@ -134,7 +134,15 @@ and do not put your own files in its `owner` or `snapshot` paths. On POSIX it
 must have mode 0700, with a regular, single-link mode-0600 marker owned by the
 worker user. Unix uses description-scoped `flock` leases; configure probes this
 capability. Targets without it retain legacy unique temporary writes, without
-automatic stale cleanup. Windows creates it with an owner-only ACL and rejects reparse points.
+automatic stale cleanup. Windows requests an owner-only ACL and rejects reparse
+points. Use a volume supporting persistent ACLs (such as NTFS); without that
+support the requested ACL has no effect. On upgrade, the worker also needs
+`FILE_ADD_SUBDIRECTORY` on the persistence parent to create the reserved directory;
+permission to create snapshot files alone is insufficient. Directory-creation
+failures log the Windows error separately from invalid ownership or a busy lease.
+Periodic writes skip a busy lease. Shutdown retries contention up to ten times
+at 10ms intervals per zone and logs an error if the final save still fails.
+Other errors, including invalid ownership, fail without a retry.
 An existing missing, incomplete or invalid marker fails closed with a warning;
 this includes interruption during initial namespace setup, before any snapshot
 slot is created. To recover, stop writers and move that directory aside for

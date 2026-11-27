@@ -33,7 +33,7 @@ void ngx_http_error_abuse_win32_owner_release(
 ngx_int_t ngx_http_error_abuse_win32_socket_readable(ngx_socket_t fd,
     ngx_log_t *log);
 ngx_fd_t ngx_http_error_abuse_win32_temp_lease(u_char *directory,
-    u_char *owner, ngx_uint_t *fresh, ngx_log_t *log);
+    u_char *owner, ngx_uint_t *fresh, ngx_int_t *status, ngx_log_t *log);
 ngx_fd_t ngx_http_error_abuse_win32_create_temp(u_char *path,
     ngx_log_t *log);
 ngx_int_t ngx_http_error_abuse_win32_flush_file(ngx_fd_t fd);
