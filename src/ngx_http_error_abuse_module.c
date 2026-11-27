@@ -381,6 +381,45 @@ static void ngx_http_error_abuse_redis_handshake_callback(
 static ngx_http_output_header_filter_pt ngx_http_error_abuse_next_header_filter;
 static ngx_http_error_abuse_redis_worker_t ngx_http_error_abuse_redis_worker;
 
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+/* CI-only, single event-loop observer; no request pointers are retained.
+ * Queued -> parked -> callback -> release -> resume is the live path.
+ * The reader snapshot is emitted AFTER hiredis returns: a nonempty reader
+ * with an outstanding callback proves receipt without decoder completion.
+ * Idle snapshots distinguish hiredis's empty callback queue from the adapter
+ * timer, which may remain armed until its scheduled idle wakeup. */
+static ngx_uint_t ngx_http_error_abuse_test_get_tokens;
+static ngx_uint_t ngx_http_error_abuse_test_get_parked;
+
+static void
+ngx_http_error_abuse_test_get_snapshot(
+    ngx_http_error_abuse_redis_event_t *ev, const char *where)
+{
+    size_t   n;
+    u_char   bytes[65], *last;
+
+    if (ev->context == NULL) {
+        return;
+    }
+    n = ngx_min(ev->context->c.reader->len, 32);
+    last = bytes;
+    if (n != 0) {
+        last = ngx_hex_dump(bytes, (u_char *) ev->context->c.reader->buf
+                            + ev->context->c.reader->len - n, n);
+    }
+    *last = '\0';
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_GET state=%s len=%uz pos=%uz task=%d pending=%d "
+                  "tokens=%ui parked=%ui timer=%d bytes=%s", where,
+                  ev->context->c.reader->len, ev->context->c.reader->pos,
+                  ev->context->c.reader->ridx,
+                  ev->context->replies.head != NULL,
+                  ngx_http_error_abuse_test_get_tokens,
+                  ngx_http_error_abuse_test_get_parked,
+                  ev->timeout.timer_set, bytes);
+}
+#endif
+
 static ngx_inline ngx_int_t
 ngx_http_error_abuse_platform_socket_readable(ngx_socket_t fd, ngx_log_t *log)
 {
@@ -3819,6 +3858,12 @@ ngx_http_error_abuse_redis_check_cleanup(void *data)
 {
     ngx_http_error_abuse_redis_check_t *check = data;
 
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_get_parked--;
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_GET cleanup id=%uA",
+                  check->request->connection->number);
+#endif
     check->request = NULL;
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_http_error_abuse_redis_worker.log, 0,
                    "error_abuse: Redis check request invalidated");
@@ -3908,6 +3953,13 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     r->write_event_handler = ngx_http_request_empty_handler;
     r->main->count++;
 
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_get_tokens++;
+    ngx_http_error_abuse_test_get_parked++;
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_GET park id=%uA", r->connection->number);
+#endif
+
     return NGX_AGAIN;
 }
 
@@ -3920,9 +3972,21 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     ngx_connection_t                  *c;
     ngx_http_error_abuse_req_ctx_t   *ctx;
     ngx_http_error_abuse_redis_check_t *check = privdata;
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_atomic_uint_t                  test_id;
+#endif
 
     r = check->request;
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_get_tokens--;
+#endif
     if (r == NULL) {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+        ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                      "EA_GET cancelled tokens=%ui parked=%ui",
+                      ngx_http_error_abuse_test_get_tokens,
+                      ngx_http_error_abuse_test_get_parked);
+#endif
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP,
                        ngx_http_error_abuse_redis_worker.log, 0,
                        "error_abuse: Redis check completed after cleanup "
@@ -3934,6 +3998,11 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     ngx_free(check);
 
     c = r->connection;
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    test_id = c->number;
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_GET callback id=%uA", test_id);
+#endif
     ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
     if (ctx == NULL) {
         /* release the reference taken at park time */
@@ -4033,6 +4102,13 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
      * it after its event handler, never re-touching r itself. */
     r->write_event_handler = ngx_http_core_run_phases;
     ngx_http_finalize_request(r, NGX_DONE);
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_get_parked--;
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_GET release id=%uA", test_id);
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_GET resume id=%uA", test_id);
+#endif
     ngx_http_core_run_phases(r);
     ngx_http_run_posted_requests(c);
 }
@@ -4252,6 +4328,10 @@ ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev)
             break;
         }
 
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+        ngx_http_error_abuse_test_get_snapshot(ev, "read");
+#endif
+
         if (ngx_http_error_abuse_platform_socket_readable(c->fd, c->log)
             != NGX_OK)
         {
@@ -4283,6 +4363,9 @@ ngx_http_error_abuse_redis_timeout_handler(ngx_event_t *t)
     if (ev->context != NULL) {
         redisAsyncHandleTimeout(ev->context);
     }
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_get_snapshot(ev, "timeout");
+#endif
 }
 
 /* hiredis asks us to (re)arm a one-shot command-timeout timer. */
