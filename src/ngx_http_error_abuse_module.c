@@ -5525,8 +5525,10 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 
     /* SEC-5: verify the trailing HMAC before trusting any further field. A
      * mismatch means tampering, a wrong key, or (RA02-EA-11) a snapshot from
-     * another zone or key expression — ignore the file (do not delete; the
-     * operator may have rotated the key). */
+     * another zone or key expression. Preserve rejected bytes during load;
+     * the next successful timer/exit save replaces them with current state.
+     * Never retry as CRC-only or guess an authentication trailer: v3 has no
+     * authentication-mode flag. Back up the file before changing the key. */
     if (mac_len != 0) {
         u_char  mac[NGX_HTTP_ERROR_ABUSE_MAC_LEN];
 
@@ -5556,7 +5558,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     }
 
     /* RFC-3: parse the rest of the little-endian header. Without a secret,
-     * v2 and v3 snapshots both load (no authentication to lose). */
+     * accept only complete CRC-valid v2/v3 payloads; never strip a trailer. */
     if (ngx_http_error_abuse_get_u32(buffer + 12) != zone->threshold) {
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "error_abuse persistence file \"%V\" is incompatible",
@@ -5575,10 +5577,9 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "error_abuse persistence file \"%V\" is corrupted "
-                      "(CRC32 mismatch), deleting",
+                      "(CRC32 mismatch); ignoring",
                       &zone->persist);
         ngx_free(base);
-        (void) ngx_delete_file((u_char *) zone->persist.data);
         return NGX_OK;
     }
 
