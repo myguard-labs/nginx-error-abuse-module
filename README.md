@@ -445,8 +445,10 @@ same `prefix` and zone settings count together and share bans. It speaks plain
 RESP, so **Valkey works too**. Connections are non-blocking, so a slow or dead
 Redis never freezes a request — the module just falls back to its own local
 counters (fail-open), and a circuit breaker pauses Redis for 30s after repeated
-failures so your logs don't fill up. You can lock it down with AUTH
-(`user=`/`password=`), pick a database (`db=N`), and encrypt with TLS by
+failures so your logs don't fill up. Both initial connection failures and later
+disconnects retry with bounded backoff; each successful connection resets that
+backoff. You can lock it down with AUTH (`user=`/`password=`), pick a database
+(`db=N`), and encrypt with TLS by
 prefixing the host: `host=tls://redis.internal` (or
 `host=rediss://redis.internal`). **Treat Redis as a trust
 boundary** — a compromised Redis could inject fake bans, so keep it on a private
