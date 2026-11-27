@@ -16,6 +16,16 @@ import subprocess
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+SCRIPT_DEPENDENCIES = (
+    "ngx_http_error_abuse_redis_check_script",
+    "ngx_http_error_abuse_redis_record_script",
+)
+
+
+def require_script_dependencies(functions, template):
+    for symbol in SCRIPT_DEPENDENCIES:
+        if symbol in functions and template.count(symbol) != 1:
+            raise AssertionError(f"fixture must define production dependency: {symbol}")
 
 
 def main():
@@ -30,6 +40,7 @@ def main():
         functions.append(source[start : source.index("\n}\n", start) + 3])
     body = "\n".join(functions)
     template = (ROOT / "ci/tests/unit/test_redis_initial.c.in").read_text()
+    require_script_dependencies(body, template)
     with tempfile.TemporaryDirectory(prefix="redis-initial-") as directory:
         build = pathlib.Path(directory)
 
@@ -68,6 +79,23 @@ def main():
 
         run(body, "green").check_returncode()
         if args.negative_controls:
+            missing_check_script = template.replace(
+                'static const char ngx_http_error_abuse_redis_check_script[] = "return 1";\n',
+                "",
+            )
+            try:
+                require_script_dependencies(body, missing_check_script)
+            except AssertionError as error:
+                expected = (
+                    "fixture must define production dependency: "
+                    "ngx_http_error_abuse_redis_check_script"
+                )
+                if str(error) != expected:
+                    raise
+                print("OK: check-script-dependency observed red", flush=True)
+            else:
+                raise AssertionError("missing check-script dependency was accepted")
+
             controls = (
                 (
                     "initial-reconnect",

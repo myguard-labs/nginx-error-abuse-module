@@ -33,6 +33,7 @@ typedef struct {
 } ngx_http_error_abuse_redis_worker_t;
 
 static ngx_http_error_abuse_redis_worker_t ngx_http_error_abuse_redis_worker;
+static const char ngx_http_error_abuse_redis_check_script[] = "return 1";
 static const char ngx_http_error_abuse_redis_record_script[] = "return 1";
 static unsigned released, removed, timers_deleted, timers_added, disconnected;
 static unsigned connected_callbacks, failed_callbacks;
