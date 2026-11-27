@@ -13,6 +13,9 @@
 #include <openssl/crypto.h>
 #if !(NGX_WIN32)
 #include <poll.h>
+#if (NGX_HTTP_ERROR_ABUSE_HAVE_FLOCK)
+#include <sys/file.h>
+#endif
 #endif
 #if (NGX_THREADS)
 #include <ngx_thread_pool.h>
@@ -4591,6 +4594,29 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
     return NGX_OK;
 }
 
+/* Keep periodic writes nonblocking; only shutdown waits briefly for a peer.
+ * Invalid ownership and I/O errors are permanent for this attempt. */
+static void
+ngx_http_error_abuse_save_final(ngx_http_error_abuse_zone_t *zone,
+    ngx_log_t *log)
+{
+    ngx_uint_t  attempt;
+    ngx_int_t   rc;
+
+    for (attempt = 0; /* void */; attempt++) {
+        rc = ngx_http_error_abuse_save(zone, log);
+        if (rc != NGX_AGAIN || attempt == 10) {
+            break;
+        }
+        ngx_msleep(10);
+    }
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "error_abuse: final snapshot save failed for \"%V\"",
+                      &zone->persist);
+    }
+}
+
 static void
 ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
 {
@@ -4637,7 +4663,7 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
                 continue;
             }
 #endif
-            (void) ngx_http_error_abuse_save(zones[i], cycle->log);
+            ngx_http_error_abuse_save_final(zones[i], cycle->log);
             /* Release the reused serialize buffer (the thread pool has already
              * been drained by its own earlier exit handler, so no in-flight
              * write still references it). */
@@ -5039,6 +5065,230 @@ ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
     return buffer;
 }
 
+#if (NGX_WIN32 || NGX_HTTP_ERROR_ABUSE_HAVE_FLOCK)
+
+/* A permanent marker owns this reserved namespace.  Never adopt an existing
+ * directory without it: a filename, PID or age cannot establish ownership.
+ * The lease stays open through rename; closing it releases the kernel lock
+ * after a crash as well as on normal completion.  flock locks each open file
+ * description: process-associated fcntl locks would let alias zones in the
+ * same worker delete one another's active slot. */
+static ngx_fd_t
+ngx_http_error_abuse_temp_lease(u_char *directory, u_char *owner,
+    ngx_uint_t *fresh, ngx_int_t *status, ngx_log_t *log)
+{
+#if (NGX_WIN32)
+    return ngx_http_error_abuse_win32_temp_lease(directory, owner, fresh,
+                                                status, log);
+#else
+    ngx_fd_t         fd;
+    ngx_file_info_t  fi;
+
+    (void) log;
+    *status = NGX_ERROR;
+    *fresh = ngx_create_dir(directory, 0700) == 0;
+    if (!*fresh && ngx_errno != NGX_EEXIST) {
+        return NGX_INVALID_FILE;
+    }
+    if (lstat((char *) directory, &fi) == -1 || !ngx_is_dir(&fi)
+        || fi.st_uid != geteuid() || (fi.st_mode & 0777) != 0700)
+    {
+        return NGX_INVALID_FILE;
+    }
+    fd = ngx_open_file(owner, NGX_FILE_RDWR,
+                       O_NOFOLLOW|O_NONBLOCK
+                       | (*fresh ? O_CREAT|O_EXCL : 0), 0600);
+    if (fd == NGX_INVALID_FILE) {
+        return fd;
+    }
+    /* An existing opener must not lease an unpublished marker before its
+     * creator can lock it.  A fresh file reaches this size only after its
+     * creator holds the lease and writes the immutable marker. */
+    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR || !ngx_is_file(&fi)
+        || fi.st_uid != geteuid() || (fi.st_mode & 0777) != 0600
+        || fi.st_nlink != 1
+        || (!*fresh && fi.st_size != sizeof("NGEAB-TEMP-v1\n") - 1))
+    {
+        if (*fresh) {
+            (void) ngx_delete_file(owner);
+        }
+        (void) ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+    }
+    if (flock(fd, LOCK_EX|LOCK_NB) != 0) {
+        if (ngx_errno == NGX_EAGAIN) {
+            *status = NGX_AGAIN;
+        }
+        if (*fresh) {
+            (void) ngx_delete_file(owner);
+        }
+        (void) ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+    }
+    return fd;
+#endif
+}
+
+static ngx_fd_t
+ngx_http_error_abuse_prepare_temp(ngx_str_t *persist, u_char *tmp,
+    ngx_int_t *status, ngx_log_t *log)
+{
+    static const u_char  magic[] = "NGEAB-TEMP-v1\n";
+    u_char               marker[sizeof(magic)], *directory, *owner;
+    ngx_fd_t             lease;
+    ngx_uint_t           fresh;
+    ssize_t              n;
+
+    *status = NGX_ERROR;
+    directory = ngx_alloc(2 * persist->len + 64, log);
+    if (directory == NULL) {
+        return NGX_INVALID_FILE;
+    }
+    owner = directory + persist->len + 16;
+    ngx_sprintf(directory, "%V.eab-tmp%Z", persist);
+    ngx_sprintf(owner, "%V.eab-tmp/owner%Z", persist);
+    ngx_sprintf(tmp, "%V.eab-tmp/snapshot%Z", persist);
+
+    lease = ngx_http_error_abuse_temp_lease(directory, owner, &fresh, status,
+                                             log);
+    if (lease == NGX_INVALID_FILE) {
+        if (fresh) {
+            (void) ngx_delete_dir(directory);
+        }
+        ngx_free(directory);
+        return lease;
+    }
+    if (fresh) {
+        if (ngx_http_error_abuse_write_all(lease, (u_char *) magic,
+                                          sizeof(magic) - 1) != NGX_OK)
+        {
+            /* Unpublished: no contender can validate this partial marker.
+             * Remove only our exclusive creation; never a published marker. */
+            (void) ngx_delete_file(owner);
+            (void) ngx_close_file(lease);
+            (void) ngx_delete_dir(directory);
+            ngx_free(directory);
+            return NGX_INVALID_FILE;
+        }
+        if (ngx_http_error_abuse_platform_flush_file(lease) != NGX_OK) {
+            (void) ngx_close_file(lease);
+            ngx_free(directory);
+            return NGX_INVALID_FILE;
+        }
+    } else {
+        n = ngx_read_fd(lease, marker, sizeof(marker));
+        if (n != sizeof(magic) - 1
+            || ngx_memcmp(marker, magic, sizeof(magic) - 1) != 0)
+        {
+            (void) ngx_close_file(lease);
+            ngx_free(directory);
+            return NGX_INVALID_FILE;
+        }
+    }
+    ngx_free(directory);
+
+    /* Only this one reserved slot belongs to the validated marker.  Do not
+     * enumerate the directory or touch legacy .tmp.PID.nonce siblings. */
+    if (ngx_delete_file(tmp) == NGX_FILE_ERROR && ngx_errno != NGX_ENOENT) {
+        (void) ngx_close_file(lease);
+        return NGX_INVALID_FILE;
+    }
+    return lease;
+}
+
+/* PERF-1: write a prepared snapshot buffer to disk. Pure I/O — no shared
+ * memory, no mutex — so it is safe to run on a thread-pool task off the event
+ * loop. Does not free `buffer`. */
+static ngx_int_t
+ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
+    ngx_str_t *persist, ngx_log_t *log)
+{
+    u_char     *tmp;
+    ngx_fd_t    fd, lease;
+    ngx_int_t   status;
+
+    tmp = ngx_alloc(persist->len + 64, log);
+    if (tmp == NULL) {
+        return NGX_ERROR;
+    }
+
+    lease = ngx_http_error_abuse_prepare_temp(persist, tmp, &status, log);
+    if (lease == NGX_INVALID_FILE) {
+        if (status != NGX_AGAIN) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "error_abuse: temporary snapshot ownership "
+                          "unavailable for \"%V\"", persist);
+        }
+        ngx_free(tmp);
+        return status;
+    }
+    fd = ngx_http_error_abuse_platform_create_temp(tmp, log);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      ngx_open_file_n " \"%s\" failed", tmp);
+        (void) ngx_close_file(lease);
+        ngx_free(tmp);
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_error_abuse_write_all(fd, buffer, len) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      ngx_write_fd_n " \"%s\" failed", tmp);
+        (void) ngx_close_file(fd);
+        (void) ngx_delete_file(tmp);
+        (void) ngx_close_file(lease);
+        ngx_free(tmp);
+        return NGX_ERROR;
+    }
+
+    /* STAB-2: flush data before the rename so a crash cannot leave an empty
+     * renamed snapshot. */
+#if (NGX_HTTP_ERROR_ABUSE_TEST_FAIL_PERSIST_FSYNC)
+    ngx_errno = EIO;
+    if (1) {
+#else
+    if (ngx_http_error_abuse_platform_flush_file(fd) != NGX_OK) {
+#endif
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      "fsync() \"%s\" failed", tmp);
+        (void) ngx_close_file(fd);
+        (void) ngx_delete_file(tmp);
+        (void) ngx_close_file(lease);
+        ngx_free(tmp);
+        return NGX_ERROR;
+    }
+
+    if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      ngx_close_file_n " \"%s\" failed", tmp);
+        (void) ngx_delete_file(tmp);
+        (void) ngx_close_file(lease);
+        ngx_free(tmp);
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_error_abuse_platform_replace(tmp, persist, log) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      ngx_rename_file_n " \"%s\" to \"%V\" failed",
+                      tmp, persist);
+        (void) ngx_delete_file(tmp);
+        (void) ngx_close_file(lease);
+        ngx_free(tmp);
+        return NGX_ERROR;
+    }
+
+    /* STAB-2: fsync the parent directory so the rename itself is durable. */
+    ngx_http_error_abuse_platform_sync_parent(persist->data, log);
+
+    (void) ngx_close_file(lease);
+    ngx_free(tmp);
+    return NGX_OK;
+}
+
+#else
+
+/* Preserve snapshot writing on Unix targets without description-scoped locks.
+ * Their legacy unique temps cannot be reclaimed safely. */
 /* PERF-1: write a prepared snapshot buffer to disk. Pure I/O — no shared
  * memory, no mutex — so it is safe to run on a thread-pool task off the event
  * loop. Does not free `buffer`. */
@@ -5123,6 +5373,8 @@ ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
     ngx_free(tmp);
     return NGX_OK;
 }
+
+#endif
 
 static ngx_int_t
 ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)

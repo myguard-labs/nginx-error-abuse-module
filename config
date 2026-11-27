@@ -1,6 +1,19 @@
 ngx_addon_name=ngx_http_error_abuse_module
 ngx_module_type=HTTP_FILTER
 ngx_module_name=ngx_http_error_abuse_module
+# flock leases are associated with an open file description, unlike POSIX
+# record locks.  Probe both header and link support; Windows uses native handles.
+if [ "${NGX_PLATFORM:-}" != win32 ]; then
+    ngx_feature="error-abuse snapshot flock lease"
+    ngx_feature_name=NGX_HTTP_ERROR_ABUSE_HAVE_FLOCK
+    ngx_feature_run=no
+    ngx_feature_incs="#include <sys/file.h>"
+    ngx_feature_path=
+    ngx_feature_libs=
+    ngx_feature_test="(void) flock(-1, LOCK_EX|LOCK_NB)"
+    . auto/feature
+fi
+
 # Production sources -- always compiled, never depend on the ci/t/harness
 # submodule. A plain (non-recursive) clone or a source archive contains only
 # the submodule gitlink, so listing ci/t/harness files here for a packaged

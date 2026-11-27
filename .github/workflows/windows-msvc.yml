@@ -1,4 +1,4 @@
-# sync-sha: 4d898c99ce66f460cb146a739dbd1ff48a64c3794c117bf3068bcce6aa67fb03
+# sync-sha: bee896dd0a96e54683e9bb186cadcde804b5794065b92a88920a8b5fc7b60193
 name: Windows MSVC
 
 on:
@@ -286,7 +286,34 @@ jobs:
           } finally { Stop-Nginx $proc }
 
           Clear-Content logs/error.log
-          $proc = Start-Nginx
+          $slot = "$snapshot.eab-tmp/snapshot"
+          $unrelated = "$snapshot.eab-tmp/unrelated"
+          $legacy = "$snapshot.tmp.1.deadbeef"
+          [IO.File]::WriteAllText($slot, 'interrupted')
+          [IO.File]::WriteAllText($unrelated, 'keep')
+          [IO.File]::WriteAllText($legacy, 'legacy')
+          $lease = [IO.File]::Open("$snapshot.eab-tmp/owner", 'Open', 'ReadWrite', 'None')
+          $proc = $null
           try {
+            $proc = Start-Nginx
             if ((Status) -ne 429) { throw 'restart did not restore blocked state' }
-          } finally { Stop-Nginx $proc }
+            Start-Sleep -Milliseconds 500
+            if ([IO.File]::ReadAllText($slot) -ne 'interrupted') {
+              throw 'live temporary snapshot lease was stolen'
+            }
+            $lease.Dispose()
+            $lease = $null
+            $reclaimed = $false
+            foreach ($i in 1..40) {
+              if (-not (Test-Path -LiteralPath $slot)) { $reclaimed = $true; break }
+              Start-Sleep -Milliseconds 250
+            }
+            if (-not $reclaimed) { throw 'stale snapshot slot was not reclaimed' }
+            if ([IO.File]::ReadAllText($unrelated) -ne 'keep' -or
+                [IO.File]::ReadAllText($legacy) -ne 'legacy') {
+              throw 'unrelated snapshot files changed'
+            }
+          } finally {
+            if ($null -ne $lease) { $lease.Dispose() }
+            if ($null -ne $proc) { Stop-Nginx $proc }
+          }
