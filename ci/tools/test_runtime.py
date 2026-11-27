@@ -1998,7 +1998,207 @@ def test_snapshot_zone_binding(
     _snapshot_binding_seed(nginx)
     _snapshot_binding_restores(nginx)
     _snapshot_binding_versions(nginx)
+    test_snapshot_migration(binary, module, root, runner, port)
     nginx.assert_clean_logs()
+
+
+class _SnapshotMigrationNginx(_SnapshotBindingNginx):
+    """One zone with an adjustable mode and save interval, always cold-started."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.secret: bytes | None = PERSIST_SECRET
+        self.save_interval = "1h"
+        self.state = self.root / "migration.state"
+
+    def write_config(self, keyed_key: str = "$arg_client") -> None:
+        del keyed_key
+        for sub in ("conf", "logs", "empty"):
+            (self.root / sub).mkdir(parents=True, exist_ok=True)
+        load = f"load_module {self.module};\n" if self.module else ""
+        auth = f"persist_secret={self.secret.hex()}" if self.secret else ""
+        (self.root / "conf/nginx.conf").write_text(
+            f"""{load}worker_processes 1;
+pid {self.root}/nginx.pid;
+error_log {self.root}/logs/error.log info;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    error_abuse_zone zone=migration:1m key=$arg_client statuses=404
+        interval=180s threshold=1 block=180s persist={self.state}
+        persist_interval={self.save_interval} {auth};
+    server {{
+        listen 127.0.0.1:{self.port};
+        location = /error {{
+            error_abuse zone=migration status=429;
+            root {self.root}/empty;
+        }}
+        location = /ok {{ error_abuse zone=migration status=429; empty_gif; }}
+    }}
+}}
+""",
+            encoding="ascii",
+        )
+
+
+def _migration_snapshot(secret: bytes | None, version: int = 3) -> bytes:
+    """Independent wire fixture: one live ban for identity 'old', no events."""
+    now = int(time.time())
+    payload = struct.pack("<HHqq", 32, 0, now + 180, now)
+    payload += hashlib.sha256(b"old").digest()
+    covered = struct.pack("<8sIIII", b"NGEAB01", version, 1, 1, zlib.crc32(payload))
+    covered += payload
+    if secret is None:
+        return covered
+    if version == 2:
+        return covered + hmac.new(secret, covered, hashlib.sha256).digest()
+    return covered + _snapshot_mac(secret, "migration", "$arg_client", covered)
+
+
+def test_snapshot_migration(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+    only: tuple[str, str] | None = None,
+) -> None:
+    """RA02-EA-18/24: retain rejected bytes until a current-mode save replaces them.
+
+    `only` selects the same individual case for separately rebuilt mutations.
+    All scenarios also check the saved CRC/HMAC and a fresh cold-start restore.
+    """
+    rotated = bytes(reversed(PERSIST_SECRET))
+    scenarios = (
+        "authenticated",
+        "plain",
+        "plain-v2",
+        "removed",
+        "added",
+        "rotated",
+        "crc-corrupt",
+        "hmac-corrupt",
+        "ambiguous",
+        "short",
+        "legacy-auth",
+        "empty-reject",
+    )
+    for name in scenarios:
+        for save in ("exit", "timer"):
+            if only is not None and only != (name, save):
+                continue
+            nginx = _SnapshotMigrationNginx(
+                binary, module, root / f"migration-{name}-{save}", port, runner, True
+            )
+            nginx.root.mkdir(parents=True)
+            nginx.save_interval = "2s" if save == "timer" else "1h"
+            nginx.secret = (
+                None
+                if name in ("plain", "plain-v2", "removed", "crc-corrupt", "ambiguous")
+                else rotated
+                if name == "rotated"
+                else PERSIST_SECRET
+            )
+            original_secret = (
+                None
+                if name in ("plain", "plain-v2", "crc-corrupt", "added")
+                else PERSIST_SECRET
+            )
+            version = 2 if name in ("plain-v2", "legacy-auth") else 3
+            original = bytearray(_migration_snapshot(original_secret, version))
+            if name in ("crc-corrupt", "hmac-corrupt", "empty-reject"):
+                original[-1] ^= 1
+            if name == "ambiguous":
+                # CRC-valid as a no-secret file, but the extra 32 bytes are not
+                # records. A guessed trailer must never make this acceptable.
+                struct.pack_into("<I", original, 20, zlib.crc32(original[24:]))
+            if name == "short":
+                original = original[:23]
+            before = bytes(original)
+            nginx.state.write_bytes(before)
+            nginx.state.chmod(0o600)
+            accepted = name in ("authenticated", "plain", "plain-v2")
+            marker = (
+                "loaded: 1 records"
+                if accepted
+                else {
+                    "removed": "is corrupted (CRC32 mismatch); ignoring",
+                    "crc-corrupt": "is corrupted (CRC32 mismatch); ignoring",
+                    "ambiguous": "is malformed",
+                    "short": "has invalid size",
+                    "legacy-auth": SNAPSHOT_LEGACY_V2,
+                }.get(name, SNAPSHOT_HMAC_FAILED)
+            )
+            # Configuration validation runs the real loader without starting
+            # workers/timers. Preservation must not race the first valid save.
+            nginx.write_config()
+            nginx.config_test()
+            if not nginx.state.exists() or nginx.state.read_bytes() != before:
+                raise AssertionError(
+                    f"{name}: rejected/original snapshot not preserved"
+                )
+            offset = nginx.log_offset()
+            nginx.start()
+            try:
+                expect(port, "/ok?client=old", 429 if accepted else 200)
+                _expect_snapshot_log(
+                    name, nginx.log_since(offset), nginx.state, marker, ()
+                )
+                if name != "empty-reject":
+                    expect(port, "/error?client=fresh", 404)
+                    expect(port, "/ok?client=fresh", 429)
+                if save == "timer":
+                    # A timer may run before the fresh request. Wait for its
+                    # state, not merely any rewrite of the original snapshot.
+                    def timer_saved(
+                        zone: _SnapshotMigrationNginx, original: bytes, empty: bool
+                    ) -> bool:
+                        saved = zone.state.read_bytes()
+                        if empty:
+                            return (
+                                saved != original
+                                and struct.unpack_from("<I", saved, 16)[0] == 0
+                            )
+                        payload = saved[24:-32] if zone.secret else saved[24:]
+                        return (
+                            saved != original
+                            and hashlib.sha256(b"fresh").digest() in payload
+                        )
+
+                    deadline = time.monotonic() + 6
+                    while (
+                        not timer_saved(nginx, before, name == "empty-reject")
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.05)
+                    if not timer_saved(nginx, before, name == "empty-reject"):
+                        raise AssertionError(
+                            f"{name}: timer save did not replace snapshot"
+                        )
+            finally:
+                nginx.stop()
+            after = nginx.state.read_bytes()
+            if after == before:
+                raise AssertionError(f"{name}: exit save did not replace snapshot")
+            covered = after[:-32] if nginx.secret else after
+            if struct.unpack_from("<I", covered, 8)[0] != 3:
+                raise AssertionError(f"{name}: save did not write version 3")
+            if struct.unpack_from("<I", covered, 20)[0] != zlib.crc32(covered[24:]):
+                raise AssertionError(f"{name}: saved CRC is invalid")
+            if nginx.secret and not hmac.compare_digest(
+                after[-32:],
+                _snapshot_mac(nginx.secret, "migration", "$arg_client", covered),
+            ):
+                raise AssertionError(f"{name}: save did not use the current secret")
+            nginx.save_interval = "1h"
+            nginx.start()
+            try:
+                expect(port, "/ok?client=fresh", 200 if name == "empty-reject" else 429)
+                expect(port, "/ok?client=old", 429 if accepted else 200)
+            finally:
+                nginx.stop()
+            nginx.assert_clean_logs()
+            print(f"OK: snapshot migration {name}/{save}", flush=True)
 
 
 def test_snapshot_deadline_clamp(

@@ -161,6 +161,24 @@ bans of authenticated zones once: their version 2 snapshot is not bound to a
 zone, so it is ignored with a "legacy version 2 authenticated snapshot" warning
 (the file is kept) and replaced by a version 3 snapshot on the next save.
 Zones without `persist_secret` still restore version 2 snapshots.
+
+Adding, removing or rotating `persist_secret` does not migrate saved state.
+Version 3 has no authentication-mode flag: the loader uses the configured
+mode, never retries a failed HMAC as CRC-only, and never strips a guessed HMAC
+trailer when the secret is absent. A snapshot written under another mode or
+key is rejected; its bans are not restored. CRC32 failures also leave the
+original file intact during load, since they can indicate secret removal as
+well as corruption.
+
+This preservation lasts only until the first successful periodic or exit save:
+that save atomically replaces the rejected file with fresh in-memory state in
+the current mode, even if the zone is empty. It does not retain a backup.
+Before changing the secret or mode, stop nginx, back up the resulting snapshot
+securely, then change the configuration and start nginx. To recover old saved
+state, stop nginx and restore both the backup and its matching configuration
+before restarting; stopping the new instance alone can overwrite the rejected
+file.
+
 Legacy records with exactly `threshold` events remain readable. After expired
 and future events are filtered, a still-full ring becomes a ban with no queued
 events, as on a live threshold match. An existing live ban keeps its clamped
