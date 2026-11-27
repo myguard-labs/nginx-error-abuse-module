@@ -383,6 +383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evict-scan-budget-only", action="store_true")
     parser.add_argument("--oversized-snapshot-only", action="store_true")
     parser.add_argument("--snapshot-binding-only", action="store_true")
+    parser.add_argument("--persist-path-only", action="store_true")
     parser.add_argument(
         "--deadline-clamp",
         choices=("snapshot-crc", "snapshot-hmac", "redis"),
@@ -4295,10 +4296,116 @@ def test_stats_zone_utf8(
     )
 
 
+def test_persist_paths(
+    binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
+) -> None:
+    """Check POSIX atomic-save destination identity with real nginx -t calls."""
+    if os.name == "nt":
+        print("SKIP: POSIX persistence path identity (Windows uses textual paths)")
+        return  # Windows retains expanded textual path comparison.
+    paths = root / "persist-paths"
+    paths.mkdir()
+    (paths / "child").mkdir()
+    (paths / "other").mkdir()
+    alias = root / "persist-alias"
+    alias.symlink_to(paths, target_is_directory=True)
+    existing = paths / "existing.state"
+    existing.write_bytes(b"")
+    hardlink = paths / "hardlink.state"
+    os.link(existing, hardlink)
+    symlink = paths / "symlink.state"
+    symlink.symlink_to(existing)
+    dangling = paths / "dangling.state"
+    dangling.symlink_to(paths / "missing.state")
+    fifo = paths / "fifo.state"
+    os.mkfifo(fifo)
+    loop = paths / "loop"
+    loop.symlink_to(loop)
+
+    def zones(*filenames: str | pathlib.Path) -> str:
+        return "\n".join(
+            f"    error_abuse_zone zone=p{index}:1m persist={filename};"
+            for index, filename in enumerate(filenames)
+        )
+
+    missing = paths / "new.state"
+    for name, first, second in (
+        ("identical", missing, missing),
+        ("relative", "../persist-paths/new.state", missing),
+        ("dot", f"{paths}/./new.state", missing),
+        ("dotdot", f"{paths}/child/../new.state", missing),
+        ("slashes", f"{paths}//new.state", missing),
+        ("parent-symlink", alias / "new.state", missing),
+        ("existing-parent-symlink", alias / "existing.state", existing),
+    ):
+        expect_invalid_config(
+            binary,
+            module,
+            root,
+            runner,
+            "persist-" + name,
+            zones(first, second),
+            "use the same persistence file",
+        )
+    for name, filenames in (
+        ("missing", (missing,)),
+        ("existing", (existing,)),
+        ("relative-valid", ("../persist-paths/new.state",)),
+        ("parent-symlink-valid", (alias / "new.state",)),
+        ("distinct-leaves", (missing, paths / "second.state")),
+        ("distinct-parents", (missing, paths / "other" / "new.state")),
+        ("hardlinks", (existing, hardlink)),
+    ):
+        expect_valid_config(
+            binary, module, root, runner, "persist-" + name, zones(*filenames)
+        )
+    for name, filename, expected in (
+        ("empty-leaf", f"{paths}/", "invalid error_abuse persistence filename"),
+        ("dot-leaf", f"{paths}/.", "invalid error_abuse persistence filename"),
+        ("dotdot-leaf", f"{paths}/..", "invalid error_abuse persistence filename"),
+        (
+            "missing-parent",
+            paths / "absent" / "s",
+            "cannot resolve error_abuse persistence parent",
+        ),
+        (
+            "file-parent",
+            f"{existing}/s",
+            "cannot resolve error_abuse persistence parent",
+        ),
+        ("loop-parent", loop / "s", "cannot resolve error_abuse persistence parent"),
+        (
+            "long-parent",
+            paths / ("x" * 256) / "s",
+            "cannot resolve error_abuse persistence parent",
+        ),
+        (
+            "long-leaf",
+            paths / ("x" * 256),
+            "cannot inspect error_abuse persistence file",
+        ),
+        ("symlink", symlink, "must be regular and not a symlink"),
+        ("dangling-symlink", dangling, "must be regular and not a symlink"),
+        ("directory", paths / "child", "must be regular and not a symlink"),
+        ("fifo", fifo, "must be regular and not a symlink"),
+    ):
+        expect_invalid_config(
+            binary,
+            module,
+            root,
+            runner,
+            "persist-" + name,
+            zones(filename),
+            expected,
+        )
+    print("OK: persistence path identity (7 aliases, 7 valid, 12 invalid)")
+
+
 def test_invalid_configs(
     binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
 ) -> None:
     # error_abuse_stats attaches to a declared zone; it never creates one.
+    test_persist_paths(binary, module, root, runner)
     test_stats_zone_utf8(binary, module, root, runner)
     expect_invalid_config(
         binary,
@@ -4525,7 +4632,10 @@ def main() -> int:
         raise FileNotFoundError(module)
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
-        root = pathlib.Path(tmp)
+        root = pathlib.Path(tmp).resolve()
+        if args.persist_path_only:
+            test_persist_paths(binary, module, root, args.runner)
+            return 0
         if args.redis_lifecycle_only:
             test_redis_lifecycle(binary, module, root, args.runner, args.port)
             return 0
