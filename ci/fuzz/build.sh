@@ -3,18 +3,18 @@
 # Build the error-abuse libFuzzer targets.
 # Usage: fuzz/build.sh [output-dir-or-binary]
 #
-#   - no arg          : build both targets into fuzz/
-#   - a directory     : build both targets into that dir
+#   - no arg          : build all targets into fuzz/
+#   - a directory     : build all targets into that dir
 #   - a file path     : build ONLY the snapshot target to that path
 #                        (back-compat for the CI step that passes an
 #                        explicit fuzz_snapshot output name)
 #
-# Both targets LINK the module's real decision TU
-# (../../src/ngx_http_error_abuse_scan.c) plus nginx's real
-# src/core/ngx_string.c, so the parsers under test and the
-# ngx_atoi()/ngx_strlchr() they walk bytes with are production code. That
-# requires a configured nginx tree at .build/nginx-<VER>/ -- run
-# ci/tools/ci-build.sh first.
+# The snapshot/status targets LINK the module's real decision TU
+# (../../src/ngx_http_error_abuse_scan.c); the Accept target includes the
+# production stats parser header. All targets also link nginx's real
+# src/core/ngx_string.c, so the parsers and nginx helpers they walk bytes with
+# are production code. That requires a configured nginx tree at
+# .build/nginx-<VER>/ -- run ci/tools/ci-build.sh first.
 #
 # This replaced extract_parser.sh, which sed-sliced the two function bodies out
 # of the module .c and compiled them against ngx_shim.h's re-typed copies of the
@@ -36,6 +36,7 @@ CC="${CC:-clang}"
 # OSS-Fuzz sets $LIB_FUZZING_ENGINE and its own $CFLAGS; honour them.
 ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}"
 CFLAGS="${CFLAGS:--g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined}"
+WARNINGS="${WARNINGS:--Werror}"
 
 # --- Locate the configured nginx source tree. ------------------------------
 # The targets need nginx HEADERS (objs/ngx_auto_config.h) plus the real
@@ -72,7 +73,7 @@ NGX_INCS="-I$NGX_SRC/src/core -I$NGX_SRC/src/event -I$NGX_SRC/src/event/modules 
 build_one() {
     local src="$1" out="$2"
     # shellcheck disable=SC2086
-    "$CC" $CFLAGS $ENGINE $NGX_INCS -I"$SRC_DIR" -I"$FUZZ_DIR" \
+    "$CC" $CFLAGS $WARNINGS $ENGINE $NGX_INCS -I"$SRC_DIR" -I"$FUZZ_DIR" \
         "$FUZZ_DIR/$src" \
         "$FUZZ_DIR/ngx_stubs.c" \
         "$SRC_DIR/ngx_http_error_abuse_scan.c" \

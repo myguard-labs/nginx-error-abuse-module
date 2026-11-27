@@ -1,0 +1,8 @@
+"format=json"
+"format=prometheus"
+"application/openmetrics-text"
+"text/plain"
+"version=\"1\\.0.0\""
+"charset=\"U\\TF-8\""
+";q=0.5"
+"\\\""

@@ -481,6 +481,25 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
 }
 
 
+/* Apply the request-wide byte budget before parsing one Accept field. The
+ * request handler and direct fuzz harness share this helper so repeated-field
+ * accounting cannot drift between production and the test seam. */
+static ngx_int_t
+ngx_http_error_abuse_accept_field(ngx_str_t *v, size_t *bytes,
+    ngx_uint_t *items, ngx_int_t *openmetrics, ngx_int_t *plain,
+    ngx_uint_t *om_specificity, ngx_uint_t *plain_specificity)
+{
+    if (v->len > NGX_HTTP_ERROR_ABUSE_NEGOTIATE_BYTES - *bytes) {
+        return NGX_ERROR;
+    }
+
+    *bytes += v->len;
+
+    return ngx_http_error_abuse_accept(v, items, openmetrics, plain,
+                                       om_specificity, plain_specificity);
+}
+
+
 /* ---- renderers -------------------------------------------------------- */
 
 /* Overflow-checked size accumulation. */

@@ -145,11 +145,12 @@ try_accept(const char *value, ngx_int_t *om, ngx_int_t *plain)
 static void
 case_accept(void)
 {
-    char        many[512];
-    size_t      i;
-    ngx_int_t   om, plain;
-    ngx_str_t   field;
-    ngx_uint_t  items, om_specificity, plain_specificity;
+    static u_char  byte_field[4097];
+    char           many[512];
+    size_t         bytes, i;
+    ngx_int_t      om, plain;
+    ngx_str_t      field;
+    ngx_uint_t     items, om_specificity, plain_specificity;
 
     check(try_accept("application/openmetrics-text", &om, &plain) == NGX_OK
           && om == 1000 && plain == 0, "bare OpenMetrics media type");
@@ -190,6 +191,26 @@ case_accept(void)
     check(ngx_http_error_abuse_accept(&field, &items, &om, &plain,
                                     &om_specificity, &plain_specificity) == NGX_ERROR,
           "repeated escaped parameter field exceeding shared budget rejected");
+
+    memset(byte_field, 'b', sizeof(byte_field));
+    byte_field[0] = 'a';
+    byte_field[1] = '/';
+    field.data = byte_field;
+    field.len = 4096;
+    bytes = 0;
+    items = om_specificity = plain_specificity = 0;
+    om = plain = 0;
+    check(ngx_http_error_abuse_accept_field(&field, &bytes, &items, &om,
+                  &plain, &om_specificity, &plain_specificity) == NGX_OK
+          && ngx_http_error_abuse_accept_field(&field, &bytes, &items, &om,
+                  &plain, &om_specificity, &plain_specificity) == NGX_OK
+          && bytes == NGX_HTTP_ERROR_ABUSE_NEGOTIATE_BYTES,
+          "repeated Accept fields share the exact byte budget");
+    field.len = 1;
+    check(ngx_http_error_abuse_accept_field(&field, &bytes, &items, &om,
+                  &plain, &om_specificity, &plain_specificity) == NGX_ERROR
+          && bytes == NGX_HTTP_ERROR_ABUSE_NEGOTIATE_BYTES,
+          "Accept field one byte beyond the shared budget is rejected");
     check(try_accept("text/plain;q=0.5, application/openmetrics-text;q=0.4",
                  &om, &plain) == NGX_OK && om == 400 && plain == 500,
           "both types scored");
