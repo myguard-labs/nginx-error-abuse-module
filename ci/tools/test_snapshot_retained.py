@@ -7,6 +7,8 @@ Requires --core pointing to a configured nginx/Angie tree. Tests only the
 post-validation restore phase, with deterministic slab capacity/failure and
 clock boundaries. --negative-controls rebuilds a processed-record reporting
 mutant and requires the constrained and duplicate count assertions to fail.
+It also rebuilds full-ring normalization and upper-bound mutants to prove
+legacy acceptance, runtime canonicalization, and rejection above capacity.
 """
 
 import argparse
@@ -30,6 +32,13 @@ CASES = (
     "expired",
     "inactive-records",
     "empty",
+    "threshold-minus-one",
+    "threshold-equal",
+    "threshold-equal-ban",
+    "threshold-equal-saturated",
+    "threshold-equal-expired",
+    "threshold-equal-future",
+    "threshold-greater",
 )
 
 
@@ -70,10 +79,13 @@ def main():
     template = template.replace("/* NODE_LAYOUT */", node).replace(
         "/* NODE_HELPERS */", helpers
     )
+    normalization_start = body.index("        /* RA02-EA-17:")
+    normalization_end = body.index("\n    }", normalization_start)
+    normalization = body[normalization_start:normalization_end]
     with tempfile.TemporaryDirectory(prefix="snapshot-retained-") as directory:
         build = pathlib.Path(directory)
 
-        def compile_body(restore, label):
+        def compile_body(restore, label, scan=None):
             generated = build / f"{label}.c"
             generated.write_text(template.replace("/* RESTORE_BODY */", restore))
             binary = build / label
@@ -93,7 +105,7 @@ def main():
                 ],
                 f"-I{ROOT / 'src'}",
                 str(generated),
-                str(ROOT / "src/ngx_http_error_abuse_scan.c"),
+                str(scan or ROOT / "src/ngx_http_error_abuse_scan.c"),
                 str(core / "src/core/ngx_string.c"),
                 str(core / "src/core/ngx_rbtree.c"),
                 str(core / "src/core/ngx_crc32.c"),
@@ -136,6 +148,42 @@ def main():
                 ):
                     raise AssertionError(f"{name}: reporting mutant not observed red")
                 print(f"OK: {name} reporting mutant observed red", flush=True)
+            mutant = compile_body(body.replace(normalization, ""), "full-ring-mutant")
+            for name in ("threshold-equal", "threshold-equal-ban"):
+                result = run(mutant, name)
+                if result.returncode != 1 or result.stderr.strip() != (
+                    "FAIL: restored event count is not canonical"
+                ):
+                    raise AssertionError(f"{name}: full-ring mutant not observed red")
+                print(f"OK: {name} full-ring mutant observed red", flush=True)
+            scan = (ROOT / "src/ngx_http_error_abuse_scan.c").read_text()
+            marker = "rec_event_count > threshold"
+            if scan.count(marker) != 1:
+                raise AssertionError("expected one snapshot count bound")
+            for label, replacement, name, failure in (
+                (
+                    "unbounded",
+                    "((void) threshold, 0)",
+                    "threshold-greater",
+                    "event count above threshold was accepted",
+                ),
+                (
+                    "strict",
+                    "rec_event_count >= threshold",
+                    "threshold-equal",
+                    "invalid fixture snapshot",
+                ),
+            ):
+                mutated_scan = build / f"{label}-scan.c"
+                mutated_scan.write_text(scan.replace(marker, replacement))
+                mutant = compile_body(body, label, mutated_scan)
+                result = run(mutant, name)
+                if (
+                    result.returncode != 1
+                    or result.stderr.strip() != f"FAIL: {failure}"
+                ):
+                    raise AssertionError(f"{name}: {label} mutant not observed red")
+                print(f"OK: {name} {label} mutant observed red", flush=True)
             restored = compile_body(body, "restored")
             for name in CASES:
                 run(restored, name).check_returncode()

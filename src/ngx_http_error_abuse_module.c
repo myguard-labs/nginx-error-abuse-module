@@ -5667,6 +5667,18 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
                 events[ean->event_count++] = (time_t) stored_when;
             }
         }
+
+        /* RA02-EA-17: older snapshots may contain a full ring. Keep accepting
+         * that layout, but publish the same state as the threshold writer
+         * after filtering stale/future events. With no live saved deadline,
+         * start the ban at load time, like other restored deadline clamps. */
+        if (ean->event_count == zone->threshold) {
+            if (ean->blocked_until == 0) {
+                ean->blocked_until = ngx_http_error_abuse_time_add_saturate(
+                    now, zone->block);
+            }
+            ean->event_count = 0;
+        }
     }
 
     /* init_zone() loads only into a fresh, empty zone. Count distinct nodes

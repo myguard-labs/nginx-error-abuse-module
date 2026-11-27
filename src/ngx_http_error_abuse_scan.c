@@ -157,7 +157,9 @@ ngx_http_error_abuse_validate_snapshot(u_char *p, u_char *last,
 
         /* Identities are always a fixed 32-byte SHA-256 digest (SEC-3); a
          * record with any other key length is forged or corrupt — reject the
-         * whole snapshot rather than admit an unmatchable dead-weight node. */
+         * whole snapshot rather than admit an unmatchable dead-weight node.
+         * A full ring fits the allocation and remains a supported legacy
+         * layout; load() normalizes it after timestamp filtering. */
         if (rec_key_len != NGX_HTTP_ERROR_ABUSE_DIGEST_LEN
             || rec_event_count > threshold)
         {
