@@ -2286,6 +2286,9 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             seen |= NGX_HTTP_ERROR_ABUSE_SEEN_STATUSES;
             statuses.data = value[i].data + 9;
             statuses.len = value[i].len - 9;
+            if (statuses.len == 0) {
+                goto invalid;
+            }
 
         } else if (ngx_strncmp(value[i].data, "interval=", 9) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_INTERVAL) {

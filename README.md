@@ -240,6 +240,10 @@ Omitting `key` uses `$binary_remote_addr`. An explicit `key=` must contain a
 nonempty expression; an empty value is a configuration error. A valid expression
 that evaluates to an empty value for a request still leaves that request untracked.
 
+Omitting `statuses` uses `403,404,500-599`. An explicit `statuses=` must contain
+a nonempty comma-separated list of exact codes or ranges; an empty value is a
+configuration error.
+
 | Parameter          | Default               | Meaning                                            |
 | ------------------ | --------------------- | -------------------------------------------------- |
 | `zone`             | *(required)*          | Name and shared-memory size, e.g. `client:10m`.    |
