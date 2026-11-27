@@ -161,6 +161,12 @@ bans of authenticated zones once: their version 2 snapshot is not bound to a
 zone, so it is ignored with a "legacy version 2 authenticated snapshot" warning
 (the file is kept) and replaced by a version 3 snapshot on the next save.
 Zones without `persist_secret` still restore version 2 snapshots.
+Legacy records with exactly `threshold` events remain readable. After expired
+and future events are filtered, a still-full ring becomes a ban with no queued
+events, as on a live threshold match. An existing live ban keeps its clamped
+deadline; otherwise the ban starts at restore time for the configured `block`
+duration (saturated at the platform time limit). Records above the threshold
+are malformed.
 
 Client identities are stored as a fixed 32-byte SHA-256 digest of the `key`, so
 a large key variable (`$request_uri`, `$http_*`) costs the same memory and Redis
