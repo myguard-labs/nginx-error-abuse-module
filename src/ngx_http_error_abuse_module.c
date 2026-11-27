@@ -3058,6 +3058,13 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     mcf->redis.timeout = timeout;
     mcf->redis.configured = 1;
 
+    if (password.len != 0 && !tls) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "error_abuse_redis AUTH credentials will be sent "
+                           "without TLS; use host=tls:// or host=rediss:// "
+                           "with a trusted server certificate");
+    }
+
     return NGX_CONF_OK;
 
 invalid:
