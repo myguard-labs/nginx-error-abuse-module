@@ -1,4 +1,4 @@
-# sync-sha: abb9be67d0f912adc5be1459c54267278ecff9e5c24306139e48a55c9c35edf3
+# sync-sha: bea84711b8ae10fbe28f773c86261fab9580a60eb23a75f3b980bb9c6f37960e
 name: Build and Test
 
 env:
@@ -75,6 +75,7 @@ jobs:
           python3 ci/tools/test_ci_fuzz.py
           python3 ci/tools/test_ci_review_policy.py
           python3 ci/tools/test_runtime_lifecycle.py
+          CC=clang python3 ci/tools/test_redis_initial.py --negative-controls
           CC=clang python3 ci/tools/test_snapshot_open.py --negative-controls
           CC=clang python3 ci/tools/test_snapshot_temp.py --negative-controls
           python3 -m unittest ci.tools.test_fuzz_namespace

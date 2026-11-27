@@ -370,6 +370,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--redis-server")
     parser.add_argument("--log-safety-only", action="store_true")
     parser.add_argument("--redis-lifecycle-only", action="store_true")
+    parser.add_argument("--redis-initial-only", action="store_true")
     parser.add_argument(
         "--config-seeds-only",
         action="store_true",
@@ -811,6 +812,7 @@ def test_redis_backoff_cap(
         peer.stop()
 
     test_redis_handshake_recovery(binary, fault_module, root, runner, port + 1)
+    test_redis_initial_recovery(binary, fault_module, root, runner, port + 2)
     print("OK: Redis reconnect backoff cap and handshake recovery controls")
 
 
@@ -1338,8 +1340,9 @@ class HostileRedisServer:
     EVAL_ERROR = b"EVAL-HOSTILE-SECRET\x00tail"
     HANDSHAKE_ERROR = b"HANDSHAKE-HOSTILE-SECRET\x00tail"
 
-    def __init__(self, handshake_error: bool = False) -> None:
+    def __init__(self, handshake_error: bool = False, listen_port: int = 0) -> None:
         self.handshake_error = handshake_error
+        self.listen_port = listen_port
         self.commands: list[bytes] = []
         self._condition = threading.Condition()
         self._server: socketserver.ThreadingTCPServer | None = None
@@ -1397,7 +1400,7 @@ class HostileRedisServer:
             allow_reuse_address = True
             daemon_threads = True
 
-        self._server = Server(("127.0.0.1", 0), Handler)
+        self._server = Server(("127.0.0.1", self.listen_port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -1427,6 +1430,68 @@ class HostileRedisServer:
             self._thread.join(timeout=5)
         self._server = None
         self._thread = None
+
+
+def test_redis_initial_recovery(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    port: int,
+) -> None:
+    """A refused initial connection later reads a ban absent from local state."""
+
+    class BlockedPeer(HostileRedisServer):
+        def _response(self, command: list[bytes]) -> bytes:
+            if command[0].upper() == b"GET":
+                deadline = str(int(time.time()) + 30).encode("ascii")
+                return b"$" + str(len(deadline)).encode() + b"\r\n" + deadline + b"\r\n"
+            return super()._response(command)
+
+    class LoggedNginx(Nginx):
+        def write_config(self, keyed_key: str = "$arg_client") -> None:
+            super().write_config(keyed_key)
+            config = self.root / "conf" / "nginx.conf"
+            config.write_text(
+                config.read_text().replace(
+                    "access_log off;", f"access_log {self.root}/access.log;"
+                ),
+                encoding="ascii",
+            )
+
+    # Keep the port reserved but not listening until the failure is observed.
+    reservation = socket.socket()
+    reservation.bind(("127.0.0.1", 0))
+    redis_port = reservation.getsockname()[1]
+    peer = BlockedPeer(listen_port=redis_port)
+    nginx = LoggedNginx(
+        binary, module, root / "redis-initial", port, runner, True, redis_port
+    )
+    try:
+        nginx.start()
+        error_log = nginx.root / "logs" / "error.log"
+        _wait_for_log(error_log, b"error_abuse Redis connection failed")
+        # This fresh identity has no local ban; a dead Redis must allow it.
+        expect(port, "/redis-ok?client=initial-recovery", 200)
+        reservation.close()
+        peer.start()
+        peer.wait_for(b"SCRIPT", timeout=5.0)
+        expect(port, "/redis-ok?client=initial-recovery", 429)
+        peer.wait_for(b"GET")
+        _wait_for_log_count(nginx.root / "access.log", b"client=initial-recovery", 2)
+        access = (nginx.root / "access.log").read_text(encoding="ascii")
+        if access.count("client=initial-recovery") != 2:
+            raise AssertionError("initial recovery request completed more than once")
+        if peer.commands != [b"SCRIPT", b"GET"]:
+            raise AssertionError(
+                f"initial recovery command ordering: {peer.commands!r}"
+            )
+        print("OK: refused initial Redis connection recovered with one GET/resume")
+    finally:
+        reservation.close()
+        nginx.stop()
+        peer.stop()
+    nginx.assert_clean_logs()
 
 
 class LifecycleRedisServer(HostileRedisServer):
@@ -4877,6 +4942,9 @@ def main() -> int:
             return 0
         if args.redis_lifecycle_only:
             test_redis_lifecycle(binary, module, root, args.runner, args.port)
+            return 0
+        if args.redis_initial_only:
+            test_redis_initial_recovery(binary, module, root, args.runner, args.port)
             return 0
         if args.config_seeds_only:
             test_config_seeds(binary, module, root, args.runner)

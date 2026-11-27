@@ -1,0 +1,245 @@
+/* Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause */
+#include <hiredis/async.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef unsigned long ngx_msec_t;
+typedef int ngx_socket_t;
+typedef struct { int active, timer_set, posted; } ngx_event_t;
+typedef struct {
+    ngx_socket_t fd;
+    ngx_event_t *read, *write;
+} ngx_connection_t;
+typedef struct {
+    redisAsyncContext *context;
+    ngx_connection_t *conn;
+    ngx_event_t timeout;
+} ngx_http_error_abuse_redis_event_t;
+typedef struct { size_t len; unsigned char *data; } test_string_t;
+typedef struct { test_string_t password, user; int db; } test_conf_t;
+typedef struct {
+    redisAsyncContext *context;
+    int ready, exiting;
+    ngx_msec_t reconnect_backoff;
+    ngx_event_t reconnect;
+    test_conf_t *conf;
+} ngx_http_error_abuse_redis_worker_t;
+
+static ngx_http_error_abuse_redis_worker_t ngx_http_error_abuse_redis_worker;
+static const char ngx_http_error_abuse_redis_record_script[] = "return 1";
+static unsigned released, removed, timers_deleted, timers_added, disconnected;
+static unsigned connected_callbacks, failed_callbacks;
+
+static void
+require(int ok, const char *message)
+{
+    if (!ok) {
+        fprintf(stderr, "FAIL: %s\n", message);
+        exit(1);
+    }
+}
+
+#define NGX_OK 0
+#define NGX_READ_EVENT 0
+#define NGX_WRITE_EVENT 1
+#define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT 10
+#define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX 80
+#define ngx_log_error(...) ((void) 0)
+#define ngx_random() 0
+
+static int
+ngx_del_event(ngx_event_t *event, int type, int flags)
+{
+    require(event->active, "event removed twice");
+    event->active = 0;
+    removed++;
+    return NGX_OK;
+}
+
+static void
+ngx_del_timer(ngx_event_t *event)
+{
+    require(event->timer_set, "timer removed twice");
+    event->timer_set = 0;
+    timers_deleted++;
+}
+
+static void
+ngx_add_timer(ngx_event_t *event, ngx_msec_t delay)
+{
+    require(!event->timer_set, "reconnect armed twice");
+    require(delay >= 7 && delay <= 100, "reconnect delay outside bounded backoff");
+    event->timer_set = 1;
+    timers_added++;
+}
+
+static void
+ngx_delete_posted_event(ngx_event_t *event)
+{
+    require(event->posted, "posted event removed twice");
+    event->posted = 0;
+}
+
+static void
+ngx_free_connection(ngx_connection_t *connection)
+{
+    require(connection->fd >= 0, "connection released twice");
+    released++;
+}
+
+static void
+ngx_http_error_abuse_redis_handshake_callback(redisAsyncContext *ac,
+    void *reply, void *data)
+{
+    /* No request tokens exist in this connection-only fixture. */
+}
+
+static void ngx_http_error_abuse_redis_arm_reconnect(void);
+/* REDIS_LIFECYCLE */
+
+static void
+connect_callback(const redisAsyncContext *ac, int status)
+{
+    if (status == REDIS_OK) {
+        connected_callbacks++;
+    } else {
+        failed_callbacks++;
+    }
+    ngx_http_error_abuse_redis_connect_callback(ac, status);
+}
+
+static void
+disconnect_callback(const redisAsyncContext *ac, int status)
+{
+    disconnected++;
+    ngx_http_error_abuse_redis_disconnect_callback(ac, status);
+}
+
+static void
+wait_event(int fd, short events)
+{
+    struct pollfd pollfd = { fd, events, 0 };
+    require(poll(&pollfd, 1, 2000) == 1, "hiredis socket did not become ready");
+}
+
+static redisAsyncContext *
+connect_peer(int port, ngx_http_error_abuse_redis_event_t *adapter,
+    ngx_connection_t *connection)
+{
+    redisAsyncContext *ac = redisAsyncConnect("127.0.0.1", port);
+    require(ac != NULL && !ac->err, "connect did not reach async callback");
+    ac->data = &ngx_http_error_abuse_redis_worker;
+    ngx_http_error_abuse_redis_worker.context = ac;
+    adapter->context = ac;
+    adapter->conn = connection;
+    connection->fd = ac->c.fd;
+    *connection->read = (ngx_event_t) { 1, 1, 1 };
+    *connection->write = (ngx_event_t) { 1, 1, 1 };
+    adapter->timeout.timer_set = 1;
+    ac->ev.data = adapter;
+    ac->ev.cleanup = ngx_http_error_abuse_redis_cleanup;
+    require(redisAsyncSetConnectCallback(ac, connect_callback) == REDIS_OK,
+            "register connect callback");
+    require(redisAsyncSetDisconnectCallback(ac, disconnect_callback) == REDIS_OK,
+            "register disconnect callback");
+    wait_event(ac->c.fd, POLLOUT);
+    return ac;
+}
+
+static void
+assert_cleanup(ngx_http_error_abuse_redis_event_t *adapter,
+    ngx_connection_t *connection, int fd, unsigned count)
+{
+    require(ngx_http_error_abuse_redis_worker.context == NULL,
+            "initial failure retained freed context");
+    require(adapter->context == NULL && adapter->conn == NULL,
+            "cleanup retained adapter ownership");
+    require(released == count, "adapter connection was not released exactly once");
+    require(!adapter->timeout.timer_set,
+            "adapter timeout survived context cleanup");
+    require(removed == count * 2 && timers_deleted == count * 3,
+            "cleanup did not remove all registered events and timers");
+    require(!connection->read->posted && !connection->write->posted,
+            "cleanup retained a posted event");
+    require(connection->fd == -1, "cleanup retained nginx descriptor ownership");
+    errno = 0;
+    require(fcntl(fd, F_GETFD) == -1 && errno == EBADF,
+            "hiredis did not close its descriptor");
+    ngx_http_error_abuse_redis_cleanup(adapter);
+    require(released == count, "empty adapter cleanup released twice");
+}
+
+int
+main(void)
+{
+    struct sockaddr_in address = { .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t length = sizeof(address);
+    int listener, port, fd, peer;
+    unsigned i;
+    test_conf_t conf = { 0 };
+    ngx_event_t read = { 0 }, write = { 0 };
+    ngx_connection_t connection = { -1, &read, &write };
+    ngx_http_error_abuse_redis_event_t adapter = { 0 };
+    redisAsyncContext *ac;
+    ngx_http_error_abuse_redis_worker_t *worker = &ngx_http_error_abuse_redis_worker;
+
+    worker->conf = &conf;
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    require(listener >= 0, "create reserved non-listening peer");
+    require(bind(listener, (struct sockaddr *) &address, sizeof(address)) == 0,
+            "reserve refused port");
+    require(getsockname(listener, (struct sockaddr *) &address, &length) == 0,
+            "read refused port");
+    port = ntohs(address.sin_port);
+    for (i = 1; i <= 3; i++) {
+        worker->reconnect.timer_set = 0; /* expiry before each next attempt */
+        worker->exiting = (i == 3);
+        ac = connect_peer(port, &adapter, &connection);
+        fd = ac->c.fd;
+        redisAsyncHandleWrite(ac); /* hiredis frees ac on initial refusal */
+        assert_cleanup(&adapter, &connection, fd, i);
+        require(!worker->ready, "failed connect left worker ready");
+        require(failed_callbacks == i && connected_callbacks == 0,
+                "initial connect callback did not complete exactly once");
+        require(disconnected == 0, "initial failure called disconnect callback");
+        require(timers_added == (i == 3 ? 2 : i),
+                "initial failure did not arm exactly one retry or ignored exit");
+        require(worker->reconnect_backoff == (i == 1 ? 20 : 40),
+                "initial failure did not advance bounded backoff");
+        if (!worker->exiting) {
+            ngx_http_error_abuse_redis_arm_reconnect();
+            require(timers_added == i, "pending retry armed twice");
+        }
+    }
+    worker->exiting = 0;
+    require(listen(listener, 1) == 0, "bring refused peer online");
+    ac = connect_peer(port, &adapter, &connection);
+    fd = ac->c.fd;
+    redisAsyncHandleWrite(ac);
+    peer = accept(listener, NULL, NULL);
+    require(peer >= 0, "accept recovered connection");
+    require(worker->context == ac && worker->ready,
+            "later connect did not recover readiness");
+    require(worker->reconnect_backoff == 0, "recovery did not reset backoff");
+    require(connected_callbacks == 1 && failed_callbacks == 3,
+            "recovery connect callback did not complete exactly once");
+    close(peer); /* real connected-session disconnect, with SCRIPT pending */
+    wait_event(fd, POLLIN);
+    redisAsyncHandleRead(ac);
+    assert_cleanup(&adapter, &connection, fd, 4);
+    require(disconnected == 1 && !worker->ready,
+            "connected-session disconnect did not complete exactly once");
+    require(timers_added == 3 && worker->reconnect.timer_set,
+            "connected-session disconnect did not schedule a fresh retry");
+    close(listener);
+    puts("OK: initial refusal, repeated failure, exit, cleanup once, recovery and disconnect");
+    return 0;
+}
