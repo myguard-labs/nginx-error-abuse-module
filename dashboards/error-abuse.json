@@ -48,7 +48,12 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Requests Total",
+      "title": "Requests per second",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -70,7 +75,12 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Matched Responses Total",
+      "title": "Matched Responses per second",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -92,7 +102,12 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Blocked Total",
+      "title": "Blocked per second",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -114,7 +129,12 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Dry Run Would Block Total",
+      "title": "Dry Run Would Block per second",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -136,7 +156,12 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Bans Total",
+      "title": "Bans per second",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -158,7 +183,12 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Zone Evictions Total",
+      "title": "Zone Evictions per second",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -180,7 +210,12 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Zone Alloc Failures Total",
+      "title": "Zone Alloc Failures per second",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
       "gridPos": {
         "h": 8,
         "w": 12,

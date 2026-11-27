@@ -80,6 +80,11 @@ def validate(path):
         )
         if not expr == expected:
             raise AssertionError(f"unexpected query: {expr}")
+        if kinds[name] == "counter" and (
+            not panel["title"].endswith(" per second")
+            or panel.get("fieldConfig", {}).get("defaults", {}).get("unit") != "ops"
+        ):
+            raise AssertionError(f"counter panel must show a per-second rate: {name}")
         expressions.append(
             (
                 expr.replace("${zone}", "client_errors").replace(

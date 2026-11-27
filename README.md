@@ -459,6 +459,10 @@ scrape_configs:
       - targets: ["127.0.0.1:8080"]
 ```
 
+Set the Grafana Prometheus datasource scrape interval to `30s` to match this
+job, so `$__rate_interval` uses an appropriate range. If the job interval
+changes, update the datasource interval accordingly.
+
 Use the address and port of your management listener, and allow the Prometheus
 server through the endpoint's access controls. Keep `error_abuse off;` in the
 stats location so scraping does not affect enforcement or counters.
