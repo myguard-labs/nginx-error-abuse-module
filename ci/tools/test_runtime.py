@@ -381,6 +381,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run only the Redis block deadline round-up control",
     )
+    parser.add_argument(
+        "--redis-ban-counter-only",
+        action="store_true",
+        help="run only the Redis armed-now ban counter control",
+    )
     parser.add_argument("--mixed-eviction-only", action="store_true")
     parser.add_argument("--evict-scan-budget-only", action="store_true")
     parser.add_argument("--oversized-snapshot-only", action="store_true")
@@ -848,6 +853,13 @@ def nginx_config(
         location = /redis-ok {{
             error_abuse zone=cluster status=429;
             empty_gif;
+        }}
+        location = /redis-return-error {{
+            error_abuse zone=cluster status=429;
+            return 404;
+        }}
+        location = /redis-stats {{
+            error_abuse_stats cluster;
         }}
 """
     return f"""{load}worker_processes {workers};
@@ -1321,6 +1333,15 @@ class RedisServer:
                 return int(match.group(1))
         return 0
 
+    def command_calls(self, command: str) -> int:
+        stats = self.command("INFO", "commandstats")
+        match = re.search(
+            rf"^cmdstat_{re.escape(command)}:calls=(\d+)",
+            stats,
+            flags=re.MULTILINE,
+        )
+        return int(match.group(1)) if match is not None else 0
+
     def stop(self) -> None:
         if self.process is None:
             return
@@ -1430,6 +1451,20 @@ class HostileRedisServer:
             self._thread.join(timeout=5)
         self._server = None
         self._thread = None
+
+
+class LegacyRecordRedisServer(HostileRedisServer):
+    """Redis peer that preserves the pre-EA-06 two-integer EVAL reply."""
+
+    def _response(self, command: list[bytes]) -> bytes:
+        name = command[0].upper()
+        if name == b"SCRIPT":
+            return b"$40\r\n" + b"0" * 40 + b"\r\n"
+        if name == b"GET":
+            return b"$-1\r\n"
+        if name == b"EVALSHA":
+            return b"*2\r\n:0\r\n:1\r\n"
+        return b"-UNEXPECTED-COMMAND\r\n"
 
 
 def test_redis_initial_recovery(
@@ -2400,6 +2435,74 @@ def _wait_for_script_loads(
         )
 
 
+def _wait_for_command_calls(
+    redis: RedisServer, command: str, expected: int, timeout: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    actual = redis.command_calls(command)
+    while actual < expected and time.monotonic() < deadline:
+        time.sleep(0.02)
+        actual = redis.command_calls(command)
+    if actual < expected:
+        raise AssertionError(f"Redis expected {expected} {command} calls, got {actual}")
+
+
+def _redis_zone_stats(port: int) -> dict[str, int]:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/redis-stats",
+        headers={"Connection": "close"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        if response.status != 200:
+            raise AssertionError(f"Redis stats returned {response.status}")
+        return json.loads(response.read())
+
+
+def _wait_for_ban_total(
+    ports: tuple[int, ...], expected: int, timeout: float = 5.0
+) -> tuple[int, ...]:
+    deadline = time.monotonic() + timeout
+    values = tuple(_redis_zone_stats(port)["bans"] for port in ports)
+    while sum(values) != expected and time.monotonic() < deadline:
+        if sum(values) > expected:
+            break
+        time.sleep(0.02)
+        values = tuple(_redis_zone_stats(port)["bans"] for port in ports)
+    if sum(values) != expected:
+        raise AssertionError(
+            f"Redis bans expected aggregate {expected}, got per-node {values}"
+        )
+    return values
+
+
+def _wait_for_stable_ban_total(
+    ports: tuple[int, ...],
+    expected: int,
+    timeout: float = 5.0,
+    stable_for: float = 0.25,
+) -> tuple[int, ...]:
+    """Require an aggregate ban count to remain unchanged after callbacks."""
+    deadline = time.monotonic() + timeout
+    stable_since: float | None = None
+    values = tuple(_redis_zone_stats(port)["bans"] for port in ports)
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if sum(values) == expected:
+            if stable_since is None:
+                stable_since = now
+            elif now - stable_since >= stable_for:
+                return values
+        else:
+            stable_since = None
+            if sum(values) > expected:
+                break
+        time.sleep(0.02)
+        values = tuple(_redis_zone_stats(port)["bans"] for port in ports)
+    raise AssertionError(
+        f"Redis bans did not remain at aggregate {expected}, got per-node {values}"
+    )
+
+
 def _wait_for_status(port: int, path: str, expected: int, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     actual = request(port, path)
@@ -2517,6 +2620,211 @@ def _assert_handshake_log_safety(error_log: pathlib.Path) -> None:
         raise AssertionError(
             f"log safety: expected one Redis handshake record, got {data.count(marker)}"
         )
+
+
+def test_redis_ban_counter(
+    binary: pathlib.Path,
+    module: pathlib.Path | None,
+    root: pathlib.Path,
+    runner: str,
+    nginx_port: int,
+    redis_binary: pathlib.Path,
+) -> None:
+    """EA-06: one logical Redis ban contributes one aggregate ban count."""
+    redis_port = nginx_port + 20
+    prefix = f"error-abuse-ban-counter-{os.getpid()}-{time.time_ns()}:"
+    redis = RedisServer(redis_binary, root / "redis-ban-counter", redis_port)
+    first = Nginx(
+        binary,
+        module,
+        root / "redis-ban-counter-a",
+        nginx_port,
+        runner,
+        True,
+        redis_port,
+        prefix,
+    )
+    second = Nginx(
+        binary,
+        module,
+        root / "redis-ban-counter-b",
+        nginx_port + 1,
+        runner,
+        True,
+        redis_port,
+        prefix,
+    )
+    try:
+        redis.start()
+        first.start()
+        second.start()
+        _wait_for_script_loads(redis, 2)
+        ports = (first.port, second.port)
+        if _wait_for_stable_ban_total(ports, 0) != (0, 0):
+            raise AssertionError("Redis ban counters did not start at zero")
+
+        # Boundary plus multi-instance positive: neither local tracker reaches
+        # threshold=3, but the third shared event atomically arms Redis. The
+        # node whose EVAL crosses the threshold owns the one aggregate count.
+        calls = redis.command_calls("evalsha")
+        for _ in range(2):
+            expect(first.port, "/redis-return-error?client=cross", 404)
+        _wait_for_command_calls(redis, "evalsha", calls + 2)
+        events_key = _redis_state_key(prefix, "cross", "events")
+        _wait_for_redis_value(redis, "2", "ZCARD", events_key)
+        if _wait_for_stable_ban_total(ports, 0) != (0, 0):
+            raise AssertionError("threshold-minus-one changed the ban counter")
+        expect(second.port, "/redis-return-error?client=cross", 404)
+        _wait_for_command_calls(redis, "evalsha", calls + 3)
+        block_key = _redis_state_key(prefix, "cross", "block")
+        _wait_for_redis_value(redis, "1", "EXISTS", block_key)
+        if _wait_for_ban_total(ports, 1) != (0, 1):
+            raise AssertionError("cross-instance arm was not owned by node B")
+
+        # Local/Redis overlap: all three events hit one node, so its local
+        # tracker and Redis arm on the same response. The marker must replace,
+        # not add to, the suppressed local count.
+        calls = redis.command_calls("evalsha")
+        for _ in range(3):
+            expect(first.port, "/redis-return-error?client=overlap", 404)
+        _wait_for_command_calls(redis, "evalsha", calls + 3)
+        if _wait_for_ban_total(ports, 2) != (1, 1):
+            raise AssertionError("local/Redis overlap was not counted once")
+
+        # Repeated valid replies while the block key is live must report
+        # armed_now=0. Issue them concurrently from both instances; the Lua
+        # guard also keeps a new events window from accumulating under a ban.
+        calls = redis.command_calls("evalsha")
+        request_ports = (first.port, second.port) * 4
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            statuses = list(
+                executor.map(
+                    lambda port: request(port, "/redis-return-error?client=overlap"),
+                    request_ports,
+                )
+            )
+        if statuses != [404] * len(request_ports):
+            raise AssertionError(f"concurrent Redis replies: {statuses}")
+        _wait_for_command_calls(redis, "evalsha", calls + len(request_ports))
+        _wait_for_stable_ban_total(ports, 2)
+        overlap_events = _redis_state_key(prefix, "overlap", "events")
+        if redis.command("ZCARD", overlap_events) != "0":
+            raise AssertionError("active Redis ban accumulated retry events")
+
+        # Error boundary: a hostile wrong-type block value is not an active
+        # valid ban. The protected GET must let events continue until SET
+        # replaces that value and one new shared arm is counted.
+        calls = redis.command_calls("evalsha")
+        _redis_set_wrong_get(redis, prefix, "wrong-block")
+        for _ in range(3):
+            expect(first.port, "/redis-return-error?client=wrong-block", 404)
+        _wait_for_command_calls(redis, "evalsha", calls + 3)
+        _wait_for_ban_total(ports, 3)
+        wrong_block_key = _redis_state_key(prefix, "wrong-block", "block")
+        if redis.command("TYPE", wrong_block_key) != "string":
+            raise AssertionError("Redis wrong-type block value was not replaced")
+
+        # Corrupt string blocks are not active bans. A malformed deadline with
+        # a TTL and a valid deadline without any expiry must both be removed
+        # atomically before normal event accounting continues. Each threshold
+        # repair owns exactly one new aggregate count.
+        corrupt_blocks = (
+            ("malformed-deadline", "not-a-deadline", ("PX", "60000")),
+            ("missing-expiry", str(int(time.time()) + 600), ()),
+            ("exponent-deadline", "1e309", ("PX", "60000")),
+            ("hex-deadline", "0x10", ("PX", "60000")),
+            ("overflow-deadline", "9" * 400, ("PX", "60000")),
+        )
+        expected_total = 3
+        for client, value, expiry in corrupt_blocks:
+            corrupt_key = _redis_state_key(prefix, client, "block")
+            if redis.command("SET", corrupt_key, value, *expiry) != "OK":
+                raise AssertionError(f"failed to seed corrupt block for {client}")
+            calls = redis.command_calls("evalsha")
+            for _ in range(3):
+                expect(
+                    first.port,
+                    f"/redis-return-error?client={client}",
+                    404,
+                )
+            _wait_for_command_calls(redis, "evalsha", calls + 3)
+            expected_total += 1
+            _wait_for_ban_total(ports, expected_total)
+            repaired = redis.command("GET", corrupt_key)
+            if not repaired.isdecimal() or int(repaired) <= 0:
+                raise AssertionError(
+                    f"Redis corrupt block deadline was not repaired for {client}"
+                )
+            if int(redis.command("PTTL", corrupt_key)) <= 0:
+                raise AssertionError(
+                    f"Redis corrupt block expiry was not repaired for {client}"
+                )
+
+        # Redis failure keeps local fail-open enforcement and counts the one
+        # local arm. A successful reconnect must resume atomic shared arms.
+        redis.stop()
+        expect(first.port, "/redis-ok?client=disconnect-probe", 200)
+        for _ in range(3):
+            expect(first.port, "/redis-return-error?client=fallback", 404)
+        expected_total += 1
+        _wait_for_ban_total(ports, expected_total)
+        expect(first.port, "/redis-ok?client=fallback", 429)
+
+        redis = RedisServer(
+            redis_binary, root / "redis-ban-counter-reconnect", redis_port
+        )
+        redis.start()
+        _wait_for_script_loads(redis, 2, timeout=10)
+        for _ in range(2):
+            expect(first.port, "/redis-return-error?client=reconnected", 404)
+        expect(second.port, "/redis-return-error?client=reconnected", 404)
+        _wait_for_command_calls(redis, "evalsha", 3)
+        expected_total += 1
+        _wait_for_ban_total(ports, expected_total)
+    finally:
+        first.stop()
+        second.stop()
+        redis.stop()
+    first.assert_clean_logs()
+    second.assert_clean_logs()
+
+    # Rolling compatibility: a legacy two-integer reply is valid and falls
+    # back to the old local-arm ownership instead of tripping the breaker or
+    # dropping the metric.
+    legacy = LegacyRecordRedisServer()
+    legacy_nginx: Nginx | None = None
+    try:
+        legacy.start()
+        legacy_nginx = Nginx(
+            binary,
+            module,
+            root / "redis-ban-counter-legacy",
+            nginx_port + 2,
+            runner,
+            True,
+            legacy.port,
+            f"error-abuse-ban-counter-legacy-{os.getpid()}:",
+        )
+        legacy_nginx.start()
+        legacy.wait_for(b"SCRIPT")
+        for _ in range(3):
+            expect(
+                legacy_nginx.port,
+                "/redis-return-error?client=legacy",
+                404,
+            )
+        _wait_for_ban_total((legacy_nginx.port,), 1)
+    finally:
+        if legacy_nginx is not None:
+            legacy_nginx.stop()
+        legacy.stop()
+    if legacy_nginx is not None:
+        legacy_nginx.assert_clean_logs()
+
+    print(
+        "OK: Redis armed-now counter crossing, overlap, repeats, corruption, "
+        "failure, reconnect and legacy reply controls"
+    )
 
 
 def test_log_safety(
@@ -5043,6 +5351,18 @@ def main() -> int:
             )
             print("OK: Redis block deadline ceil control")
             return 0
+        if args.redis_ban_counter_only:
+            if not args.redis_server:
+                raise ValueError("Redis ban counter control requires --redis-server")
+            test_redis_ban_counter(
+                binary,
+                module,
+                root,
+                args.runner,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
+            )
+            return 0
         if args.redis_state_controls:
             if module is None or not args.redis_server:
                 raise ValueError(
@@ -5087,6 +5407,14 @@ def main() -> int:
         test_snapshot_zone_binding(binary, module, root, args.runner, args.port + 18)
         test_error_page_redirect(binary, module, root, args.runner, args.port + 20)
         if args.redis_server:
+            test_redis_ban_counter(
+                binary,
+                module,
+                root,
+                args.runner,
+                args.port,
+                pathlib.Path(args.redis_server).absolute(),
+            )
             test_redis_multi_host(
                 binary,
                 module,

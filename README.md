@@ -380,7 +380,7 @@ nginx-http-shield-module's `shield_ban_status`. JSON is the default:
 | `matched`         | `error_abuse_matched_responses_total`      | counter | Responses with a tracked status that were checked against the threshold (enforcing and dry-run). Responses from a client that is already banned are not counted here; they normally show up under `blocked` or `would_block`. One exception: in an enforcing location that answers before preaccess (`return 404;`), a banned client's response is neither rejected nor counted in `matched`, `blocked` or `would_block`. |
 | `blocked`         | `error_abuse_blocked_total`                | counter | Requests the module rejected: active bans, local or Redis, and `on_full=reject`. |
 | `would_block`     | `error_abuse_dry_run_would_block_total`    | counter | Dry-run decisions that would have blocked: a request from a banned client, or a response that would reach the threshold. |
-| `bans`            | `error_abuse_bans_total`                   | counter | Bans armed by this instance's local tracker when a client reached the threshold. A ban armed only in Redis (from responses counted on other instances) is not included; it shows up under `blocked` when the client returns. |
+| `bans`            | `error_abuse_bans_total`                   | counter | New ban decisions owned by this instance. Without Redis, the local threshold arm owns the count. With Redis, the instance whose atomic record operation creates the shared block key owns it, including a threshold crossed by events from multiple instances; a local fail-open arm owns it only when no valid current Redis reply can settle the decision. Summing this counter across instances therefore counts one successful shared arm once, not once per local tracker. |
 | `evictions`       | `error_abuse_zone_evictions_total`         | counter | Unblocked clients evicted to make room for a new one. |
 | `alloc_failures`  | `error_abuse_zone_alloc_failures_total`    | counter | Tracked responses not recorded because the zone was full. |
 | `nodes`           | `error_abuse_zone_nodes`                   | gauge   | Clients held in the zone, including expired entries not yet reclaimed. |
@@ -457,6 +457,17 @@ prefixing the host: `host=tls://redis.internal` (or
 `host=rediss://redis.internal`). **Treat Redis as a trust
 boundary** — a compromised Redis could inject fake bans, so keep it on a private
 network.
+
+The Redis record script returns a fixed integer tuple
+`[blocked, count, deadline, armed_now]`. `armed_now` is `1` only for the atomic
+operation that created the shared block key. Records received while that key is
+already active return `armed_now=0` and do not start another event window or
+extend the ban. A block value is active only when it contains a canonical
+positive decimal integer deadline within Redis Lua's exact-integer range and
+has a positive remaining TTL; malformed, non-expiring, or out-of-range string
+values are removed before normal event accounting resumes. Older two- or
+three-integer replies remain accepted during a rolling upgrade; their ban metric
+falls back to the local threshold arm.
 
 ## Excluding clients (allowlists)
 

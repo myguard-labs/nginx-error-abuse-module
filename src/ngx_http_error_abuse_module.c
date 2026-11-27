@@ -360,7 +360,8 @@ static ngx_int_t ngx_http_error_abuse_stats_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_error_abuse_redis_check(
     ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx);
 static void ngx_http_error_abuse_redis_record(
-    ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx);
+    ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx,
+    ngx_flag_t local_armed);
 static ngx_int_t ngx_http_error_abuse_redis_connect(void);
 static void ngx_http_error_abuse_redis_arm_reconnect(void);
 static ngx_int_t ngx_http_error_abuse_redis_attach(redisAsyncContext *ac,
@@ -426,6 +427,14 @@ ngx_http_error_abuse_platform_owner_release(
 static const char ngx_http_error_abuse_redis_record_script[] =
     "local t=redis.call('TIME') "
     "local now=t[1]*1000+math.floor(t[2]/1000) "
+    "local active=redis.pcall('GET',KEYS[2]) "
+    "if type(active)=='string' then "
+    "local canonical=string.match(active,'^[1-9][0-9]*$') "
+    "if canonical and (#active<16 or (#active==16 "
+    "and active<='9007199254740991')) then "
+    "local deadline=tonumber(active) local ttl=redis.call('PTTL',KEYS[2]) "
+    "if deadline and ttl>0 then return {1,0,0,0} end end "
+    "redis.call('DEL',KEYS[2]) end "
     "redis.call('ZREMRANGEBYSCORE',KEYS[1],'-inf',now-ARGV[1]) "
     "redis.call('ZADD',KEYS[1],now,now..':'..ARGV[5]) "
     "local n=redis.call('ZCARD',KEYS[1]) "
@@ -433,12 +442,12 @@ static const char ngx_http_error_abuse_redis_record_script[] =
     "if n>=tonumber(ARGV[2]) then "
     "local deadline=math.ceil((now+ARGV[3])/1000) "
     "redis.call('SET',KEYS[2],deadline,'PX',ARGV[3]) "
-    "redis.call('DEL',KEYS[1]) return {1,n,deadline} end "
-    "return {0,n}";
+    "redis.call('DEL',KEYS[1]) return {1,n,deadline,1} end "
+    "return {0,n,0,0}";
 
 /* SHA1 hex of the record script. The script never changes, so this is computed
  * once at init_process; record() then uses EVALSHA instead of shipping the full
- * ~470-byte script on every tracked error response. The script is primed into
+ * script on every tracked error response. The script is primed into
  * the Redis script cache via SCRIPT LOAD on each (re)connect, and a NOSCRIPT
  * reply (cache flushed) re-primes it. */
 static u_char ngx_http_error_abuse_script_sha[40];
@@ -973,7 +982,7 @@ ngx_http_error_abuse_find_touch_locked(ngx_http_error_abuse_zone_t *zone,
 static ngx_int_t
 ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
     time_t now, ngx_uint_t *count, time_t *blocked_until,
-    ngx_flag_t count_request)
+    ngx_flag_t *armed_now, ngx_flag_t count_request)
 {
     uint32_t                        hash;
     ngx_uint_t                      index;
@@ -981,6 +990,7 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
     ngx_http_error_abuse_node_t    *ean;
 
     hash = ngx_crc32_short(key->data, key->len);
+    *armed_now = 0;
 
     ngx_shmtx_lock(&zone->shpool->mutex);
 
@@ -1033,7 +1043,10 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
             now, zone->block);
         ean->event_head = 0;
         ean->event_count = 0;
-        zone->sh->stats.bans++;
+        *armed_now = 1;
+        if (!zone->redis) {
+            zone->sh->stats.bans++;
+        }
     }
 
     *count = (ean->blocked_until > now) ? zone->threshold
@@ -1300,6 +1313,16 @@ ngx_http_error_abuse_stats_count_request(ngx_http_error_abuse_zone_t *zone)
     ngx_shmtx_unlock(&zone->shpool->mutex);
 }
 
+/* Redis-enabled zones settle bans after the atomic record reply. Keep the
+ * 64-bit update inside the zone lock, including on 32-bit and Windows. */
+static void
+ngx_http_error_abuse_stats_count_ban(ngx_http_error_abuse_zone_t *zone)
+{
+    ngx_shmtx_lock(&zone->shpool->mutex);
+    zone->sh->stats.bans++;
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+}
+
 /* error_abuse_stats: a Redis-sourced block decision never reaches
  * is_blocked(), so it is counted here under its own short lock. Rare path:
  * only a client Redis already reports as blocked gets here. */
@@ -1450,6 +1473,7 @@ static ngx_int_t
 ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
 {
     ngx_int_t                        rc;
+    ngx_flag_t                       local_armed;
     time_t                           now;
     ngx_http_error_abuse_req_ctx_t  *ctx;
     ngx_http_error_abuse_loc_conf_t *conf;
@@ -1554,10 +1578,10 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
 
     rc = ngx_http_error_abuse_record(ctx->zone, &ctx->key, now,
                                      &ctx->count, &ctx->blocked_until,
-                                     !ctx->stats_counted);
+                                     &local_armed, !ctx->stats_counted);
     ctx->stats_counted = 1;
     if (ctx->zone->redis) {
-        ngx_http_error_abuse_redis_record(r, ctx);
+        ngx_http_error_abuse_redis_record(r, ctx, local_armed);
     }
     if (rc == NGX_ERROR) {
         /* F-3: the zone had no room to allocate a node for this new identity
@@ -3985,28 +4009,61 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     ngx_http_run_posted_requests(c);
 }
 
-/* COR-5: validate the record EVAL reply. The script returns {blocked, count}
- * (plus an optional deadline). OOM, ACL, read-only-replica, script and
- * protocol errors all arrive here; treat anything but the expected integer
- * array as a failure so the circuit breaker can trip. privdata is NULL — the
- * originating request is long gone, so log against the worker. */
 static void
-ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
-    void *privdata)
+ngx_http_error_abuse_redis_record_callback_impl(redisAsyncContext *ac,
+    void *data, ngx_http_error_abuse_zone_t *zone, ngx_flag_t local_armed)
 {
-    redisReply  *reply = data;
+    ngx_flag_t   armed_now, marker;
+    redisReply  *reply;
+
+    reply = data;
+    armed_now = 0;
+    marker = 0;
 
     if (reply == NULL) {
         ngx_http_error_abuse_redis_record_failure(ngx_time());
+        if (local_armed) {
+            ngx_http_error_abuse_stats_count_ban(zone);
+        }
         return;
     }
 
     if (reply->type == REDIS_REPLY_ARRAY
         && reply->elements >= 2
+        && reply->element != NULL
+        && reply->element[0] != NULL
+        && reply->element[1] != NULL
         && reply->element[0]->type == REDIS_REPLY_INTEGER
-        && reply->element[1]->type == REDIS_REPLY_INTEGER)
+        && reply->element[1]->type == REDIS_REPLY_INTEGER
+        && reply->element[0]->integer >= 0
+        && reply->element[0]->integer <= 1
+        && reply->element[1]->integer >= 0
+        && (reply->elements != 3
+            || (reply->element[2] != NULL
+                && reply->element[2]->type == REDIS_REPLY_INTEGER))
+        && (reply->elements < 4
+            || (reply->element[2] != NULL
+                && reply->element[3] != NULL
+                && reply->element[2]->type == REDIS_REPLY_INTEGER
+                && reply->element[3]->type == REDIS_REPLY_INTEGER
+                && reply->element[3]->integer >= 0
+                && reply->element[3]->integer <= 1
+                && (reply->element[3]->integer == 0
+                    || reply->element[0]->integer == 1))))
     {
+        /* New writers return a fixed [blocked, count, deadline, armed_now]
+         * tuple. The fourth integer is the atomic ownership decision: only
+         * the EVAL that created the block key reports 1. During a rolling
+         * upgrade, accept the former two/three-integer replies and preserve
+         * their local-only ban accounting. */
+        if (reply->elements >= 4) {
+            marker = 1;
+            armed_now = (reply->element[3]->integer == 1);
+        }
         ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
+        if (armed_now || (!marker && local_armed)) {
+            ngx_http_error_abuse_stats_count_ban(zone);
+        }
         return;
     }
 
@@ -4025,6 +4082,9 @@ ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
         ngx_log_error(NGX_LOG_WARN, ngx_http_error_abuse_redis_worker.log, 0,
                       "error_abuse: Redis script cache miss (NOSCRIPT); "
                       "reloading record script");
+        if (local_armed) {
+            ngx_http_error_abuse_stats_count_ban(zone);
+        }
         return;
     }
 
@@ -4034,11 +4094,32 @@ ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
                   "(type=%d, detail_len=%uz)", reply->type,
                   reply->type == REDIS_REPLY_ERROR && reply->str
                       ? reply->len : 0);
+    if (local_armed) {
+        ngx_http_error_abuse_stats_count_ban(zone);
+    }
+}
+
+/* COR-5/EA-06: hiredis invokes one callback per queued EVAL, including a
+ * NULL reply on disconnect. Separate wrappers carry whether the local zone
+ * armed on this response without retaining request memory or allocating a
+ * callback token. */
+static void
+ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
+    void *privdata)
+{
+    ngx_http_error_abuse_redis_record_callback_impl(ac, data, privdata, 0);
+}
+
+static void
+ngx_http_error_abuse_redis_record_local_callback(redisAsyncContext *ac,
+    void *data, void *privdata)
+{
+    ngx_http_error_abuse_redis_record_callback_impl(ac, data, privdata, 1);
 }
 
 static void
 ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
-    ngx_http_error_abuse_req_ctx_t *ctx)
+    ngx_http_error_abuse_req_ctx_t *ctx, ngx_flag_t local_armed)
 {
     char        interval[NGX_INT64_LEN + 1];
     char        threshold[NGX_INT_T_LEN + 1];
@@ -4048,6 +4129,7 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     u_char     *p;
     time_t      now;
     ngx_str_t   events, block;
+    redisCallbackFn *callback;
     const char *argv[10];
     size_t      argvlen[10];
 
@@ -4059,6 +4141,9 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: Redis unavailable for record");
+        if (local_armed) {
+            ngx_http_error_abuse_stats_count_ban(ctx->zone);
+        }
         return;
     }
 
@@ -4100,12 +4185,18 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     argv[9] = nonce;
     argvlen[9] = (size_t) (p - (u_char *) nonce);
 
+    callback = local_armed
+               ? ngx_http_error_abuse_redis_record_local_callback
+               : ngx_http_error_abuse_redis_record_callback;
     if (redisAsyncCommandArgv(ngx_http_error_abuse_redis_worker.context,
-                              ngx_http_error_abuse_redis_record_callback,
-                              NULL, 10, argv, argvlen) != REDIS_OK)
+                              callback,
+                              ctx->zone, 10, argv, argvlen) != REDIS_OK)
     {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "error_abuse could not queue Redis event");
+        if (local_armed) {
+            ngx_http_error_abuse_stats_count_ban(ctx->zone);
+        }
     }
 
 #undef NGX_ERROR_ABUSE_REDIS_NUMBER
