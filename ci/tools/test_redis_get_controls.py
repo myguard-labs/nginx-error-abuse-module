@@ -4,6 +4,8 @@
 import io
 import pathlib
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -15,6 +17,7 @@ from test_runtime_get import (
     Reply,
     assert_cancellation,
     assert_completion,
+    assert_one_completion,
     block_key,
     digest,
     prefix_consumed,
@@ -83,7 +86,7 @@ class Parser(unittest.TestCase):
 
 class Peer(unittest.TestCase):
     def setUp(self):
-        self.peer = GetPeer(b"check", b"record", ack_timeout=0.05)
+        self.peer = GetPeer(b"check", b"record")
         self.peer.start()
         self.addCleanup(self.peer.stop)
         self.client = socket.create_connection(("127.0.0.1", self.peer.port), 1)
@@ -118,6 +121,7 @@ class Peer(unittest.TestCase):
             if split:
                 self.assertEqual(self.stream.read(split), reply.wire[:split])
                 self.assertFalse(reply.finished.is_set())
+                time.sleep(0.06)
                 reply.release.set()
             self.assertEqual(
                 self.stream.read(len(reply.wire) - split), reply.wire[split:]
@@ -128,6 +132,7 @@ class Peer(unittest.TestCase):
 
     def test_missing_ack_propagates(self):
         self.handshake()
+        self.peer.ack_timeout = 0.05
         reply = Reply("missing", b"$-1\r\n", 1)
         self.get(reply)
         self.assertEqual(self.stream.read(1), b"$")
@@ -186,6 +191,28 @@ class Peer(unittest.TestCase):
         self.peer.prepare(Reply("one", b"$-1\r\n"))
         with self.assertRaisesRegex(AssertionError, "overlapping GET replies"):
             self.peer.prepare(Reply("two", b"$-1\r\n"))
+
+    def test_setup_error_stops_non_daemon_peer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "conf").mkdir()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    pathlib.Path(__file__).with_name("test_runtime_get.py"),
+                    "--nginx-binary",
+                    "/nonexistent/nginx",
+                    "--module",
+                    "/nonexistent/module.so",
+                    "--root",
+                    root,
+                ],
+                capture_output=True,
+                check=False,
+                timeout=3,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"FileExistsError", result.stderr)
 
 
 class Oracles(unittest.TestCase):
@@ -254,6 +281,16 @@ class Oracles(unittest.TestCase):
                 self.assertRaisesRegex(AssertionError, message),
             ):
                 assert_cancellation(bad)
+
+    def test_completion_rejects_second_status_for_same_request(self):
+        assert_one_completion(["nil-1 200"], "nil-1", "200")
+        for lines in (
+            ["nil-1 200", "nil-1 499"],
+            ["nil-1 499", "nil-1 200"],
+            ["nil-1 200", "nil-1 200"],
+        ):
+            with self.assertRaisesRegex(AssertionError, "repeated HTTP completion"):
+                assert_one_completion(lines, "nil-1", "200")
 
     def test_fd_baseline_waits_for_owned_http_socket_close(self):
         with tempfile.TemporaryDirectory() as directory:

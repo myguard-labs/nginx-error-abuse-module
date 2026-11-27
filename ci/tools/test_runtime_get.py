@@ -11,6 +11,7 @@ then requires cleanup and the later Redis callback to settle both observers.
 
 import argparse
 import ast
+import contextlib
 import dataclasses
 import hashlib
 import io
@@ -245,7 +246,8 @@ class GetPeer:
             try:
                 connection.shutdown(socket.SHUT_RDWR)
             except OSError:
-                pass
+                # A concurrent peer close already completed this stop step.
+                continue
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=3)
@@ -335,6 +337,12 @@ def assert_cancellation(log: str) -> dict:
     return final
 
 
+def assert_one_completion(lines: list[str], identity: str, status: str) -> None:
+    completions = [line for line in lines if line.startswith(f"{identity} ")]
+    if completions != [f"{identity} {status}"]:
+        raise AssertionError("GET repeated HTTP completion")
+
+
 def prefix_consumed(log: str, reply: Reply) -> bool:
     return any(
         s["where"] == "read"
@@ -383,18 +391,21 @@ def test_redis_get(
     )
     peer = GetPeer(check, record)
     peer.start()
-    slow_listener = socket.socket()
-    slow_listener.bind(("127.0.0.1", 0))
-    slow_listener.listen()
-    slow_listener.settimeout(5)
-    slow_port = slow_listener.getsockname()[1]
+    slow_listener = None
     slow_client = None
     upstream = None
-    nginx = Nginx(binary, module, root, port, "", selection != "cancel", peer.port)
-    (root / "conf").mkdir(parents=True)
-    (root / "logs").mkdir()
-    (root / "conf/nginx.conf").write_text(
-        f"""load_module {module};
+    nginx = None
+    try:
+        slow_listener = socket.socket()
+        slow_listener.bind(("127.0.0.1", 0))
+        slow_listener.listen()
+        slow_listener.settimeout(5)
+        slow_port = slow_listener.getsockname()[1]
+        nginx = Nginx(binary, module, root, port, "", selection != "cancel", peer.port)
+        (root / "conf").mkdir(parents=True)
+        (root / "logs").mkdir()
+        (root / "conf/nginx.conf").write_text(
+            f"""load_module {module};
 worker_processes 1;
 worker_shutdown_timeout 100ms;
 pid {root}/nginx.pid;
@@ -414,8 +425,20 @@ http {{
     }}
 }}
 """,
-        encoding="ascii",
-    )
+            encoding="ascii",
+        )
+    except BaseException:
+        if slow_listener is not None:
+            with contextlib.suppress(OSError):
+                slow_listener.close()
+        if nginx is not None:
+            with contextlib.suppress(Exception):
+                nginx.stop()
+        with contextlib.suppress(Exception):
+            peer.stop()
+        raise
+    assert slow_listener is not None
+    assert nginx is not None
     error_path = root / "logs/error.log"
     access_path = root / "access.log"
 
@@ -514,13 +537,9 @@ http {{
                 "GET missing HTTP completion",
                 peer,
             )
-            if (
-                access_path.read_text()
-                .splitlines()
-                .count(f"{reply.identity} {status.decode()}")
-                != 1
-            ):
-                raise AssertionError("GET repeated HTTP completion")
+            assert_one_completion(
+                access_path.read_text().splitlines(), reply.identity, status.decode()
+            )
             wait_until(
                 lambda: worker_fds(proc, port) == baseline,
                 "GET worker fd snapshot did not return to baseline",
@@ -594,7 +613,7 @@ http {{
                 lambda: (
                     [kind for kind, _ in events(log()[offset:])] == ["park", "cleanup"]
                 ),
-                "cancellation GET client close did not run request cleanup",
+                "cancellation GET shutdown did not run request cleanup",
                 peer,
             )
             final = wait_until(
@@ -647,13 +666,13 @@ http {{
                 if len(wire) != length:
                     raise AssertionError("GET frozen reply byte count changed")
                 identity = f"{kind}-{split}"
+                settle = len(log())
                 started = run(Reply(identity, wire, split, deadline))
                 # A distinct key must use the same session before the original
                 # command's timer deadline; then await the real idle timer wake.
                 run(Reply(identity + "-before", b"$-1\r\n"))
                 if time.monotonic() >= started + TIMEOUT:
                     raise AssertionError("GET same-session reuse missed prior deadline")
-                settle = len(log())
                 wait_until(
                     lambda settle=settle: idle(settle),
                     "GET adapter timer did not settle",
@@ -661,8 +680,8 @@ http {{
                 )
                 if time.monotonic() < started + TIMEOUT:
                     raise AssertionError("GET idle witness preceded prior deadline")
-                run(Reply(identity + "-after", b"$-1\r\n"))
                 settle = len(log())
+                run(Reply(identity + "-after", b"$-1\r\n"))
                 wait_until(
                     lambda settle=settle: idle(settle),
                     "GET reuse timer did not settle",
