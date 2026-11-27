@@ -22,6 +22,8 @@
 #define NGX_LOG_DEBUG_HTTP 0
 
 typedef unsigned char u_char;
+typedef int ngx_flag_t;
+typedef void (redisCallbackFn)(void *, void *, void *);
 typedef struct { size_t len; u_char *data; } ngx_str_t;
 typedef struct { DURATION_TYPE interval, block, inactive; unsigned threshold; }
     test_zone_t;
@@ -33,12 +35,14 @@ static struct { void *context; uint64_t nonce; unsigned sequence; }
     ngx_http_error_abuse_redis_worker;
 static char ngx_http_error_abuse_script_sha[40];
 static int available = 1, keys_result, queue_result, queued, warnings;
+static int fallback_bans;
 static int64_t expected[3];
 
 #define ngx_log_debug0(...) ((void) 0)
 #define ngx_log_debug3(...) ((void) 0)
 #define ngx_log_error(...) ((void) warnings++)
 #define ngx_http_error_abuse_redis_record_callback NULL
+#define ngx_http_error_abuse_redis_record_local_callback NULL
 
 static void
 check(int ok, const char *message)
@@ -73,6 +77,13 @@ ngx_http_error_abuse_redis_keys(void *pool,
     block->data = (u_char *) "block";
     block->len = 5;
     return keys_result;
+}
+
+static void
+ngx_http_error_abuse_stats_count_ban(test_zone_t *zone)
+{
+    check(zone != NULL, "fallback ban zone");
+    fallback_bans++;
 }
 
 /* The only formatting adapter: preserve the production macro's int64_t
@@ -146,21 +157,24 @@ main(void)
         expected[0] = seconds[i] * INT64_C(1000);
         expected[1] = seconds[(i + 1) % 5] * INT64_C(1000);
         expected[2] = seconds[(i + 2) % 5] * INT64_C(1000);
-        ngx_http_error_abuse_redis_record(&request, &ctx);
+        ngx_http_error_abuse_redis_record(&request, &ctx, 0);
         check(queued == (int) i + 1, "each accepted duration queues a record");
     }
 
     available = 0;
-    ngx_http_error_abuse_redis_record(&request, &ctx);
+    ngx_http_error_abuse_redis_record(&request, &ctx, 1);
     check(queued == 5, "unavailable Redis does not queue a record");
+    check(fallback_bans == 1, "unavailable Redis counts a local ban once");
     available = 1;
     keys_result = -1;
-    ngx_http_error_abuse_redis_record(&request, &ctx);
+    ngx_http_error_abuse_redis_record(&request, &ctx, 1);
     check(queued == 5, "key failure does not queue a record");
+    check(fallback_bans == 2, "key failure counts a local ban once");
     keys_result = 0;
     queue_result = -1;
-    ngx_http_error_abuse_redis_record(&request, &ctx);
+    ngx_http_error_abuse_redis_record(&request, &ctx, 1);
     check(queued == 6 && warnings == 1, "queue failure emits a warning");
+    check(fallback_bans == 3, "queue failure counts a local ban once");
     puts("OK: all three Redis durations, time32 boundary, maximum, error paths");
     return 0;
 }
