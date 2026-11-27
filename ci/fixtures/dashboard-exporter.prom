@@ -1,0 +1,33 @@
+# HELP error_abuse_requests_total Requests checked against the zone.
+# TYPE error_abuse_requests_total counter
+error_abuse_requests_total{zone="client_errors"} 0
+# HELP error_abuse_matched_responses_total Responses with a status tracked by the zone.
+# TYPE error_abuse_matched_responses_total counter
+error_abuse_matched_responses_total{zone="client_errors"} 0
+# HELP error_abuse_blocked_total Requests rejected by the module.
+# TYPE error_abuse_blocked_total counter
+error_abuse_blocked_total{zone="client_errors"} 0
+# HELP error_abuse_dry_run_would_block_total Dry-run decisions that would have blocked.
+# TYPE error_abuse_dry_run_would_block_total counter
+error_abuse_dry_run_would_block_total{zone="client_errors"} 0
+# HELP error_abuse_bans_total Bans armed after the threshold was reached.
+# TYPE error_abuse_bans_total counter
+error_abuse_bans_total{zone="client_errors"} 0
+# HELP error_abuse_zone_evictions_total Unblocked zone nodes evicted to make room.
+# TYPE error_abuse_zone_evictions_total counter
+error_abuse_zone_evictions_total{zone="client_errors"} 0
+# HELP error_abuse_zone_alloc_failures_total Tracked responses not recorded because the zone was full.
+# TYPE error_abuse_zone_alloc_failures_total counter
+error_abuse_zone_alloc_failures_total{zone="client_errors"} 0
+# HELP error_abuse_zone_nodes Client identities held in the zone.
+# TYPE error_abuse_zone_nodes gauge
+error_abuse_zone_nodes{zone="client_errors"} 0
+# HELP error_abuse_blocked_clients Client identities currently blocked.
+# TYPE error_abuse_blocked_clients gauge
+error_abuse_blocked_clients{zone="client_errors"} 0
+# HELP error_abuse_zone_used_bytes Zone bytes reserved including slab overhead.
+# TYPE error_abuse_zone_used_bytes gauge
+error_abuse_zone_used_bytes{zone="client_errors"} 73728
+# HELP error_abuse_zone_size_bytes Zone size in bytes.
+# TYPE error_abuse_zone_size_bytes gauge
+error_abuse_zone_size_bytes{zone="client_errors"} 10485760

@@ -1,4 +1,4 @@
-# sync-sha: bea84711b8ae10fbe28f773c86261fab9580a60eb23a75f3b980bb9c6f37960e
+# sync-sha: 41888c3257fa349e71bc65f1ab2e6fc2e5ea76550b0e009b47d6b7a182f417c9
 name: Build and Test
 
 env:
@@ -56,6 +56,13 @@ jobs:
 
       - name: Validate scripts and source
         run: |
+          # Extract the distro tool without installing or starting a service.
+          tool_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$tool_dir"' EXIT
+          tool_package=prometheus
+          if apt-cache show promtool >/dev/null 2>&1; then tool_package=promtool; fi
+          (cd "$tool_dir" && apt-get download "$tool_package" && dpkg-deb -x ./*.deb extracted)
+          export PROMTOOL="$tool_dir/extracted/usr/bin/promtool"
           bash -n ci/tools/ci-build.sh
           bash -n ci/tools/test-ci-build-source.sh
           bash -n ci/tools/test-ci-build-cache.sh
@@ -64,6 +71,7 @@ jobs:
           shellcheck ci/tools/ci-build.sh ci/tools/build-identity.sh ci/tools/ci-build-artifact.sh ci/tools/test-ci-build-source.sh ci/tools/test-ci-build-cache.sh ci/tools/test-ci-build-cache-containment.sh ci/tools/test-ci-build-artifact.sh
           bash ci/tools/test-ci-build-cache-containment.sh
           bash ci/tools/test-ci-build-artifact.sh
+          python3 ci/tools/test_dashboard.py
           python3 ci/tools/test_release_provenance.py
           python3 ci/tools/test_ci_cache_policy.py
           python3 ci/tools/check_ci_graph.py

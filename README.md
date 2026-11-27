@@ -440,6 +440,29 @@ Responses carry `Vary: Accept`.
 > walks the zone under its lock, which takes O(clients) time, so scrape at a
 > normal interval (15 s or more), not continuously.
 
+### Grafana dashboard
+
+Import [`dashboards/error-abuse.json`](dashboards/error-abuse.json) into Grafana
+and select a Prometheus datasource. Choose one or more zones using the Zone
+selector. Panels show per-instance series; counter panels use `rate()` before
+any aggregation so nginx restarts do not produce negative rates. Ban decisions
+are owned by one instance as described in the table above.
+
+For the endpoint shown above, add a Prometheus scrape job such as:
+
+```yaml
+scrape_configs:
+  - job_name: error-abuse
+    scrape_interval: 30s
+    metrics_path: /error-abuse-metrics
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+Use the address and port of your management listener, and allow the Prometheus
+server through the endpoint's access controls. Keep `error_abuse off;` in the
+stats location so scraping does not affect enforcement or counters.
+
 ## About Redis (optional)
 
 By default each NGINX server bans on its own. If you run several servers behind
