@@ -2160,6 +2160,9 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             seen |= NGX_HTTP_ERROR_ABUSE_SEEN_KEY;
             key.data = value[i].data + 4;
             key.len = value[i].len - 4;
+            if (key.len == 0) {
+                goto invalid;
+            }
 
         } else if (ngx_strncmp(value[i].data, "statuses=", 9) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_STATUSES) {

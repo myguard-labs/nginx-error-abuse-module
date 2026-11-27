@@ -202,6 +202,10 @@ location / { error_abuse zone=client_errors; }
 Declares a zone. Only `zone=name:size` is required; the rest default to a
 deliberately relaxed policy that catches *sustained* abuse, not the odd 404.
 
+Omitting `key` uses `$binary_remote_addr`. An explicit `key=` must contain a
+nonempty expression; an empty value is a configuration error. A valid expression
+that evaluates to an empty value for a request still leaves that request untracked.
+
 | Parameter          | Default               | Meaning                                            |
 | ------------------ | --------------------- | -------------------------------------------------- |
 | `zone`             | *(required)*          | Name and shared-memory size, e.g. `client:10m`.    |
