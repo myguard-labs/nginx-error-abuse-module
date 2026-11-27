@@ -300,6 +300,7 @@ import atexit
 import concurrent.futures
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import os
@@ -4085,6 +4086,64 @@ def _assert_prometheus(body: str, openmetrics: bool) -> None:
         raise AssertionError(f"EOF marker mismatch (openmetrics={openmetrics})")
 
 
+def test_stats_accept(port: int) -> None:
+    """RA02-EA-20 / EA-04: exercise the actual repeated-header consumer."""
+    specific_zero = "application/openmetrics-text;version=1.0.0;q=0"
+    generic_one = "application/openmetrics-text;q=1"
+    plain_half = "text/plain;q=0.5"
+    om_prefix = generic_one + ";x="
+    plain_prefix = "text/plain;q=0;x="
+    byte_boundary = [
+        om_prefix + "a" * (4096 - len(om_prefix)),
+        plain_prefix + "a" * (4096 - len(plain_prefix)),
+    ]
+    cases = [
+        ("specific refusal", [f"{specific_zero}, {generic_one}, {plain_half}"], False),
+        ("repeated specific first", [specific_zero, generic_one, plain_half], False),
+        ("repeated generic first", [generic_one, specific_zero, plain_half], False),
+        ("equal specificity", [specific_zero, specific_zero[:-1] + "1"], True),
+        ("format tie", ["application/openmetrics-text;q=0.5", plain_half], True),
+        ("zero tie", [specific_zero, "text/plain;q=0"], False),
+        ("unsupported version", ["application/openmetrics-text;version=2.0.0"], False),
+        ("empty parameters", ["application/openmetrics-text; ;version=1.0.0;;"], True),
+        ("delimiter OWS", ["application/openmetrics-text \t; \tversion=1.0.0"], True),
+        ("space before equals", ["application/openmetrics-text;q =1"], False),
+        ("tab after equals", ["application/openmetrics-text;q=\t1"], False),
+        ("malformed later field", [generic_one, "text/plain;q=2"], False),
+        ("parameter budget", [generic_one + ";" * 15], True),
+        ("parameter over budget", [generic_one + ";" * 16], False),
+        ("item budget", [generic_one, "," * 30], True),
+        ("item over budget", [generic_one, "," * 31], False),
+        ("byte budget", byte_boundary, True),
+        ("byte over budget", [byte_boundary[0], byte_boundary[1] + "a"], False),
+    ]
+    for name, fields, openmetrics in cases:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            connection.putrequest("GET", "/ea-stats-prom")
+            connection.putheader("Connection", "close")
+            for value in fields:
+                connection.putheader("Accept", value)
+            connection.endheaders()
+            response = connection.getresponse()
+            body = response.read()
+            expected = "application/openmetrics-text" if openmetrics else "text/plain"
+            content_type = response.getheader("Content-Type", "")
+            if (
+                response.status != 200
+                or not content_type.startswith(expected + ";")
+                or body.endswith(b"# EOF\n") != openmetrics
+                or response.getheader("Vary") != "Accept"
+            ):
+                raise AssertionError(
+                    f"RA02-EA-20/EA-04 {name}: status={response.status} "
+                    f"content-type={content_type!r}, expected={expected}"
+                )
+        finally:
+            connection.close()
+    print(f"OK: RA02-EA-20/EA-04 Accept negotiation {len(cases)} cases")
+
+
 def test_stats_and_matched(port: int, root: pathlib.Path) -> None:
     """Issue #86 log filter + error_abuse_stats counters, one zone, threshold 2.
 
@@ -4163,6 +4222,8 @@ def test_stats_and_matched(port: int, root: pathlib.Path) -> None:
         _, headers, _ = http_call(port, "/ea-stats-prom", headers={"Accept": accept})
         if not headers.get("content-type", "").startswith("text/plain"):
             raise AssertionError(f"Accept {accept!r} chose {headers}")
+
+    test_stats_accept(port)
 
     # ?format=json overrides the prometheus directive default.
     status, headers, body = http_call(port, "/ea-stats-prom?format=json")

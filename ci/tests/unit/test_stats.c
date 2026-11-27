@@ -133,11 +133,12 @@ static ngx_int_t
 try_accept(const char *value, ngx_int_t *om, ngx_int_t *plain)
 {
     ngx_str_t   v = str(value);
-    ngx_uint_t  items = 0;
+    ngx_uint_t  items = 0, om_specificity = 0, plain_specificity = 0;
 
     *om = 0;
     *plain = 0;
-    return ngx_http_error_abuse_accept(&v, &items, om, plain);
+    return ngx_http_error_abuse_accept(&v, &items, om, plain, &om_specificity,
+                                       &plain_specificity);
 }
 
 
@@ -148,7 +149,7 @@ case_accept(void)
     size_t      i;
     ngx_int_t   om, plain;
     ngx_str_t   field;
-    ngx_uint_t  items;
+    ngx_uint_t  items, om_specificity, plain_specificity;
 
     check(try_accept("application/openmetrics-text", &om, &plain) == NGX_OK
           && om == 1000 && plain == 0, "bare OpenMetrics media type");
@@ -180,11 +181,14 @@ case_accept(void)
           "parameter comparison rejects truncated escape directly");
     field = str("application/openmetrics-text;charset=\"utf\\-8\"");
     om = plain = 0;
+    om_specificity = plain_specificity = 0;
     items = NGX_HTTP_ERROR_ABUSE_NEGOTIATE_ITEMS - 1;
-    check(ngx_http_error_abuse_accept(&field, &items, &om, &plain) == NGX_OK
+    check(ngx_http_error_abuse_accept(&field, &items, &om, &plain,
+                                    &om_specificity, &plain_specificity) == NGX_OK
           && om == 1000 && items == NGX_HTTP_ERROR_ABUSE_NEGOTIATE_ITEMS,
           "escaped parameter respects repeated-field shared item boundary");
-    check(ngx_http_error_abuse_accept(&field, &items, &om, &plain) == NGX_ERROR,
+    check(ngx_http_error_abuse_accept(&field, &items, &om, &plain,
+                                    &om_specificity, &plain_specificity) == NGX_ERROR,
           "repeated escaped parameter field exceeding shared budget rejected");
     check(try_accept("text/plain;q=0.5, application/openmetrics-text;q=0.4",
                  &om, &plain) == NGX_OK && om == 400 && plain == 500,
@@ -212,8 +216,8 @@ case_accept(void)
           && plain == 300 && om == 0, "leading and inner empty elements");
     check(try_accept(",", &om, &plain) == NGX_OK && om == 0 && plain == 0,
           "list of only empty elements");
-    check(try_accept("text/plain;,", &om, &plain) == NGX_ERROR,
-          "empty parameter still rejected");
+    check(try_accept("text/plain;,", &om, &plain) == NGX_OK && plain == 1000,
+          "RA02-EA-20 empty parameter before comma is allowed");
 
     many[0] = '\0';
     for (i = 0; i < NGX_HTTP_ERROR_ABUSE_NEGOTIATE_ITEMS; i++) {
@@ -229,6 +233,129 @@ case_accept(void)
     }
     check(try_accept(many, &om, &plain) == NGX_ERROR,
           "empty elements spend the item budget");
+}
+
+
+static void
+case_accept_contract(void)
+{
+    static const struct {
+        const char  *value;
+        ngx_int_t    rc, om, plain;
+        const char  *name;
+    } cases[] = {
+        { " \tapplication/openmetrics-text \t; \tversion=1.0.0 \t; q=0.8 \t",
+          NGX_OK, 800, 0, "RA02-EA-20 delimiter OWS" },
+        { "application/openmetrics-text; ;\t;version=1.0.0;;q=0.8;\t",
+          NGX_OK, 800, 0, "RA02-EA-20 empty parameters around media and q" },
+        { "application/openmetrics-text;\t, text/plain;q=0.5",
+          NGX_OK, 1000, 500, "RA02-EA-20 empty parameter before next item" },
+        { "application/openmetrics-text;version =1.0.0",
+          NGX_ERROR, 0, 0, "RA02-EA-20 space before equals rejected" },
+        { "application/openmetrics-text;version= 1.0.0",
+          NGX_ERROR, 0, 0, "RA02-EA-20 space after equals rejected" },
+        { "application/openmetrics-text;q\t=1",
+          NGX_ERROR, 0, 0, "RA02-EA-20 tab before equals rejected" },
+        { "application/openmetrics-text;q=\t1",
+          NGX_ERROR, 0, 0, "RA02-EA-20 tab after equals rejected" },
+        { "application/openmetrics-text;version",
+          NGX_ERROR, 0, 0, "RA02-EA-20 missing equals rejected" },
+        { "application/openmetrics-text;=1",
+          NGX_ERROR, 0, 0, "RA02-EA-20 empty name rejected" },
+        { "application/openmetrics-text;version=",
+          NGX_ERROR, 0, 0, "RA02-EA-20 empty token value rejected" },
+        { "application/openmetrics-text;version=\"\"",
+          NGX_OK, 0, 0, "RA02-EA-20 empty quoted media value does not match" },
+        { "application/openmetrics-text;version=\"1.0.0\"x",
+          NGX_ERROR, 0, 0, "RA02-EA-20 quoted suffix rejected" },
+        { "application/openmetrics-text;\r",
+          NGX_ERROR, 0, 0, "RA02-EA-20 CR is not OWS" },
+        { "application /openmetrics-text",
+          NGX_ERROR, 0, 0, "RA02-EA-20 whitespace within type rejected" },
+        { "application/openmetrics-text;version=1.0.0;q=0, "
+          "application/openmetrics-text;q=1, text/plain;q=0.5",
+          NGX_OK, 0, 500, "EA-04 explicit version q=0 overrides generic q=1" },
+        { "application/openmetrics-text;q=1, text/plain;q=0.5, "
+          "application/openmetrics-text;version=1.0.0;q=0",
+          NGX_OK, 0, 500, "EA-04 specificity independent of item order" },
+        { "application/openmetrics-text;version=2.0.0;q=0, "
+          "application/openmetrics-text;q=0.7",
+          NGX_OK, 700, 0, "EA-04 unsupported version does not override" },
+        { "application/openmetrics-text;foo=bar;q=0, "
+          "application/openmetrics-text;q=0.7",
+          NGX_OK, 700, 0, "EA-04 unknown media parameter does not override" },
+        { "application/openmetrics-text;charset=utf-8;q=0.2, "
+          "application/openmetrics-text;q=0.9",
+          NGX_OK, 200, 0, "EA-04 charset is a media constraint" },
+        { "application/openmetrics-text;version=1.0.0;charset=utf-8;q=0.1, "
+          "application/openmetrics-text;version=1.0.0;q=0.9",
+          NGX_OK, 100, 0, "EA-04 two constraints outrank one" },
+        { "application/openmetrics-text;version=1.0.0;q=0.2, "
+          "application/openmetrics-text;version=1.0.0;q=0.8",
+          NGX_OK, 800, 0, "EA-04 equal specificity retains highest q" },
+        { "application/openmetrics-text;version=1.0.0;q=0.8, "
+          "application/openmetrics-text;version=1.0.0;q=0.2",
+          NGX_OK, 800, 0, "EA-04 equal specificity q is order independent" },
+        { "application/openmetrics-text;;q=0, application/openmetrics-text;q=0.6",
+          NGX_OK, 600, 0, "EA-04 empty slots add no specificity" },
+        { "application/openmetrics-text;version=1.0.0;version=1.0.0;q=0.1, "
+          "application/openmetrics-text;charset=utf-8;q=0.8",
+          NGX_OK, 800, 0, "EA-04 duplicate names add no specificity" },
+        { "application/openmetrics-text;q=0;version=1.0.0, "
+          "application/openmetrics-text;q=0.6",
+          NGX_OK, 600, 0, "EA-04 legacy extensions add no specificity" },
+        { "text/plain;version=0.0.4;q=0, text/plain;q=1, "
+          "application/openmetrics-text;q=0.5",
+          NGX_OK, 500, 0, "EA-04 plain specificity uses same rule" },
+        { "application/openmetrics-text;q=0.5, text/plain;q=0.5",
+          NGX_OK, 500, 500, "EA-04 format quality tie" },
+        { "application/openmetrics-text;q=0, text/plain;q=0",
+          NGX_OK, 0, 0, "EA-04 zero quality never opts in" },
+        { "application/openmetrics-text;version=1.0.0;q=0.1234",
+          NGX_ERROR, 0, 0, "EA-04 invalid specific quality rejected" },
+        { "application/openmetrics-text;version=1.0.0;q=0;q=1",
+          NGX_ERROR, 0, 0, "EA-04 duplicate specific quality rejected" }
+    };
+    char        many[128];
+    size_t      i;
+    ngx_str_t   field;
+    ngx_int_t   om, plain, rc;
+    ngx_uint_t  items, om_specificity, plain_specificity, order;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        rc = try_accept(cases[i].value, &om, &plain);
+        check(rc == cases[i].rc
+              && (rc != NGX_OK || (om == cases[i].om && plain == cases[i].plain)),
+              cases[i].name);
+    }
+
+    strcpy(many, "application/openmetrics-text");
+    for (i = 0; i < NGX_HTTP_ERROR_ABUSE_NEGOTIATE_PARAMS; i++) {
+        strcat(many, ";");
+    }
+    check(try_accept(many, &om, &plain) == NGX_OK && om == 1000,
+          "RA02-EA-20 empty parameters at budget");
+    strcat(many, ";");
+    check(try_accept(many, &om, &plain) == NGX_ERROR,
+          "RA02-EA-20 empty parameters over budget");
+
+    for (order = 0; order < 2; order++) {
+        items = om_specificity = plain_specificity = 0;
+        om = plain = 0;
+        field = str(order ? "application/openmetrics-text;q=1"
+                          : "application/openmetrics-text;version=1.0.0;q=0");
+        rc = ngx_http_error_abuse_accept(&field, &items, &om, &plain,
+                                        &om_specificity, &plain_specificity);
+        field = str(order ? "application/openmetrics-text;version=1.0.0;q=0"
+                          : "application/openmetrics-text;q=1");
+        rc |= ngx_http_error_abuse_accept(&field, &items, &om, &plain,
+                                         &om_specificity, &plain_specificity);
+        field = str("text/plain;q=0.5");
+        rc |= ngx_http_error_abuse_accept(&field, &items, &om, &plain,
+                                         &om_specificity, &plain_specificity);
+        check(rc == NGX_OK && om == 0 && plain == 500 && items == 3,
+              "EA-04 repeated fields preserve specificity in both orders");
+    }
 }
 
 
@@ -354,6 +481,7 @@ main(void)
     case_utf8();
     case_query_format();
     case_accept();
+    case_accept_contract();
     case_json();
     case_prometheus();
 
