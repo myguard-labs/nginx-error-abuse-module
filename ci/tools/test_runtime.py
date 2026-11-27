@@ -1396,9 +1396,9 @@ class HostileRedisServer:
                 return b"-" + self.HANDSHAKE_ERROR + b"\r\n"
             digest = b"0" * 40
             return b"$40\r\n" + digest + b"\r\n"
-        if name == b"GET":
-            return b"-" + self.CHECK_ERROR + b"\r\n"
         if name == b"EVALSHA":
+            if len(command) == 4:
+                return b"-" + self.CHECK_ERROR + b"\r\n"
             return b"-" + self.EVAL_ERROR + b"\r\n"
         return b"-UNEXPECTED-COMMAND\r\n"
 
@@ -1460,9 +1460,9 @@ class LegacyRecordRedisServer(HostileRedisServer):
         name = command[0].upper()
         if name == b"SCRIPT":
             return b"$40\r\n" + b"0" * 40 + b"\r\n"
-        if name == b"GET":
-            return b"$-1\r\n"
         if name == b"EVALSHA":
+            if len(command) == 4:
+                return b"$-1\r\n"
             return b"*2\r\n:0\r\n:1\r\n"
         return b"-UNEXPECTED-COMMAND\r\n"
 
@@ -1478,7 +1478,7 @@ def test_redis_initial_recovery(
 
     class BlockedPeer(HostileRedisServer):
         def _response(self, command: list[bytes]) -> bytes:
-            if command[0].upper() == b"GET":
+            if command[0].upper() == b"EVALSHA" and len(command) == 4:
                 deadline = str(int(time.time()) + 30).encode("ascii")
                 return b"$" + str(len(deadline)).encode() + b"\r\n" + deadline + b"\r\n"
             return super()._response(command)
@@ -1512,16 +1512,16 @@ def test_redis_initial_recovery(
         peer.start()
         peer.wait_for(b"SCRIPT", timeout=5.0)
         expect(port, "/redis-ok?client=initial-recovery", 429)
-        peer.wait_for(b"GET")
+        peer.wait_for(b"EVALSHA")
         _wait_for_log_count(nginx.root / "access.log", b"client=initial-recovery", 2)
         access = (nginx.root / "access.log").read_text(encoding="ascii")
         if access.count("client=initial-recovery") != 2:
             raise AssertionError("initial recovery request completed more than once")
-        if peer.commands != [b"SCRIPT", b"GET"]:
+        if peer.commands != [b"SCRIPT", b"SCRIPT", b"EVALSHA"]:
             raise AssertionError(
                 f"initial recovery command ordering: {peer.commands!r}"
             )
-        print("OK: refused initial Redis connection recovered with one GET/resume")
+        print("OK: refused initial Redis connection recovered with one check/resume")
     finally:
         reservation.close()
         nginx.stop()
@@ -1530,7 +1530,7 @@ def test_redis_initial_recovery(
 
 
 class LifecycleRedisServer(HostileRedisServer):
-    """Gate GET completion so tests choose reply, timeout, or disconnect."""
+    """Gate check completion so tests choose reply, timeout, or disconnect."""
 
     def __init__(self, mode: str) -> None:
         super().__init__()
@@ -1571,7 +1571,7 @@ class LifecycleRedisServer(HostileRedisServer):
             def handle(self) -> None:
                 try:
                     while command := parent._read_command(self.rfile):
-                        is_get = command[0].upper() == b"GET"
+                        is_get = command[0].upper() == b"EVALSHA" and len(command) == 4
                         if is_get:
                             parent.get.set()
                             if not parent.release.wait(10):
@@ -1638,10 +1638,11 @@ class HandshakeRecoveryRedisServer(HostileRedisServer):
                             response = b"-" + parent.SCRIPT_ERROR + b"\r\n"
                         elif name == b"SCRIPT":
                             response = b"$40\r\n" + b"0" * 40 + b"\r\n"
-                        elif name == b"GET":
-                            response = b"$-1\r\n"
                         elif name == b"EVALSHA":
-                            response = b"*2\r\n:0\r\n:1\r\n"
+                            if len(command) == 4:
+                                response = b"$-1\r\n"
+                            else:
+                                response = b"*2\r\n:0\r\n:1\r\n"
                         else:
                             response = b"-UNEXPECTED-COMMAND\r\n"
                         self.wfile.write(response)
@@ -1729,7 +1730,6 @@ def test_redis_handshake_recovery(
             )
 
         expect(nginx.port, "/redis-error?client=recovered", 404)
-        redis.wait_for_session_command(2, b"GET")
         redis.wait_for_session_command(2, b"EVALSHA")
     finally:
         if nginx is not None:
@@ -1740,14 +1740,14 @@ def test_redis_handshake_recovery(
 
 
 class DeadlineRedisServer(HostileRedisServer):
-    """Minimal RESP2 peer whose GET reply is an excessive block deadline."""
+    """Minimal RESP2 peer whose check reply is an excessive block deadline."""
 
     def __init__(self, deadline: int) -> None:
         super().__init__()
         self.deadline = str(deadline).encode("ascii")
 
     def _response(self, command: list[bytes]) -> bytes:
-        if command[0].upper() == b"GET":
+        if command[0].upper() == b"EVALSHA" and len(command) == 4:
             return (
                 b"$"
                 + str(len(self.deadline)).encode("ascii")
@@ -2386,7 +2386,7 @@ def test_redis_deadline_clamp(
             attempt += 1
             time.sleep(min(0.02, remaining))
 
-        redis.wait_for(b"GET")
+        redis.wait_for(b"EVALSHA")
         _assert_bounded_retry_after("redis", status, headers, 10)
     finally:
         if server is not None:
@@ -2534,7 +2534,9 @@ def _redis_state_key(prefix: str, client: str, suffix: str) -> str:
 
 def _redis_set_block(redis: RedisServer, prefix: str, client: str) -> None:
     deadline = int(time.time()) + 30
-    redis.command("SET", _redis_state_key(prefix, client, "block"), str(deadline))
+    redis.command(
+        "SET", _redis_state_key(prefix, client, "block"), str(deadline), "PX", "30000"
+    )
 
 
 def _redis_set_wrong_get(redis: RedisServer, prefix: str, client: str) -> None:
@@ -2616,9 +2618,9 @@ def _assert_handshake_log_safety(error_log: pathlib.Path) -> None:
     marker = (
         b"Redis handshake (AUTH/SELECT) failed (type=6, detail_len=29); disconnecting"
     )
-    if data.count(marker) != 1:
+    if data.count(marker) != 2:
         raise AssertionError(
-            f"log safety: expected one Redis handshake record, got {data.count(marker)}"
+            f"log safety: expected two Redis handshake records, got {data.count(marker)}"
         )
 
 
@@ -2658,10 +2660,45 @@ def test_redis_ban_counter(
         redis.start()
         first.start()
         second.start()
-        _wait_for_script_loads(redis, 2)
+        _wait_for_script_loads(redis, 4)
         ports = (first.port, second.port)
         if _wait_for_stable_ban_total(ports, 0) != (0, 0):
             raise AssertionError("Redis ban counters did not start at zero")
+
+        # Preaccess must validate and repair corrupt strings atomically. A
+        # synthetic rejection would make the header filter skip record(), so
+        # these controls use /redis-ok and prove the check itself deletes the
+        # key instead of returning a false 429.
+        preaccess_corrupt = (
+            ("preaccess-malformed", "not-a-deadline", ("PX", "60000")),
+            ("preaccess-no-expiry", str(int(time.time()) + 600), ()),
+        )
+        for client, value, expiry in preaccess_corrupt:
+            corrupt_key = _redis_state_key(prefix, client, "block")
+            if redis.command("SET", corrupt_key, value, *expiry) != "OK":
+                raise AssertionError(f"failed to seed preaccess block for {client}")
+            calls = redis.command_calls("evalsha")
+            expect(first.port, f"/redis-ok?client={client}", 200)
+            _wait_for_command_calls(redis, "evalsha", calls + 1)
+            _wait_for_redis_value(redis, "0", "EXISTS", corrupt_key)
+
+        # Canonical expiring values remain active. Older writers rounded the
+        # deadline down, so a live key whose deadline is due still blocks for
+        # its positive TTL and receives the callback's one-second floor.
+        live_deadline = str(int(time.time()) + 30)
+        live_key = _redis_state_key(prefix, "preaccess-live", "block")
+        redis.command("SET", live_key, live_deadline, "PX", "30000")
+        expect(first.port, "/redis-ok?client=preaccess-live", 429)
+        if redis.command("GET", live_key) != live_deadline:
+            raise AssertionError("valid expiring Redis block was repaired")
+
+        rounded_deadline = str(int(time.time()))
+        rounded_key = _redis_state_key(prefix, "preaccess-rounded", "block")
+        redis.command("SET", rounded_key, rounded_deadline, "PX", "5000")
+        expect(first.port, "/redis-ok?client=preaccess-rounded", 429)
+        if int(redis.command("PTTL", rounded_key)) <= 0:
+            raise AssertionError("legacy rounded Redis block lost its TTL")
+        _wait_for_stable_ban_total(ports, 0)
 
         # Boundary plus multi-instance positive: neither local tracker reaches
         # threshold=3, but the third shared event atomically arms Redis. The
@@ -2774,7 +2811,7 @@ def test_redis_ban_counter(
             redis_binary, root / "redis-ban-counter-reconnect", redis_port
         )
         redis.start()
-        _wait_for_script_loads(redis, 2, timeout=10)
+        _wait_for_script_loads(redis, 4, timeout=10)
         for _ in range(2):
             expect(first.port, "/redis-return-error?client=reconnected", 404)
         expect(second.port, "/redis-return-error?client=reconnected", 404)
@@ -2855,7 +2892,7 @@ def test_log_safety(
         expect(nginx.port, "/log-error?log_key=lf", 404)
         expect(nginx.port, "/log-error?log_key=cr", 404)
         expect(nginx.port, "/redis-error?client=hostile", 404)
-        redis.wait_for(b"GET")
+        redis.wait_for(b"EVALSHA")
         redis.wait_for(b"EVALSHA")
         _wait_for_log(
             nginx.root / "logs" / "error.log",
@@ -3078,7 +3115,7 @@ def test_redis_block_deadline_ceil(
             prefix,
         )
         server.start()
-        _wait_for_script_loads(redis, 1)
+        _wait_for_script_loads(redis, 2)
 
         def seeded(client: str, deadline: int) -> tuple[int, dict[str, str]]:
             redis.command(
@@ -3201,7 +3238,7 @@ def test_redis_state_controls(
         try:
             first.start()
             second.start()
-            _wait_for_script_loads(redis, prior_loads + 2)
+            _wait_for_script_loads(redis, prior_loads + 4)
         except Exception:
             try:
                 first.stop()
@@ -3247,8 +3284,8 @@ def test_redis_state_controls(
         finally:
             stop_nodes(first, second)
 
-        # Both successful GET shapes reset a partial failure streak. Without
-        # either reset, the following WRONGTYPE GET opens the breaker and the
+        # Both successful check shapes reset a partial failure streak. Without
+        # either reset, the following WRONGTYPE check opens the breaker and the
         # first node misses a block that the independent second node can see.
         for reply_kind in ("nil", "string"):
             first, second, prefix = start_nodes(f"reset-{reply_kind}")
@@ -3302,7 +3339,7 @@ def test_redis_state_controls(
 
             expect(first.port, "/redis-error?client=noscript", 404)
             _wait_for_log_count(first_log, b"Redis script cache miss", 1)
-            _wait_for_script_loads(redis, loads_after_flush + 1)
+            _wait_for_script_loads(redis, loads_after_flush + 2)
 
             events_key = _redis_state_key(prefix, "noscript", "events")
             expect(first.port, "/redis-error?client=noscript", 404)

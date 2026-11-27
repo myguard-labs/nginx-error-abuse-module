@@ -6,7 +6,9 @@ Changes with ngx_http_error_abuse_module                         (unreleased)
        created the shared block key. The owning instance counts that arm once,
        while an already-active key, concurrent replies and local/Redis overlap
        do not add another count. Legacy replies and Redis failures retain the
-       local fail-open counter fallback.
+       local fail-open counter fallback. Redis preaccess checks and record
+       operations also remove malformed, non-expiring or out-of-range block
+       strings atomically instead of treating them as active bans.
 
     *) Bugfix: a Redis ban could stay in force for up to a second after the
        deadline it stored, because the deadline was rounded down to whole

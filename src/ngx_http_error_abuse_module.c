@@ -424,6 +424,15 @@ ngx_http_error_abuse_platform_owner_release(
 #endif
 }
 
+static const char ngx_http_error_abuse_redis_check_script[] =
+    "local active=redis.pcall('GET',KEYS[1]) "
+    "if type(active)~='string' then return active end "
+    "local canonical=string.match(active,'^[1-9][0-9]*$') "
+    "if canonical and (#active<16 or (#active==16 "
+    "and active<='9007199254740991')) "
+    "and redis.call('PTTL',KEYS[1])>0 then return active end "
+    "redis.call('DEL',KEYS[1]) return false";
+
 static const char ngx_http_error_abuse_redis_record_script[] =
     "local t=redis.call('TIME') "
     "local now=t[1]*1000+math.floor(t[2]/1000) "
@@ -445,11 +454,11 @@ static const char ngx_http_error_abuse_redis_record_script[] =
     "redis.call('DEL',KEYS[1]) return {1,n,deadline,1} end "
     "return {0,n,0,0}";
 
-/* SHA1 hex of the record script. The script never changes, so this is computed
- * once at init_process; record() then uses EVALSHA instead of shipping the full
- * script on every tracked error response. The script is primed into
- * the Redis script cache via SCRIPT LOAD on each (re)connect, and a NOSCRIPT
- * reply (cache flushed) re-primes it. */
+/* SHA1 hex of the check and record scripts. They never change, so these are
+ * computed once at init_process; request paths then use EVALSHA instead of
+ * shipping the full scripts. Both are primed into the Redis script cache via
+ * SCRIPT LOAD on each (re)connect. A NOSCRIPT reply re-primes its script. */
+static u_char ngx_http_error_abuse_check_script_sha[40];
 static u_char ngx_http_error_abuse_script_sha[40];
 
 static ngx_conf_enum_t ngx_http_error_abuse_log_levels[] = {
@@ -3791,9 +3800,10 @@ ngx_http_error_abuse_redis_record_failure(time_t now)
     }
 }
 
-/* A queued GET owns this heap token until hiredis completes it, including
- * NULL replies on disconnect/exit. Request cleanup invalidates request before
- * termination can free its pool, but leaves the token for that callback.
+/* A queued Redis check owns this heap token until hiredis completes it,
+ * including NULL replies on disconnect/exit. Request cleanup invalidates
+ * request before termination can free its pool, but leaves the token for that
+ * callback.
  * A live callback disables cleanup and frees the token before resuming phases;
  * a cancelled callback frees only the token and never touches request memory.
  * All transitions run on the worker event loop. The park reference is released
@@ -3821,8 +3831,8 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     int         rc;
     time_t      now;
     ngx_str_t   events, block;
-    const char *argv[2];
-    size_t      argvlen[2];
+    const char *argv[4];
+    size_t      argvlen[4];
     ngx_http_cleanup_t                 *cln;
     ngx_http_error_abuse_redis_check_t *check;
 
@@ -3851,10 +3861,14 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
                    "for client_sha256=\"%V\"",
                    &block, &ctx->log_key);
 
-    argv[0] = "GET";
-    argvlen[0] = 3;
-    argv[1] = (const char *) block.data;
-    argvlen[1] = block.len;
+    argv[0] = "EVALSHA";
+    argvlen[0] = 7;
+    argv[1] = (const char *) ngx_http_error_abuse_check_script_sha;
+    argvlen[1] = sizeof(ngx_http_error_abuse_check_script_sha);
+    argv[2] = "1";
+    argvlen[2] = 1;
+    argv[3] = (const char *) block.data;
+    argvlen[3] = block.len;
     check = ngx_alloc(sizeof(ngx_http_error_abuse_redis_check_t),
                       r->connection->log);
     if (check == NULL) {
@@ -3875,10 +3889,10 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     ctx->redis_pending = 1;
     rc = redisAsyncCommandArgv(ngx_http_error_abuse_redis_worker.context,
                                ngx_http_error_abuse_redis_check_callback,
-                               check, 2, argv, argvlen);
+                               check, 4, argv, argvlen);
     if (rc != REDIS_OK) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                      "error_abuse: failed to queue Redis GET command");
+                      "error_abuse: failed to queue Redis check command");
         ngx_http_error_abuse_redis_record_failure(now);
 
         cln->handler = NULL;
@@ -3977,6 +3991,20 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: Redis check for client_sha256=\"%V\" "
                        "returned not blocked", &ctx->log_key);
+
+    } else if (reply->type == REDIS_REPLY_ERROR && reply->str
+               && ngx_strncmp(reply->str, "NOSCRIPT", 8) == 0)
+    {
+        /* Fail open for this request and restore the atomic check for the
+         * next one. A cache miss is not a connection failure. */
+        (void) redisAsyncCommand(ac,
+            ngx_http_error_abuse_redis_handshake_callback, NULL,
+            "SCRIPT LOAD %b",
+            (const char *) ngx_http_error_abuse_redis_check_script,
+            (size_t) (sizeof(ngx_http_error_abuse_redis_check_script) - 1));
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "error_abuse: Redis check script cache miss "
+                      "(NOSCRIPT); reloading check script");
 
     } else {
         /* COR-5: REDIS_REPLY_ERROR (NOAUTH, WRONGTYPE, ...) or an unexpected
@@ -4498,6 +4526,14 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
             rc = redisAsyncCommand(worker->context,
                 ngx_http_error_abuse_redis_handshake_callback, NULL,
                 "SCRIPT LOAD %b",
+                (const char *) ngx_http_error_abuse_redis_check_script,
+                (size_t) (sizeof(ngx_http_error_abuse_redis_check_script)
+                          - 1));
+        }
+        if (rc == REDIS_OK) {
+            rc = redisAsyncCommand(worker->context,
+                ngx_http_error_abuse_redis_handshake_callback, NULL,
+                "SCRIPT LOAD %b",
                 (const char *) ngx_http_error_abuse_redis_record_script,
                 (size_t) (sizeof(ngx_http_error_abuse_redis_record_script)
                           - 1));
@@ -4743,7 +4779,16 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
         u_char               digest[20];
         ngx_uint_t           k;
 
-        /* Precompute the EVALSHA digest of the (constant) record script. */
+        /* Precompute the EVALSHA digests of the constant scripts. */
+        SHA1((const unsigned char *) ngx_http_error_abuse_redis_check_script,
+             sizeof(ngx_http_error_abuse_redis_check_script) - 1, digest);
+        for (k = 0; k < 20; k++) {
+            ngx_http_error_abuse_check_script_sha[k * 2] =
+                hex[digest[k] >> 4];
+            ngx_http_error_abuse_check_script_sha[k * 2 + 1] =
+                hex[digest[k] & 0x0f];
+        }
+
         SHA1((const unsigned char *) ngx_http_error_abuse_redis_record_script,
              sizeof(ngx_http_error_abuse_redis_record_script) - 1, digest);
         for (k = 0; k < 20; k++) {
