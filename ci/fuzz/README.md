@@ -66,7 +66,7 @@ That is why an ASAN report from these targets names
 function, not a harness duplicate of it.
 
 `fuzz_accept` compiles
-[`../ngx_http_error_abuse_stats.h`](../ngx_http_error_abuse_stats.h) directly.
+[`../../src/ngx_http_error_abuse_stats.h`](../../src/ngx_http_error_abuse_stats.h) directly.
 Its repeated-field path calls the same `ngx_http_error_abuse_accept_field()`
 helper as the request handler, so byte and item accumulation stay production
 code rather than a harness copy.
