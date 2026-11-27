@@ -3387,13 +3387,14 @@ ngx_http_error_abuse_stats_openmetrics(ngx_http_request_t *r)
 {
     size_t            bytes;
     ngx_int_t         om_q, plain_q;
-    ngx_uint_t        i, items;
+    ngx_uint_t        i, items, om_specificity, plain_specificity;
     ngx_list_part_t  *part;
     ngx_table_elt_t  *h;
 
     om_q = 0;
     plain_q = 0;
     items = 0;
+    om_specificity = plain_specificity = 0;
     bytes = 0;
 
     part = &r->headers_in.headers.part;
@@ -3422,7 +3423,8 @@ ngx_http_error_abuse_stats_openmetrics(ngx_http_request_t *r)
         }
         bytes += h[i].value.len;
 
-        if (ngx_http_error_abuse_accept(&h[i].value, &items, &om_q, &plain_q)
+        if (ngx_http_error_abuse_accept(&h[i].value, &items, &om_q, &plain_q,
+                                       &om_specificity, &plain_specificity)
             != NGX_OK)
         {
             return 0;

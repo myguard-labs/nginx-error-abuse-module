@@ -9,8 +9,8 @@
  * Renderers write into a caller-sized buffer and never allocate; the module
  * sizes the request-pool buffer with the matching *_size() function.
  *
- * Format negotiation (?format=, Accept) follows nginx-http-shield-module's
- * shield_ban_status endpoint so both modules scrape the same way.
+ * Format negotiation (?format=, Accept) supports JSON, Prometheus 0.0.4 and
+ * explicitly requested OpenMetrics 1.0.
  */
 #ifndef NGX_HTTP_ERROR_ABUSE_STATS_H_INCLUDED_
 #define NGX_HTTP_ERROR_ABUSE_STATS_H_INCLUDED_
@@ -296,15 +296,18 @@ ngx_http_error_abuse_accept_value(ngx_str_t *value, const char *expected,
  * back to Prometheus 0.0.4. Empty list elements are skipped but spend the
  * item budget. Wildcards never opt into OpenMetrics. Unknown media parameters
  * do not match our representations; syntactically valid accept extensions
- * after q are ignored. */
+ * after q are ignored. Matching media parameters take precedence over bare
+ * media types, even at q=0; equal specificity retains the highest q. */
 static ngx_int_t
 ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
-    ngx_int_t *openmetrics, ngx_int_t *plain)
+    ngx_int_t *openmetrics, ngx_int_t *plain, ngx_uint_t *om_specificity,
+    ngx_uint_t *plain_specificity)
 {
     u_char      *p, *end, *start;
     ngx_str_t    type, name, value;
     ngx_int_t    q;
-    ngx_uint_t   params, seen_q, supported, quoted, om, text;
+    ngx_uint_t   params, seen_q, supported, quoted, om, text, media;
+    ngx_uint_t   specificity;
 
     if (v->len == 0) {
         return NGX_OK;
@@ -355,7 +358,7 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
                && ngx_strncasecmp(type.data, (u_char *) "text/plain",
                                   type.len) == 0;
         q = 1000;
-        seen_q = params = 0;
+        seen_q = params = media = 0;
         supported = 1;
 
         ngx_http_error_abuse_accept_space(&p, end);
@@ -366,16 +369,19 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
             }
             p++;
             ngx_http_error_abuse_accept_space(&p, end);
+            /* RFC 9110 5.6.6 permits empty parameters. Each semicolon
+             * still spends a parameter slot, including trailing ones. */
+            if (p == end || *p == ';' || *p == ',') {
+                continue;
+            }
             name.data = p;
             while (p < end && ngx_http_error_abuse_accept_token(*p)) {
                 p++;
             }
             name.len = p - name.data;
-            ngx_http_error_abuse_accept_space(&p, end);
             if (name.len == 0 || p == end || *p++ != '=') {
                 return NGX_ERROR;
             }
-            ngx_http_error_abuse_accept_space(&p, end);
 
             quoted = p < end && *p == '"';
             if (quoted) {
@@ -423,6 +429,7 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
                     && ngx_strncasecmp(name.data, (u_char *) "version", 7)
                        == 0)
                 {
+                    media |= 1;
                     supported &= (om
                                   && ngx_http_error_abuse_accept_value(
                                          &value, "1.0.0", quoted))
@@ -434,6 +441,7 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
                            && ngx_strncasecmp(name.data,
                                               (u_char *) "charset", 7) == 0)
                 {
+                    media |= 2;
                     supported &= ngx_http_error_abuse_accept_value(&value,
                                                           "utf-8", quoted);
 
@@ -445,11 +453,22 @@ ngx_http_error_abuse_accept(ngx_str_t *v, ngx_uint_t *items,
             ngx_http_error_abuse_accept_space(&p, end);
         }
 
-        if (supported && om && q > *openmetrics) {
+        /* Count distinct matching media parameters, never q, extensions,
+         * duplicate names or empty parameter slots. */
+        specificity = ((media & 1) != 0) + ((media & 2) != 0);
+        if (supported && om
+            && (specificity > *om_specificity
+                || (specificity == *om_specificity && q > *openmetrics)))
+        {
             *openmetrics = q;
+            *om_specificity = specificity;
         }
-        if (supported && text && q > *plain) {
+        if (supported && text
+            && (specificity > *plain_specificity
+                || (specificity == *plain_specificity && q > *plain)))
+        {
             *plain = q;
+            *plain_specificity = specificity;
         }
 
         if (p == end) {

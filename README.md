@@ -399,7 +399,13 @@ OpenMetrics 1.0 (`application/openmetrics-text; version=1.0.0;
 charset=utf-8`, ending in `# EOF`) is used only when `Accept` names
 `application/openmetrics-text` with a positive `q` at least as high as
 `text/plain`. Wildcards never select OpenMetrics, and a malformed `Accept`
-falls back to 0.0.4. Responses carry `Vary: Accept`.
+falls back to 0.0.4. For each format, the range with more matching media
+parameters (`version`, `charset`) determines its quality, including `q=0`;
+equal specificity uses the highest quality across repeated fields. Empty
+semicolon parameters are allowed and count toward the parameter budget.
+Spaces or tabs around semicolons are allowed; whitespace around `=` is
+malformed. Parameters after `q` remain ignored as legacy accept extensions.
+Responses carry `Vary: Accept`.
 
 > **Turn enforcement off here.** A stats location inherits `error_abuse` from
 > its server or parent location like any other location. Without
