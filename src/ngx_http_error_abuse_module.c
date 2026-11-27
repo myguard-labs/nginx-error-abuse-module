@@ -3468,13 +3468,9 @@ ngx_http_error_abuse_stats_openmetrics(ngx_http_request_t *r)
             continue;
         }
 
-        if (h[i].value.len > NGX_HTTP_ERROR_ABUSE_NEGOTIATE_BYTES - bytes) {
-            return 0;
-        }
-        bytes += h[i].value.len;
-
-        if (ngx_http_error_abuse_accept(&h[i].value, &items, &om_q, &plain_q,
-                                       &om_specificity, &plain_specificity)
+        if (ngx_http_error_abuse_accept_field(&h[i].value, &bytes, &items,
+                                       &om_q, &plain_q, &om_specificity,
+                                       &plain_specificity)
             != NGX_OK)
         {
             return 0;

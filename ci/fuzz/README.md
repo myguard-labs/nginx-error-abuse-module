@@ -1,7 +1,6 @@
 # Fuzzing
 
-Coverage-guided fuzzing of the two untrusted-input parsers in the scan core,
-[`../ngx_http_error_abuse_scan.c`](../ngx_http_error_abuse_scan.c):
+Coverage-guided fuzzing of the module's untrusted-input parsers:
 
 - **`fuzz_snapshot`** → `ngx_http_error_abuse_validate_snapshot()` — the
   gate that walks the untrusted on-disk persistence snapshot before
@@ -13,9 +12,14 @@ Coverage-guided fuzzing of the two untrusted-input parsers in the scan core,
   `first<100 / final<first / final>MAX_STATUS` guard is ever weakened.
   The harness allocates the bitmap as an exact-sized heap object so any
   single-byte over-write is an immediate ASAN failure.
+- **`fuzz_accept`** → `ngx_http_error_abuse_stats_query_format()` and
+  `ngx_http_error_abuse_accept_field()` — raw `?format=` queries and repeated
+  Accept fields, including quoted pairs and the request-wide item/byte budgets.
+  Curated seeds retain positive, boundary and malformed oracles in every replay.
 
-Both targets link the real scan TU; the section below describes the snapshot
-target in detail and the no-copy-drift setup that applies to both.
+The snapshot and status targets link the real scan TU. The Accept target
+includes the same production stats header as the module. The section below
+describes the snapshot target in detail and the no-copy-drift setup.
 
 ## Why this target
 
@@ -48,7 +52,8 @@ byte); the rest is the snapshot payload handed in as `[p, last)`.
 
 ## No copy drift
 
-Both targets **link** [`../ngx_http_error_abuse_scan.c`](../ngx_http_error_abuse_scan.c)
+The snapshot and status targets **link**
+[`../ngx_http_error_abuse_scan.c`](../ngx_http_error_abuse_scan.c)
 — the same translation unit the shipped module links — together with nginx's
 real `src/core/ngx_string.c`. So the parsers under test *and* the
 `ngx_atoi()`/`ngx_strlchr()` they walk bytes with are production code, and the
@@ -59,6 +64,12 @@ in the build.
 That is why an ASAN report from these targets names
 `ngx_http_error_abuse_scan.c:<line>` directly: the stack frame is the shipped
 function, not a harness duplicate of it.
+
+`fuzz_accept` compiles
+[`../../src/ngx_http_error_abuse_stats.h`](../../src/ngx_http_error_abuse_stats.h) directly.
+Its repeated-field path calls the same `ngx_http_error_abuse_accept_field()`
+helper as the request handler, so byte and item accumulation stay production
+code rather than a harness copy.
 
 Earlier revisions sliced the two function bodies out of the module `.c` with
 `extract_parser.sh` and compiled them against an `ngx_shim.h` that reimplemented
@@ -85,6 +96,7 @@ bash ci/fuzz/build.sh                 # needs clang with libFuzzer
 cd ci/fuzz
 ./fuzz_snapshot -max_total_time=60 corpus/
 ./fuzz_statuses -max_total_time=60 -dict=fuzz.dict corpus_statuses/
+./fuzz_accept -max_total_time=60 -dict=fuzz_accept.dict corpus_accept/
 ```
 
 `build.sh` fails with an explicit message if no configured tree is present,
@@ -110,9 +122,9 @@ manual regression diagnostic; the monthly regression and long campaign belong to
   a custom duration)
 
 ASAN+UBSAN are compiled in, so memory and undefined-behaviour bugs abort the
-run and fail the job. The harness also traps if the validator ever returns a
-value other than `NGX_OK`/`NGX_ERROR`, or breaks its lockstep contract with
-`load()`.
+run and fail the job. The harnesses also trap if a parser returns outside its
+declared result domain, the snapshot validator breaks its lockstep contract
+with `load()`, or a curated Accept/query oracle changes.
 
 `build.sh` and `run.py` discover every `fuzz_*.c`, including future targets.
 Target binary names must not end in `.dict`, `.c`, or `.h`, which are reserved
@@ -143,9 +155,9 @@ Admission reserves 3600 seconds for setup, build, uploads and runner overhead;
 for each target it includes the requested discovery duration, the default
 120-second regression campaign, 60 seconds of exit grace for each campaign, and
 600 seconds for minimization. Each fixture reserves 60 seconds in each of the
-two replay passes. Thus, with the current two targets and two fixtures,
-GitHub-hosted runners accept the 3600-second default and at most 8040 seconds per
-target. Self-hosted runners accept the same default and at most 15240 seconds per
+two replay passes. Thus, with the current three targets and two fixtures,
+GitHub-hosted runners accept the 3600-second default and at most 5080 seconds per
+target. Self-hosted runners accept the same default and at most 9880 seconds per
 target. Adding a target or fixture reduces each maximum automatically. These
 are admission allowances, not measured execution guarantees: the workflow's
 600-minute timeout remains an independent hard upper bound on self-hosted
