@@ -300,6 +300,14 @@ TLS verification and SNI. IPv4 literals use four decimal octets; shorthand
 numeric forms such as `127.1` are rejected for TLS. A trusted certificate for a
 different endpoint is rejected.
 
+Setting `password=` without TLS logs a configuration warning: Redis AUTH sends
+credentials without encryption. Use `host=tls://name` or `host=rediss://name`
+with a trusted server certificate. The warning also applies to loopback IPs
+and local hostnames: an address alone does not ensure transport confidentiality
+or exclude a forwarded connection. It contains no credential values and does
+not reject the configuration. TLS and configurations without `password=` do
+not emit this warning; `user=` still requires `password=`.
+
 `host=` is resolved to a numeric address **once, at config load**, so the worker
 event loop never blocks on `getaddrinfo()` when (re)connecting. Two consequences:
 a name with several A records is pinned to its **first** address for the life of

@@ -385,6 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oversized-snapshot-only", action="store_true")
     parser.add_argument("--snapshot-binding-only", action="store_true")
     parser.add_argument("--persist-path-only", action="store_true")
+    parser.add_argument("--redis-auth-warning-only", action="store_true")
     parser.add_argument(
         "--deadline-clamp",
         choices=("snapshot-crc", "snapshot-hmac", "redis"),
@@ -4462,11 +4463,91 @@ def test_persist_paths(
     print("OK: persistence path identity (7 aliases, 7 valid, 12 invalid)")
 
 
+def test_redis_auth_warning(
+    binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path
+) -> None:
+    """Plaintext AUTH warns even locally; TLS and rejected directives do not."""
+    warning = (
+        "error_abuse_redis AUTH credentials will be sent without TLS; "
+        "use host=tls:// or host=rediss:// with a trusted server certificate"
+    )
+    password = "auth-password-canary"
+    user = "auth-user-canary"
+    cases = [
+        ("remote", "host=192.0.2.1", True, True),
+        ("loopback", "host=127.0.0.1", True, True),
+        ("loopback-range", "host=127.255.255.254", True, True),
+        ("ipv6-loopback", "host=[::1]", True, True),
+        ("local-name", "host=localhost", True, True),
+        ("unresolved", "host=redis-auth-warning.invalid", True, True),
+        ("acl", f"host=127.0.0.1 user={user}", True, True),
+        ("tls", f"host=tls://127.0.0.1 user={user}", True, False),
+        ("rediss", "host=rediss://127.0.0.1", True, False),
+        ("tls-ipv6", "host=tls://[::1]", True, False),
+        ("no-auth", "host=127.0.0.1", True, False),
+        ("no-auth-remote", "host=192.0.2.1", True, False),
+        ("one-byte-password", "host=127.0.0.1 password=x", True, True),
+        ("no-auth-tls", "host=tls://127.0.0.1", True, False),
+        ("user-only", f"host=127.0.0.1 user={user}", False, False),
+        ("empty-password", "host=127.0.0.1 password=", False, False),
+        ("empty-user", "host=127.0.0.1 user=", False, False),
+        ("duplicate-password", f"host=127.0.0.1 password={password}", False, False),
+        ("bad-port", "host=127.0.0.1 port=0", False, False),
+        ("bad-host", "host=tls://", False, False),
+        ("tls-numeric-shorthand", "host=tls://127.1", False, False),
+        ("missing-host", "port=6379", False, False),
+    ]
+    for name, parameters, valid, warns in cases:
+        if name not in (
+            "no-auth",
+            "no-auth-remote",
+            "no-auth-tls",
+            "user-only",
+            "empty-password",
+            "one-byte-password",
+        ):
+            parameters += f" password={password}"
+        work = root / ("redis-auth-" + name)
+        (work / "logs").mkdir(parents=True)
+        load = f"load_module {module};\n" if module else ""
+        config = work / "nginx.conf"
+        config.write_text(
+            f"{load}error_log stderr;\nevents {{}}\n"
+            f"http {{ error_abuse_redis {parameters}; }}\n",
+            encoding="ascii",
+        )
+        result = subprocess.run(
+            [str(binary), "-p", str(work), "-c", str(config), "-t"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+        if password in result.stdout or user in result.stdout:
+            raise AssertionError(f"{name}: Redis AUTH diagnostic exposed a canary")
+        if result.returncode != (0 if valid else 1):
+            raise AssertionError(f"{name}: unexpected config result: {result.stdout}")
+        if result.stdout.count(warning) != int(warns):
+            raise AssertionError(
+                f"{name}: expected plaintext AUTH warning count {int(warns)}"
+            )
+        if warns and "[warn]" not in result.stdout:
+            raise AssertionError(f"{name}: missing warning severity")
+        if (
+            name == "unresolved"
+            and "falling back to worker-time resolution" not in result.stdout
+        ):
+            raise AssertionError("unresolved: missing DNS fallback warning")
+        print(f"OK: Redis AUTH warning {name}", flush=True)
+
+
 def test_invalid_configs(
     binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, runner: str
 ) -> None:
     # error_abuse_stats attaches to a declared zone; it never creates one.
     test_persist_paths(binary, module, root, runner)
+    test_redis_auth_warning(binary, module, root)
     test_stats_zone_utf8(binary, module, root, runner)
     expect_invalid_config(
         binary,
@@ -4694,6 +4775,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
         root = pathlib.Path(tmp).resolve()
+        if args.redis_auth_warning_only:
+            test_redis_auth_warning(binary, module, root)
+            return 0
         if args.persist_path_only:
             test_persist_paths(binary, module, root, args.runner)
             return 0
