@@ -504,3 +504,54 @@ canary32zonepass
 ["GET /missing", "GET /ok", "GET /missing?id=a", "GET /ok?id=a", "GET /ok?id=b"]
 --- error_code eval
 [404, 200, 404, 429, 200]
+
+=== TEST 39: empty statuses is rejected
+--- http_config
+    error_abuse_zone zone=test39:1m statuses=;
+--- config
+    location = /ok { empty_gif; }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "statuses="
+
+=== TEST 40: quoted empty statuses is rejected
+--- http_config
+    error_abuse_zone zone=test40:1m "statuses=";
+--- config
+    location = /ok { empty_gif; }
+--- must_die
+--- error_log: invalid error_abuse_zone parameter "statuses="
+
+=== TEST 41: omitted statuses preserves default codes and range boundaries
+--- http_config
+    error_abuse_zone zone=test41:1m key=$arg_id threshold=1;
+--- config
+    location = /denied { error_abuse zone=test41; return 403; }
+    location = /missing { error_abuse zone=test41; return 404; }
+    location = /failure { error_abuse zone=test41; return 500; }
+    location = /last { error_abuse zone=test41; return 599; }
+    location = /ignored { error_abuse zone=test41; return 400; }
+    location = /ok { error_abuse zone=test41; empty_gif; }
+--- request eval
+["GET /denied?id=a", "GET /ok?id=a", "GET /missing?id=b", "GET /ok?id=b",
+ "GET /failure?id=c", "GET /ok?id=c", "GET /last?id=d", "GET /ok?id=d",
+ "GET /ignored?id=e", "GET /ok?id=e"]
+--- error_code eval
+[403, 429, 404, 429, 500, 429, 599, 429, 400, 200]
+
+=== TEST 42: explicit statuses preserves exact codes and range boundaries
+--- http_config
+    error_abuse_zone zone=test42:1m key=$arg_id statuses=404,501-502 threshold=1;
+--- config
+    location = /missing { error_abuse zone=test42; return 404; }
+    location = /first { error_abuse zone=test42; return 501; }
+    location = /last { error_abuse zone=test42; return 502; }
+    location = /before { error_abuse zone=test42; return 500; }
+    location = /after { error_abuse zone=test42; return 503; }
+    location = /denied { error_abuse zone=test42; return 403; }
+    location = /ok { error_abuse zone=test42; empty_gif; }
+--- request eval
+["GET /missing?id=a", "GET /ok?id=a", "GET /first?id=b", "GET /ok?id=b",
+ "GET /last?id=c", "GET /ok?id=c", "GET /before?id=d", "GET /ok?id=d",
+ "GET /after?id=e", "GET /ok?id=e", "GET /denied?id=f", "GET /ok?id=f"]
+--- error_code eval
+[404, 429, 501, 429, 502, 429, 500, 200, 503, 200, 403, 200]
