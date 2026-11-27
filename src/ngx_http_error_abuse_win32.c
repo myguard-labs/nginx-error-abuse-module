@@ -296,6 +296,81 @@ ngx_http_error_abuse_win32_socket_readable(ngx_socket_t fd, ngx_log_t *log)
     return available > 0 ? NGX_OK : NGX_AGAIN;
 }
 
+/* Denying read/write sharing is the nonblocking lease. Allow deletion of
+ * our own unpublished marker on setup failure. OPEN_REPARSE_POINT keeps an
+ * owner symlink from leasing an unrelated object. Namespace setup is
+ * deliberately not recovered from an unmarked pre-existing directory.
+ */
+ngx_fd_t
+ngx_http_error_abuse_win32_temp_lease(u_char *directory, u_char *owner,
+    ngx_uint_t *fresh, ngx_log_t *log)
+{
+    DWORD                       attrs, err;
+    HANDLE                      fd;
+    WCHAR                      *dir, *path;
+    PSECURITY_DESCRIPTOR         descriptor;
+    SECURITY_ATTRIBUTES         sa;
+    BY_HANDLE_FILE_INFORMATION  info;
+
+    dir = ngx_http_error_abuse_win32_utf16(directory, log);
+    path = ngx_http_error_abuse_win32_utf16(owner, log);
+    descriptor = NULL;
+    fd = NGX_INVALID_FILE;
+    *fresh = 0;
+    if (dir == NULL || path == NULL) {
+        goto done;
+    }
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;OW)", SDDL_REVISION_1, &descriptor, NULL))
+    {
+        goto done;
+    }
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = descriptor;
+    sa.bInheritHandle = FALSE;
+    *fresh = CreateDirectoryW(dir, &sa) != 0;
+    if (!*fresh && GetLastError() != ERROR_ALREADY_EXISTS) {
+        goto done;
+    }
+    attrs = GetFileAttributesW(dir);
+    if (attrs == INVALID_FILE_ATTRIBUTES
+        || !(attrs & FILE_ATTRIBUTE_DIRECTORY)
+        || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
+    {
+        goto done;
+    }
+    fd = CreateFileW(path, GENERIC_READ|GENERIC_WRITE|DELETE,
+                     FILE_SHARE_DELETE, &sa,
+                     *fresh ? CREATE_NEW : OPEN_EXISTING,
+                     FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (fd != NGX_INVALID_FILE
+        && (!GetFileInformationByHandle(fd, &info)
+            || (info.dwFileAttributes
+                & (FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))
+            || info.nNumberOfLinks != 1))
+    {
+        if (*fresh) {
+            (void) DeleteFileW(path);
+        }
+        (void) CloseHandle(fd);
+        fd = NGX_INVALID_FILE;
+    }
+
+done:
+    err = GetLastError();
+    if (descriptor != NULL) {
+        LocalFree(descriptor);
+    }
+    if (dir != NULL) {
+        ngx_free(dir);
+    }
+    if (path != NULL) {
+        ngx_free(path);
+    }
+    ngx_set_errno(err);
+    return fd;
+}
+
 ngx_fd_t
 ngx_http_error_abuse_win32_create_temp(u_char *path, ngx_log_t *log)
 {

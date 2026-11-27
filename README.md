@@ -124,6 +124,22 @@ skipped; snapshot writes remain enabled. Windows retains its native open
 semantics (including symlink resolution) and checks the opened file type.
 The type check happens after open, so it does not prevent device-open side
 effects; keeping the persistence directory private remains necessary.
+Snapshot writes reserve `<persist>.eab-tmp/`, containing a permanent `owner`
+marker and a `snapshot` slot. A nonblocking kernel lease on the marker protects
+that slot through cleanup and rename, including overlapping worker generations.
+After an interrupted write, the next writer holding the lease removes only the
+reserved slot. Other entries and old `.tmp.PID.nonce` siblings are preserved:
+legacy filenames cannot prove ownership. Keep the reserved directory private
+and do not put your own files in its `owner` or `snapshot` paths. On POSIX it
+must have mode 0700, with a regular, single-link mode-0600 marker owned by the
+worker user. Unix uses description-scoped `flock` leases; configure probes this
+capability. Targets without it retain legacy unique temporary writes, without
+automatic stale cleanup. Windows creates it with an owner-only ACL and rejects reparse points.
+An existing missing, incomplete or invalid marker fails closed with a warning;
+this includes interruption during initial namespace setup, before any snapshot
+slot is created. To recover, stop writers and move that directory aside for
+inspection; the next save creates a fresh namespace. Never delete a live marker
+or replace its directory while writers run, as doing so breaks the lease.
 The on-disk format is a portable little-endian byte stream (not a native struct
 dump). Set `persist_secret=<hex>` to additionally authenticate the file with
 HMAC-SHA256. The key must be at least 16 bytes (32 hex characters); 32 bytes

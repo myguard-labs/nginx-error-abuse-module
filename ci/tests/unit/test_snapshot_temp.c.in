@@ -1,0 +1,179 @@
+/* Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+typedef unsigned char u_char;
+typedef int ngx_fd_t;
+typedef int ngx_int_t;
+typedef unsigned int ngx_uint_t;
+typedef int ngx_err_t;
+typedef struct stat ngx_file_info_t;
+typedef int ngx_log_t;
+typedef struct { size_t len; u_char *data; } ngx_str_t;
+#define NGX_WIN32 0
+#define NGX_HTTP_ERROR_ABUSE_HAVE_FLOCK 1
+#define NGX_OK 0
+#define NGX_ERROR (-1)
+#define NGX_INVALID_FILE (-1)
+#define NGX_FILE_ERROR (-1)
+#define NGX_FILE_RDWR O_RDWR
+#define NGX_FILE_WRONLY O_WRONLY
+#define NGX_FILE_OWNER_ACCESS 0600
+#define NGX_EEXIST EEXIST
+#define NGX_ENOENT ENOENT
+#define NGX_EINTR EINTR
+#define NGX_LOG_ERR 3
+#define NGX_LOG_WARN 4
+#define NGX_MAX_PATH 4096
+#define ngx_errno errno
+#define ngx_inline inline
+#define ngx_alloc(n, log) malloc(n)
+#define ngx_free free
+#define ngx_memcmp memcmp
+#define ngx_memcpy memcpy
+#define ngx_open_file(path, mode, flags, access) test_open((char *) path, mode | flags, access)
+#define ngx_open_file_n "open()"
+#define ngx_rename_file_n "rename()"
+#define ngx_write_fd_n "write()"
+#define ngx_close_file_n "close()"
+#define ngx_create_dir(path, mode) mkdir((char *) path, mode)
+#define ngx_delete_dir(path) rmdir((char *) path)
+#define ngx_fd_info fstat
+#define ngx_is_file(fi) S_ISREG((fi)->st_mode)
+#define ngx_is_dir(fi) S_ISDIR((fi)->st_mode)
+#define ngx_close_file close
+#define ngx_read_fd read
+#define ngx_write_fd test_write
+#define ngx_delete_file(path) unlink((char *) path)
+#define ngx_rename_file(a, b) rename((char *) a, (char *) b)
+#define ngx_log_error(...) ((void) 0)
+
+static u_char *
+ngx_sprintf(u_char *out, const char *format, ngx_str_t *path)
+{
+    size_t tail = strlen(format + 2) - 2; /* omit trailing %Z */
+    memcpy(out, path->data, path->len);
+    memcpy(out + path->len, format + 2, tail);
+    out[path->len + tail] = '\0';
+    return out + path->len + tail;
+}
+
+static int
+test_open(const char *path, int flags, int mode)
+{
+    int fd = open(path, flags, mode);
+    if (fd != -1 && (flags & O_EXCL) && strstr(path, "/owner") != NULL
+        && getenv("EA_PAUSE_INIT") != NULL)
+    {
+        puts("OWNER_CREATED");
+        fflush(stdout);
+        (void) getchar();
+    }
+    return fd;
+}
+
+static int
+test_flock(int fd, int operation)
+{
+    int result = flock(fd, operation);
+    if (result == 0 && getenv("EA_PAUSE_LEASE") != NULL) {
+        puts("LEASED");
+        fflush(stdout);
+        (void) getchar();
+    }
+    return result;
+}
+#define flock(fd, operation) test_flock(fd, operation)
+
+/* Reproduce process-associated locks for the same-process regression mutant. */
+static int
+test_process_lock(int fd)
+{
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    return fcntl(fd, F_SETLK, &lock);
+}
+
+static ssize_t
+test_write(int fd, const void *data, size_t len)
+{
+    static int calls;
+    const char *failure = getenv("EA_MARKER_WRITE_FAIL");
+    if (failure != NULL) {
+        calls++;
+        if (calls == 1 && strcmp(failure, "partial") == 0) {
+            return write(fd, data, len - 1);
+        }
+        errno = EIO;
+        return -1;
+    }
+    return write(fd, data, len);
+}
+
+static int
+test_fsync(int fd)
+{
+    static int calls;
+    const char *failure = getenv("EA_FSYNC_FAIL");
+    if (failure != NULL && ++calls == atoi(failure)) {
+        errno = EIO;
+        return -1;
+    }
+    return fsync(fd);
+}
+#define fsync test_fsync
+
+/* PRODUCTION_HELPERS */
+
+static ngx_fd_t
+paused_create(u_char *path, ngx_log_t *log)
+{
+    int fd = ngx_http_error_abuse_platform_create_temp(path, log);
+    if (fd != -1 && getenv("EA_PAUSE") != NULL) {
+        puts("CREATED");
+        fflush(stdout);
+        (void) getchar();
+    }
+    return fd;
+}
+
+/* PRODUCTION_WRITER */
+
+int main(int argc, char **argv)
+{
+    ngx_str_t path;
+    if (argc != 2) { return 2; }
+    path.data = (u_char *) argv[1];
+    path.len = strlen(argv[1]);
+    if (getenv("EA_SAME_PROCESS") != NULL) {
+        u_char temporary[4096];
+        int fd, lease;
+        lease = ngx_http_error_abuse_prepare_temp(&path, temporary, NULL);
+        if (lease == -1) { return 2; }
+        fd = ngx_http_error_abuse_platform_create_temp(temporary, NULL);
+        if (fd == -1) { close(lease); return 2; }
+        close(fd);
+        if (ngx_http_error_abuse_write_file((u_char *) "other", 5,
+                                            &path, NULL) == NGX_OK
+            || access((char *) temporary, F_OK) != 0)
+        {
+            close(lease);
+            fputs("FAIL: same-process: live lease was stolen\n", stderr);
+            return 3;
+        }
+        close(lease);
+    }
+    return ngx_http_error_abuse_write_file((u_char *) "new snapshot", 12,
+                                           &path, NULL) == NGX_OK ? 0 : 1;
+}
