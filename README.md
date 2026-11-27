@@ -308,6 +308,16 @@ or exclude a forwarded connection. It contains no credential values and does
 not reject the configuration. TLS and configurations without `password=` do
 not emit this warning; `user=` still requires `password=`.
 
+The module wipes its decoded `persist_secret=` key and copied Redis password
+with `ngx_explicit_memzero()` when their configuration pool is destroyed,
+including after configuration failure. They remain available for snapshot
+signing and Redis reconnects for the configuration's lifetime; draining workers
+keep their own copies across reloads until exit. This reduces residual copies,
+but is not complete secret erasure: nginx retains parsed configuration arguments
+and configuration-dump buffers, and hiredis/OpenSSL may hold other copies.
+Protect configuration files, `nginx -T` output, process memory, core dumps and
+swap accordingly. Abrupt termination can bypass cleanup.
+
 `host=` is resolved to a numeric address **once, at config load**, so the worker
 event loop never blocks on `getaddrinfo()` when (re)connecting. Two consequences:
 a name with several A records is pinned to its **first** address for the life of

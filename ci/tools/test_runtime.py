@@ -386,6 +386,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-binding-only", action="store_true")
     parser.add_argument("--persist-path-only", action="store_true")
     parser.add_argument("--redis-auth-warning-only", action="store_true")
+    parser.add_argument("--secret-lifetime-only", action="store_true")
     parser.add_argument(
         "--deadline-clamp",
         choices=("snapshot-crc", "snapshot-hmac", "redis"),
@@ -4463,6 +4464,96 @@ def test_persist_paths(
     print("OK: persistence path identity (7 aliases, 7 valid, 12 invalid)")
 
 
+def test_secret_lifetime(
+    binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path, port: int
+) -> None:
+    """Configuration failures and master reload keep live owned secrets usable.
+
+    Byte erasure before free is checked by test_secret_cleanup.py against real
+    nginx pools; process exit alone cannot prove that memory was wiped.
+    """
+    # Master-mode workers drop privileges and must traverse the fixture root.
+    root.chmod(0o755)
+    key = bytes(range(16))
+    zone = (
+        "error_abuse_zone zone=cleanup:1m key=$arg_client "
+        f"persist={root}/cleanup.state persist_secret={key.hex()}"
+    )
+    for name, config, expected in (
+        ("partial-hex", zone[:-2] + "gg;", "invalid error_abuse_zone parameter"),
+        ("late-zone-error", zone + " unknown=1;", "invalid error_abuse_zone parameter"),
+        (
+            "late-config-error",
+            (
+                f"error_abuse_redis host=127.0.0.1 password={key.hex()}; cleanup_unknown_directive;"
+            ),
+            'unknown directive "cleanup_unknown_directive"',
+        ),
+    ):
+        expect_invalid_config(
+            binary,
+            module,
+            root,
+            "",
+            name,
+            config,
+            expected,
+            forbidden=(key.hex(),),
+        )
+
+    class SecretNginx(_SnapshotMigrationNginx):
+        def write_config(self, keyed_key: str = "$arg_client") -> None:
+            super().write_config(keyed_key)
+            path = self.root / "conf/nginx.conf"
+            text = path.read_text()
+            path.write_text(
+                text.replace(
+                    "http {",
+                    f"http {{\n error_abuse_redis host=127.0.0.1 password={key.hex()};",
+                    1,
+                )
+            )
+
+    server = SecretNginx(binary, module, root / "secret-reload", port, "", False)
+    # Only synthetic snapshot output is writable by the dropped-privilege worker.
+    state_dir = root / "worker-state"
+    state_dir.mkdir()
+    state_dir.chmod(0o777)
+    server.state = state_dir / "migration.state"
+    try:
+        server.start()
+        expect(port, "/error?client=before", 404)
+        expect(port, "/ok?client=before", 429)
+        assert server.process is not None
+        os.kill(server.process.pid, signal.SIGHUP)
+        log = server.root / "logs/error.log"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            text = log.read_text(errors="replace")
+            if text.count("start worker process") >= 2 and "exited with code 0" in text:
+                break
+            if server.process.poll() is not None:
+                raise AssertionError("secret reload terminated nginx")
+            time.sleep(0.05)
+        else:
+            raise AssertionError("secret reload did not retire old worker cleanly")
+        expect(port, "/ok?client=before", 429)
+        expect(port, "/error?client=after", 404)
+        expect(port, "/ok?client=after", 429)
+    finally:
+        server.stop()
+    snapshot = server.state.read_bytes()
+    if len(snapshot) <= 32 or not hmac.compare_digest(
+        snapshot[-32:],
+        _snapshot_mac(PERSIST_SECRET, "migration", "$arg_client", snapshot[:-32]),
+    ):
+        raise AssertionError("secret cleanup ran before exit snapshot authentication")
+    server.assert_clean_logs()
+    print(
+        "OK: secret configuration failure, master reload, exit snapshot authentication"
+    )
+
+
 def test_redis_auth_warning(
     binary: pathlib.Path, module: pathlib.Path | None, root: pathlib.Path
 ) -> None:
@@ -4775,6 +4866,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
         root = pathlib.Path(tmp).resolve()
+        if args.secret_lifetime_only:
+            test_secret_lifetime(binary, module, root, args.port)
+            return 0
         if args.redis_auth_warning_only:
             test_redis_auth_warning(binary, module, root)
             return 0

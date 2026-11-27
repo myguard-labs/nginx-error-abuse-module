@@ -1962,6 +1962,44 @@ ngx_http_error_abuse_parse_seconds(u_char *data, size_t len, time_t *out)
     return NGX_OK;
 }
 
+/* These buffers belong to one configuration pool, including on parse failure.
+ * Register immutable allocation bounds before storing any secret bytes; the
+ * public ngx_str_t length may still be zero after a partial hex decode. Pool
+ * cleanups run before pool storage is freed, after exit_process persistence.
+ * Old workers retain their own copies across a master reload until they exit.
+ * nginx parser/config-dump and hiredis/OpenSSL copies are outside this owner.
+ */
+static void
+ngx_http_error_abuse_secret_cleanup(void *data)
+{
+    ngx_str_t  *secret = data;
+
+    ngx_explicit_memzero(secret->data, secret->len);
+}
+
+/* Returns pool-owned bytes; callers must not free or wipe them while in use. */
+static u_char *
+ngx_http_error_abuse_secret_alloc(ngx_pool_t *pool, size_t len)
+{
+    ngx_pool_cleanup_t  *cln;
+    ngx_str_t           *secret;
+
+    cln = ngx_pool_cleanup_add(pool, sizeof(ngx_str_t));
+    if (cln == NULL) {
+        return NULL;
+    }
+
+    secret = cln->data;
+    secret->data = ngx_pnalloc(pool, len);
+    if (secret->data == NULL) {
+        return NULL;
+    }
+    secret->len = len;
+    cln->handler = ngx_http_error_abuse_secret_cleanup;
+
+    return secret->data;
+}
+
 /*
  * Known non-secret options of each directive. Only a token whose name exactly
  * matches one of these (the spelling the parser itself accepted) may have its
@@ -2342,7 +2380,8 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                                    min_bytes * 2, keylen);
                 return NGX_CONF_ERROR;
             }
-            zone->persist_secret.data = ngx_pnalloc(cf->pool, keylen);
+            zone->persist_secret.data =
+                ngx_http_error_abuse_secret_alloc(cf->pool, keylen);
             if (zone->persist_secret.data == NULL) {
                 return NGX_CONF_ERROR;
             }
@@ -3045,7 +3084,8 @@ ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     if (password.len != 0) {
-        mcf->redis.password.data = ngx_pnalloc(cf->pool, password.len);
+        mcf->redis.password.data =
+            ngx_http_error_abuse_secret_alloc(cf->pool, password.len);
         if (mcf->redis.password.data == NULL) {
             return NGX_CONF_ERROR;
         }

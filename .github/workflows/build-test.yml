@@ -1,4 +1,4 @@
-# sync-sha: ec14ed4006932cab77c45fe729eb70fce935dbc432bd48c0df7ed98ded057c70
+# sync-sha: abb9be67d0f912adc5be1459c54267278ecff9e5c24306139e48a55c9c35edf3
 name: Build and Test
 
 env:
@@ -209,6 +209,13 @@ jobs:
             done
           )
 
+      - name: Secret buffer cleanup controls
+        env:
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+          CC: ${{ matrix.cc }}
+        run: |
+          python3 ci/tools/test_secret_cleanup.py --core ".build/${MATRIX_FLAVOR}-${NGINX_VERSION}-debug" --negative-controls
+
       - name: Snapshot retained-count controls
         env:
           MATRIX_FLAVOR: ${{ matrix.flavor }}
@@ -324,6 +331,14 @@ jobs:
             --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
             --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module.so" \
             --redis-server /usr/bin/redis-server
+
+      - name: Run secret configuration and reload controls
+        run: |
+          python3 ci/tools/test_runtime.py \
+            --port "$TEST_BASE_PORT" \
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+            --module "$GITHUB_WORKSPACE/nginx-bin/ngx_http_error_abuse_module.so" \
+            --secret-lifetime-only
 
       - name: Run rejection-header allocation fault controls
         run: |
