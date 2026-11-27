@@ -4426,6 +4426,11 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
         ngx_log_error(NGX_LOG_WARN, worker->log, 0,
                       "error_abuse Redis connection failed "
                       "(status=%d, error=%d)", status, ac->err);
+        /* hiredis frees an initial connect failure without invoking the
+         * disconnect callback. Drop the borrowed context now; its event
+         * cleanup still owns detaching nginx before hiredis closes the fd. */
+        worker->context = NULL;
+        ngx_http_error_abuse_redis_arm_reconnect();
     }
 }
 
