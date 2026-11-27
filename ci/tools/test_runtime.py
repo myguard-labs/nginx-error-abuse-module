@@ -4632,7 +4632,7 @@ def main() -> int:
         raise FileNotFoundError(module)
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
-        root = pathlib.Path(tmp)
+        root = pathlib.Path(tmp).resolve()
         if args.persist_path_only:
             test_persist_paths(binary, module, root, args.runner)
             return 0
