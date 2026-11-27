@@ -110,7 +110,17 @@ http {
 Read that zone line as: *"if one IP causes 100 of these error responses within
 any 5-minute window, ban it for 60 minutes."* The `persist=` file lets bans
 survive a full NGINX restart; the directory must already exist and be writable
-by the worker user. **Keep that directory private** (owned by the worker user,
+by the worker user. On POSIX, configuration resolves that existing parent
+directory once, then identifies the snapshot by its canonical parent and
+filename. Two zones cannot share that destination through relative paths,
+dot segments or symlinked parent directories. The final filename must be
+nonempty and cannot be `.` or `..`; an existing target must be a regular file,
+not a symlink. Separate hardlink names are separate destinations: an atomic
+save replaces one directory entry and leaves the other intact. Windows keeps
+expanded textual path comparison; filesystem aliases are not detected there.
+Keep the directory namespace stable while nginx runs; this configuration check
+does not defend against later directory or mount changes.
+**Keep that directory private** (owned by the worker user,
 not group/world-writable): the snapshot's CRC32 detects corruption but is *not*
 tamper protection, so anyone who can write the file can forge or remove bans.
 Temp snapshots are created with `O_EXCL|O_NOFOLLOW` and `fsync`'d before the

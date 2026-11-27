@@ -2077,6 +2077,83 @@ ngx_http_error_abuse_log_safe_param(ngx_conf_t *cf, ngx_str_t *param,
     return safe;
 }
 
+#if !(NGX_WIN32)
+/* The writer replaces a directory entry, not an inode. Resolve the existing
+ * parent once, keeping distinct hardlink names as distinct save destinations.
+ * Do not resolve a final symlink: restore deliberately refuses to follow it. */
+static ngx_int_t
+ngx_http_error_abuse_persist_path(ngx_conf_t *cf, ngx_str_t *path)
+{
+    u_char           *leaf, *p;
+    u_char            first;
+    u_char            parent[NGX_MAX_PATH];
+    size_t            len, leaf_len;
+    ngx_err_t         err;
+    ngx_file_info_t   fi;
+
+    leaf = path->data + path->len;
+    while (leaf > path->data && leaf[-1] != '/') {
+        leaf--;
+    }
+    leaf_len = path->data + path->len - leaf;
+    if (leaf == path->data || leaf_len == 0
+        || (leaf_len == 1 && leaf[0] == '.')
+        || (leaf_len == 2 && leaf[0] == '.' && leaf[1] == '.'))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid error_abuse persistence filename");
+        return NGX_ERROR;
+    }
+
+    /* Keep the slash so the root directory is also a valid parent. */
+    p = leaf;
+    first = *p;
+    err = 0;
+    *p = '\0';
+    if (ngx_realpath(path->data, parent) == NULL) {
+        err = ngx_errno;
+    }
+    *p = first;
+    if (err != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, err,
+                           "cannot resolve error_abuse persistence parent");
+        return NGX_ERROR;
+    }
+
+    len = ngx_strlen(parent);
+    p = ngx_pnalloc(cf->pool, len + 1 + leaf_len + 1);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+    path->data = p;
+    p = ngx_cpymem(p, parent, len);
+    if (p[-1] != '/') {
+        *p++ = '/';
+    }
+    p = ngx_cpymem(p, leaf, leaf_len);
+    *p = '\0';
+    path->len = p - path->data;
+
+    if (ngx_link_info(path->data, &fi) == NGX_FILE_ERROR) {
+        err = ngx_errno;
+        if (err == NGX_ENOENT) {
+            return NGX_OK;
+        }
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, err,
+                           "cannot inspect error_abuse persistence file");
+        return NGX_ERROR;
+    }
+    if (!ngx_is_file(&fi)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "error_abuse persistence file must be regular "
+                           "and not a symlink");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+#endif
+
 static char *
 ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -2395,6 +2472,11 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (ngx_conf_full_name(cf->cycle, &zone->persist, 0) != NGX_OK) {
             return NGX_CONF_ERROR;
         }
+#if !(NGX_WIN32)
+        if (ngx_http_error_abuse_persist_path(cf, &zone->persist) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+#endif
 
         {
             ngx_http_error_abuse_zone_t  **zones;
