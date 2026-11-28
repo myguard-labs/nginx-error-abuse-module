@@ -391,6 +391,68 @@ static ngx_http_error_abuse_redis_worker_t ngx_http_error_abuse_redis_worker;
 static ngx_uint_t ngx_http_error_abuse_test_get_tokens;
 static ngx_uint_t ngx_http_error_abuse_test_get_parked;
 
+/* Two initial SCRIPT callbacks only. Static tokens carry no request/context
+ * pointer and remain valid through disconnect's NULL callback drain. A new
+ * connection exposes any unsettled old generation before resetting counters. */
+typedef struct {
+    ngx_uint_t generation;
+    ngx_uint_t slot;
+} ngx_http_error_abuse_test_script_t;
+
+static ngx_uint_t ngx_http_error_abuse_test_script_generation;
+static ngx_uint_t ngx_http_error_abuse_test_script_queued;
+static ngx_uint_t ngx_http_error_abuse_test_script_called;
+static ngx_uint_t ngx_http_error_abuse_test_script_cleanup;
+static ngx_http_error_abuse_test_script_t ngx_http_error_abuse_test_scripts[2];
+
+static void
+ngx_http_error_abuse_test_script_snapshot(const char *where, ngx_uint_t slot,
+    redisReply *reply)
+{
+    ngx_http_error_abuse_redis_worker_t *worker;
+    size_t                              n;
+    u_char                              bytes[81], *last;
+
+    worker = &ngx_http_error_abuse_redis_worker;
+    n = (reply != NULL && reply->str != NULL) ? ngx_min(reply->len, 40) : 0;
+    last = bytes;
+    if (n != 0) {
+        last = ngx_hex_dump(bytes, (u_char *) reply->str, n);
+    }
+    *last = '\0';
+    ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
+                  "EA_SCRIPT state=%s gen=%ui slot=%ui queued=%ui called=%ui "
+                  "outstanding=%ui ready=%ui connected=%d timer=%d "
+                  "disconnecting=%d reconnect=%d cleanup=%ui kind=%d "
+                  "length=%uz bytes=%s", where,
+                  ngx_http_error_abuse_test_script_generation, slot,
+                  ngx_http_error_abuse_test_script_queued,
+                  ngx_http_error_abuse_test_script_called,
+                  ngx_http_error_abuse_test_script_queued
+                      - ngx_http_error_abuse_test_script_called,
+                  (ngx_uint_t) worker->ready, worker->adapter.conn != NULL,
+                  worker->adapter.timeout.timer_set,
+                  worker->adapter.context != NULL
+                      && (worker->adapter.context->c.flags
+                          & REDIS_DISCONNECTING) != 0,
+                  worker->reconnect.timer_set,
+                  ngx_http_error_abuse_test_script_cleanup,
+                  reply != NULL ? reply->type : 0,
+                  reply != NULL ? reply->len : 0, bytes);
+}
+
+static void
+ngx_http_error_abuse_test_script_queue(int rc, ngx_uint_t slot)
+{
+    if (rc == REDIS_OK) {
+        ngx_http_error_abuse_test_scripts[slot - 1].generation =
+            ngx_http_error_abuse_test_script_generation;
+        ngx_http_error_abuse_test_scripts[slot - 1].slot = slot;
+        ngx_http_error_abuse_test_script_queued++;
+        ngx_http_error_abuse_test_script_snapshot("queue", slot, NULL);
+    }
+}
+
 static void
 ngx_http_error_abuse_test_get_snapshot(
     ngx_http_error_abuse_redis_event_t *ev, const char *where)
@@ -417,6 +479,7 @@ ngx_http_error_abuse_test_get_snapshot(
                   ngx_http_error_abuse_test_get_tokens,
                   ngx_http_error_abuse_test_get_parked,
                   ev->timeout.timer_set, bytes);
+    ngx_http_error_abuse_test_script_snapshot(where, 0, NULL);
 }
 #endif
 
@@ -3958,6 +4021,8 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     ngx_http_error_abuse_test_get_parked++;
     ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
                   "EA_GET park id=%uA", r->connection->number);
+    ngx_http_error_abuse_test_get_snapshot(
+        &ngx_http_error_abuse_redis_worker.adapter, "park");
 #endif
 
     return NGX_AGAIN;
@@ -3979,6 +4044,9 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     r = check->request;
 #if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
     ngx_http_error_abuse_test_get_tokens--;
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_SCRIPT get_kind=%d",
+                  data != NULL ? ((redisReply *) data)->type : 0);
 #endif
     if (r == NULL) {
 #if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
@@ -4325,6 +4393,14 @@ ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev)
         redisAsyncHandleRead(ev->context);
 
         if (ev->context == NULL) {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+            ngx_log_error(NGX_LOG_NOTICE,
+                          ngx_http_error_abuse_redis_worker.log, 0,
+                          "EA_SCRIPT settled tokens=%ui parked=%ui",
+                          ngx_http_error_abuse_test_get_tokens,
+                          ngx_http_error_abuse_test_get_parked);
+            ngx_http_error_abuse_test_script_snapshot("drained", 0, NULL);
+#endif
             break;
         }
 
@@ -4465,11 +4541,17 @@ ngx_http_error_abuse_redis_cleanup(void *privdata)
     ngx_connection_t                    *c;
     ngx_http_error_abuse_redis_event_t  *ev = privdata;
 
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_script_cleanup++;
+#endif
     c = ev->conn;
     ev->context = NULL;
     ev->conn = NULL;
 
     if (c == NULL) {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+        ngx_http_error_abuse_test_script_snapshot("cleanup", 0, NULL);
+#endif
         return;
     }
 
@@ -4497,6 +4579,9 @@ ngx_http_error_abuse_redis_cleanup(void *privdata)
 
     ngx_free_connection(c);
     c->fd = (ngx_socket_t) -1;
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_script_snapshot("cleanup", 0, NULL);
+#endif
 }
 
 static ngx_int_t
@@ -4547,6 +4632,17 @@ ngx_http_error_abuse_redis_handshake_callback(redisAsyncContext *ac,
 {
     redisReply                          *reply = data;
     ngx_http_error_abuse_redis_worker_t *worker = ac->data;
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_script_t *test = privdata;
+
+    if (test != NULL) {
+        ngx_http_error_abuse_test_script_called++;
+        ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
+                      "EA_SCRIPT callback_gen=%ui", test->generation);
+        ngx_http_error_abuse_test_script_snapshot(
+            "callback", test->slot, reply);
+    }
+#endif
 
     if (reply == NULL) {
         /* connection-level error; disconnect callback drives reconnect */
@@ -4560,6 +4656,11 @@ ngx_http_error_abuse_redis_handshake_callback(redisAsyncContext *ac,
                       reply->str ? reply->len : 0);
         redisAsyncDisconnect(ac);
     }
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    if (test != NULL) {
+        ngx_http_error_abuse_test_script_snapshot("post", test->slot, reply);
+    }
+#endif
 }
 
 static void
@@ -4571,6 +4672,12 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
 
     worker = ac->data;
     if (status == REDIS_OK) {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+        ngx_http_error_abuse_test_script_snapshot("previous", 0, NULL);
+        ngx_http_error_abuse_test_script_generation++;
+        ngx_http_error_abuse_test_script_queued = 0;
+        ngx_http_error_abuse_test_script_called = 0;
+#endif
         worker->ready = 1;
         worker->reconnect_backoff = 0;   /* PERF-4: reset on success */
         ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
@@ -4607,19 +4714,35 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
             /* Prime the script cache so request-path EVALSHA calls hit. hiredis
              * preserves order, so this completes before any queued EVALSHA. */
             rc = redisAsyncCommand(worker->context,
-                ngx_http_error_abuse_redis_handshake_callback, NULL,
+                ngx_http_error_abuse_redis_handshake_callback,
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+                &ngx_http_error_abuse_test_scripts[0],
+#else
+                NULL,
+#endif
                 "SCRIPT LOAD %b",
                 (const char *) ngx_http_error_abuse_redis_check_script,
                 (size_t) (sizeof(ngx_http_error_abuse_redis_check_script)
                           - 1));
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+            ngx_http_error_abuse_test_script_queue(rc, 1);
+#endif
         }
         if (rc == REDIS_OK) {
             rc = redisAsyncCommand(worker->context,
-                ngx_http_error_abuse_redis_handshake_callback, NULL,
+                ngx_http_error_abuse_redis_handshake_callback,
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+                &ngx_http_error_abuse_test_scripts[1],
+#else
+                NULL,
+#endif
                 "SCRIPT LOAD %b",
                 (const char *) ngx_http_error_abuse_redis_record_script,
                 (size_t) (sizeof(ngx_http_error_abuse_redis_record_script)
                           - 1));
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+            ngx_http_error_abuse_test_script_queue(rc, 2);
+#endif
         }
         if (rc != REDIS_OK) {
             worker->ready = 0;

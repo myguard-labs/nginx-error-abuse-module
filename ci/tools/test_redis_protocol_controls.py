@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Causal malformed/negative controls for SCRIPT fixture and live oracles."""
+
+import copy
+import dataclasses
+import io
+import math
+import pathlib
+import threading
+import unittest
+from unittest import mock
+
+from test_redis_get_controls import command
+from test_runtime_get import Reply, block_key, digest, scripts
+from test_runtime_protocol import (
+    ERROR,
+    FIELDS,
+    ErrorContext,
+    ScriptPeer,
+    assert_error_post,
+    assert_fds,
+    assert_ledger,
+    assert_resources,
+    capture_error_snapshot,
+    clean_logs,
+    error_snapshot_evidence,
+    script_states,
+)
+
+
+def row(where, **changes):
+    values = dict.fromkeys(FIELDS, 0)
+    values.update(gen=1, queued=2, called=2, ready=1, connected=1)
+    values.update(changes)
+    payload = values.pop("payload", b"")
+    if "length" not in changes:
+        values["length"] = len(payload)
+    return (
+        "EA_SCRIPT state="
+        + where
+        + " "
+        + " ".join(f"{key}={values[key]}" for key in FIELDS)
+        + " bytes="
+        + payload.hex()
+        + "\n"
+    )
+
+
+def whole():
+    return (
+        row("previous", gen=0, queued=0, called=0)
+        + row("queue", slot=1, queued=1, called=0, outstanding=1)
+        + row("queue", slot=2, called=0, outstanding=2)
+        + "EA_SCRIPT callback_gen=1\n"
+        + row("callback", slot=1, called=1, outstanding=1, kind=1, payload=b"a" * 40)
+        + row("post", slot=1, called=1, outstanding=1, kind=1, payload=b"a" * 40)
+        + "EA_SCRIPT callback_gen=1\n"
+        + row("callback", slot=2, kind=1, payload=b"b" * 40)
+        + row("post", slot=2, kind=1, payload=b"b" * 40)
+    )
+
+
+EXPECTED = [(1, 1, b"a" * 40), (2, 1, b"b" * 40)]
+
+
+class Oracles(unittest.TestCase):
+    def test_complete_exact_ledger(self):
+        assert_ledger(whole(), EXPECTED)
+        self.assertEqual(len(script_states(whole())), 7)
+
+    def test_wrong_missing_duplicate_order_generation_and_stale_counts(self):
+        baseline = whole()
+        mutations = [
+            baseline.replace("61" * 40, "63" * 40),
+            baseline.replace("slot=1 queued=2", "slot=2 queued=2"),
+            baseline.replace("callback_gen=1", "callback_gen=2", 1),
+            baseline.replace("gen=1", "gen=2", 1),
+            baseline.replace("outstanding=1", "outstanding=0", 1),
+            baseline.replace("called=1", "called=2", 1),
+            baseline.replace("queued=1", "queued=2", 1),
+            baseline.replace("length=40", "length=41", 1),
+            baseline.replace("state=queue", "state=missing", 1),
+            baseline.replace("state=callback", "state=missing", 1),
+            baseline.replace("state=post", "state=missing", 1),
+            baseline + row("callback", slot=2, kind=1, payload=b"b" * 40),
+            baseline + row("post", slot=2, kind=1, payload=b"b" * 40),
+            baseline + row("read", outstanding=1),
+        ]
+        for mutated in mutations:
+            with self.subTest(mutated=mutated), self.assertRaises(AssertionError):
+                assert_ledger(mutated, EXPECTED)
+
+    def test_error_post_branch_is_causal(self):
+        valid = row("post", slot=1, kind=6, ready=0, disconnecting=1)
+        self.assertEqual(assert_error_post(valid, 1)["ready"], 0)
+        for altered, message in (
+            (valid.replace("ready=0", "ready=1"), "SCRIPT error callback left ready"),
+            (
+                valid.replace("disconnecting=1", "disconnecting=0"),
+                "did not enter disconnect",
+            ),
+            (valid.replace("slot=1", "slot=2"), "missing SCRIPT"),
+            (valid.replace("kind=6", "kind=1"), "missing SCRIPT"),
+            (valid + valid, "missing SCRIPT"),
+            ("", "missing SCRIPT"),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(AssertionError, message),
+            ):
+                assert_error_post(altered, 1)
+
+    def test_resources_and_fd_drift_reject(self):
+        connected = script_states(row("timeout"))[0]
+        assert_resources(connected, True)
+        disconnected = {**connected, "connected": 0, "cleanup": 1}
+        assert_resources(disconnected, False)
+        for key, value in (
+            ("outstanding", 1),
+            ("timer", 1),
+            ("cleanup", 1),
+            ("connected", 0),
+        ):
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                assert_resources({**connected, key: value}, True)
+        with self.assertRaises(AssertionError):
+            assert_resources({**disconnected, "cleanup": 2}, False)
+        baseline = {"0": "/dev/null", "4": "socket:[123]"}
+        assert_fds(dict(baseline), baseline)
+        for actual in (
+            None,
+            {},
+            {**baseline, "5": "socket:[456]"},
+            {**baseline, "4": "socket:[124]"},
+        ):
+            with (
+                self.subTest(actual=actual),
+                self.assertRaisesRegex(AssertionError, "fd drift"),
+            ):
+                assert_fds(actual, baseline)
+
+    def test_narrow_error_logs(self):
+        handshake = "[error] error_abuse: Redis handshake (AUTH/SELECT) failed (type=6, detail_len=18); disconnecting\n"
+        check = '[warn] error_abuse: Redis check failed (consecutive=1), client: 127.0.0.1, server: , request: "GET /get.gif?client=script-sentinel HTTP/1.0", host: "localhost"\n'
+        clean_logs(handshake + check, True)
+        clean_logs("[notice] healthy\n", False)
+        for log in (
+            handshake,
+            check,
+            handshake + check + handshake,
+            handshake + check + "[error] unknown",
+            handshake + check + "AddressSanitizer",
+            handshake + check.replace("consecutive=1", "consecutive=2"),
+            handshake + check + "runtime error:",
+        ):
+            with self.subTest(log=log), self.assertRaises(AssertionError):
+                clean_logs(log, True)
+        with self.assertRaises(AssertionError):
+            clean_logs(handshake + check, False)
+
+
+class ErrorCapture(unittest.TestCase):
+    def setUp(self):
+        script_pair = scripts(
+            pathlib.Path(__file__).resolve().parents[2]
+            / "src/ngx_http_error_abuse_module.c"
+        )
+        self.context = ErrorContext(
+            10.0,
+            0,
+            "script-sentinel",
+            script_pair,
+            (("0", "/dev/null"),),
+            1,
+            "worker-fixture",
+        )
+        self.live = {
+            "log": (
+                row("previous", gen=0, queued=0, called=0)
+                + row("queue", slot=1, queued=1, called=0, outstanding=1)
+                + row("queue", slot=2, called=0, outstanding=2)
+                + "EA_GET park id=3\nEA_SCRIPT callback_gen=1\n"
+                + row(
+                    "callback",
+                    slot=1,
+                    called=1,
+                    outstanding=1,
+                    kind=6,
+                    payload=ERROR[1:-2],
+                )
+                + row(
+                    "post",
+                    slot=1,
+                    called=1,
+                    outstanding=1,
+                    kind=6,
+                    payload=ERROR[1:-2],
+                    ready=0,
+                    disconnecting=1,
+                )
+                + "[error] error_abuse: Redis handshake (AUTH/SELECT) failed (type=6, detail_len=18); disconnecting\n"
+                + row(
+                    "cleanup", called=1, outstanding=1, ready=0, connected=0, cleanup=1
+                )
+                + "EA_SCRIPT callback_gen=1\n"
+                + row("callback", slot=2, ready=0, connected=0, cleanup=1)
+                + "EA_SCRIPT get_kind=0\nEA_GET callback id=3\n"
+                + '[warn] error_abuse: Redis check failed (consecutive=1), client: 127.0.0.1, server: , request: "GET /get.gif?client=script-sentinel HTTP/1.0", host: "localhost"\n'
+                + "EA_GET release id=3\nEA_GET resume id=3\n"
+                + "error_abuse test reconnect delay=22500 next=30000\n"
+                + "EA_SCRIPT settled tokens=0 parked=0\n"
+                + row("drained", ready=0, connected=0, cleanup=1, reconnect=1)
+            ),
+            "output": "",
+            "access": ["script-sentinel 200"],
+            "response": bytearray(b"HTTP/1.0 200 OK\r\n\r\nbody"),
+            "sessions": 1,
+            "vectors": [[b"SCRIPT", b"LOAD", script] for script in script_pair]
+            + [
+                [b"EVALSHA", digest(script_pair[0]), b"1", block_key("script-sentinel")]
+            ],
+            "peer_error": None,
+            "fds": {"0": "/dev/null"},
+        }
+
+    def capture(self, at=10.5):
+        return capture_error_snapshot(self.context, lambda: self.live, clock=lambda: at)
+
+    def test_deadline_boundary_after_all_live_reads(self):
+        read = mock.Mock(return_value=self.live)
+        clock = mock.Mock(return_value=math.nextafter(11.0, -math.inf))
+        order = mock.Mock()
+        order.attach_mock(read, "read")
+        order.attach_mock(clock, "clock")
+        snapshot = capture_error_snapshot(self.context, read, clock)
+        self.assertEqual([call[0] for call in order.mock_calls], ["read", "clock"])
+        self.assertLess(error_snapshot_evidence(snapshot)["capture_monotonic"], 11.0)
+        for at in (11.0, math.nextafter(11.0, math.inf), 12.0):
+            with (
+                self.subTest(at=at),
+                self.assertRaisesRegex(AssertionError, "waited for command timeout"),
+            ):
+                self.capture(at)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            snapshot.sessions = 2
+
+    def test_delay_window_missing_and_uncapped_witness_reject(self):
+        original = self.live["log"]
+        for delay in (1001, 22500, 37500):
+            self.live["log"] = original.replace("delay=22500", f"delay={delay}")
+            self.assertEqual(
+                error_snapshot_evidence(self.capture())["reconnect_delay_ms"], delay
+            )
+        for delay in (0, 999, 1000):
+            self.live["log"] = original.replace("delay=22500", f"delay={delay}")
+            with (
+                self.subTest(delay=delay),
+                self.assertRaisesRegex(AssertionError, "overlaps error-capture"),
+            ):
+                error_snapshot_evidence(self.capture())
+        for altered in (
+            original.replace("error_abuse test reconnect delay=22500 next=30000\n", ""),
+            original.replace("next=30000", "next=2000"),
+            original + "error_abuse test reconnect delay=22500 next=30000\n",
+        ):
+            self.live["log"] = altered
+            with self.assertRaisesRegex(AssertionError, "missing capped reconnect"):
+                error_snapshot_evidence(self.capture())
+
+    def test_late_scheduler_mutation_cannot_change_frozen_generation(self):
+        # Exercise the very capture/validation pair used by the live runner.
+        read = mock.Mock(return_value=self.live)
+        clock = mock.Mock(return_value=10.9)
+        snapshot = capture_error_snapshot(self.context, read, clock)
+        accepted = error_snapshot_evidence(snapshot)
+        self.live["log"] += row("previous", gen=2) + row("queue", gen=2, slot=1)
+        self.live["sessions"] = 2
+        self.live["vectors"].append([b"SCRIPT", b"LOAD", b"later-script"])
+        self.live["vectors"][0][2] = b"later-generation"
+        self.live["peer_error"] = "later reconnect is forbidden by this peer"
+        self.live["fds"]["4"] = "socket:[later]"
+        self.live["access"].append("script-sentinel 500")
+        self.live["response"][:] = b"HTTP/1.0 500 Later\r\n\r\n"
+        self.live["output"] = "later worker output"
+        # Validation deliberately happens after a simulated long deschedule.
+        clock.return_value = 100.0
+        self.assertEqual(error_snapshot_evidence(snapshot), accepted)
+        read.assert_called_once_with()
+        clock.assert_called_once_with()
+        # The same new-generation state, when captured before the deadline,
+        # is a defect in the capture and must still be rejected.
+        with self.assertRaisesRegex(AssertionError, "exact queue identity/order/count"):
+            error_snapshot_evidence(self.capture(at=10.9))
+
+    def test_stale_evidence_captured_before_boundary_rejects(self):
+        baseline = copy.deepcopy(self.live)
+        alterations = (
+            (
+                "log",
+                baseline["log"].replace("gen=1", "gen=2", 1),
+                "connection generation",
+            ),
+            ("sessions", 2, "session/command history"),
+            ("fds", {"0": "/dev/null", "4": "socket:[old-redis]"}, "fd drift"),
+            ("access", [], "HTTP completion"),
+            ("response", b"HTTP/1.0 500 Bad\r\n\r\n", "HTTP 200"),
+            ("peer_error", "early peer exception", "captured peer failure"),
+            (
+                "log",
+                baseline["log"].replace("tokens=0 parked=0", "tokens=1 parked=0"),
+                "token/park",
+            ),
+            (
+                "log",
+                baseline["log"].replace("tokens=0 parked=0", "tokens=0 parked=1"),
+                "token/park",
+            ),
+            (
+                "log",
+                baseline["log"].replace("cleanup=1", "cleanup=2"),
+                "cleanup/connection count",
+            ),
+            (
+                "log",
+                baseline["log"].replace("state=drained", "state=notdrained"),
+                "missing final drain",
+            ),
+            ("log", baseline["log"].replace("timer=0", "timer=1"), "command timer"),
+            (
+                "log",
+                baseline["log"].replace("reconnect=1", "reconnect=0"),
+                "lost scheduled reconnect",
+            ),
+            (
+                "log",
+                baseline["log"].replace(
+                    "called=2 outstanding=0", "called=1 outstanding=1"
+                ),
+                "outstanding count",
+            ),
+        )
+        for key, value, message in alterations:
+            self.live = {**copy.deepcopy(baseline), key: value}
+            with (
+                self.subTest(key=key, message=message),
+                self.assertRaisesRegex(AssertionError, message),
+            ):
+                error_snapshot_evidence(self.capture(at=10.99))
+        self.live = copy.deepcopy(baseline)
+        self.live["vectors"][2][-1] = b"stale-key"
+        with self.assertRaisesRegex(AssertionError, "session/command history"):
+            error_snapshot_evidence(self.capture(at=10.99))
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.scripts = scripts(
+            pathlib.Path(__file__).resolve().parents[2]
+            / "src/ngx_http_error_abuse_module.c"
+        )
+        self.peer = ScriptPeer(*self.scripts, "whole", ack_timeout=0.01)
+        self.reply = Reply("script-sentinel", b"$-1\r\n")
+        self.peer.prepare(self.reply)
+
+    def test_exact_vectors_and_script_extraction(self):
+        self.assertEqual(len(self.scripts), 2)
+        self.assertNotEqual(*self.scripts)
+        self.assertNotEqual(*(digest(s) for s in self.scripts))
+        for slot, script in enumerate(self.scripts):
+            self.peer.script_vector([b"SCRIPT", b"LOAD", script], slot)
+        for command_values in (
+            None,
+            [b"SCRIPT", b"LOAD", b"wrong"],
+            [b"SCRIPT", b"LOAD", self.scripts[1]],
+            [b"SCRIPT", b"LOAD"],
+            [b"AUTH", b"LOAD", self.scripts[0]],
+        ):
+            with (
+                self.subTest(command=command_values),
+                self.assertRaisesRegex(AssertionError, "wrong SCRIPT"),
+            ):
+                self.peer.script_vector(command_values, 0)
+        valid = [b"EVALSHA", digest(self.scripts[0]), b"1", b"key"]
+        for command_values in (
+            valid,
+            [*valid[:1], b"wrong", *valid[2:]],
+            [*valid[:2], b"2", *valid[3:]],
+            [*valid[:3]],
+            None,
+        ):
+            with (
+                self.subTest(command=command_values),
+                self.assertRaisesRegex(AssertionError, "SHA/key/vector"),
+            ):
+                self.peer.get_vector(command_values, self.reply)
+
+    def test_missing_release_callback_ack_and_peer_exception(self):
+        with self.assertRaisesRegex(AssertionError, "missing SCRIPT release"):
+            self.peer.gate(threading.Event(), "SCRIPT release")
+        event = threading.Event()
+        event.set()
+        self.peer.gate(event, "release")
+        self.peer.error = ValueError("peer exception control")
+        with self.assertRaisesRegex(AssertionError, "GET peer failed"):
+            self.peer.wait(threading.Event(), "callback", 0.01)
+        self.peer.error = None
+        self.peer.send[0].set()
+        with (
+            mock.patch(
+                "test_runtime_protocol.read_command",
+                side_effect=[[b"SCRIPT", b"LOAD", script] for script in self.scripts]
+                + [[b"bad"]],
+            ),
+            self.assertRaisesRegex(AssertionError, "SHA/key/vector"),
+        ):
+            self.peer.serve(io.BytesIO())
+        from test_runtime_get import block_key
+
+        wire = b"".join(
+            command(b"SCRIPT", b"LOAD", script) for script in self.scripts
+        ) + command(
+            b"EVALSHA", digest(self.scripts[0]), b"1", block_key(self.reply.identity)
+        )
+        with self.assertRaisesRegex(
+            AssertionError, "missing SCRIPT callback acknowledgement"
+        ):
+            self.peer.serve(io.BytesIO(wire))
+
+    def test_malformed_truncated_commands_and_missing_prefix_ack(self):
+        for wire in (
+            b"*0\r\n",
+            b"*3\r\n$6\r\nSCRIPT\r\n$4\r\nLOAD\r\n$5\r\na",
+            b"*3\r\n$+6\r\nSCRIPT\r\n",
+        ):
+            with self.subTest(wire=wire), self.assertRaises(ValueError):
+                self.peer.serve(io.BytesIO(wire))
+        self.peer.case = "error-split"
+        self.peer.send[0].set()
+        from test_runtime_get import block_key
+
+        commands = [[b"SCRIPT", b"LOAD", script] for script in self.scripts] + [
+            [b"EVALSHA", digest(self.scripts[0]), b"1", block_key(self.reply.identity)]
+        ]
+        with (
+            mock.patch("test_runtime_protocol.read_command", side_effect=commands),
+            self.assertRaisesRegex(
+                AssertionError, "missing error-prefix-consumed acknowledgement"
+            ),
+        ):
+            self.peer.serve(io.BytesIO())
+
+
+if __name__ == "__main__":
+    unittest.main()
