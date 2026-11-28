@@ -18,6 +18,9 @@ from test_runtime_protocol import (
     ERROR,
     FIELDS,
     RECORD_FIELDS,
+    CoalescedBatch,
+    CoalescedFrame,
+    CoalescedPeer,
     ErrorContext,
     RecordPeer,
     RecordReply,
@@ -29,6 +32,12 @@ from test_runtime_protocol import (
     assert_resources,
     capture_error_snapshot,
     clean_logs,
+    coalesced_callbacks,
+    coalesced_drain,
+    coalesced_fds,
+    coalesced_final_idle,
+    coalesced_position,
+    coalesced_prefix,
     error_snapshot_evidence,
     integer_reply,
     read_record_command,
@@ -878,6 +887,191 @@ class RecordFixture(unittest.TestCase):
             self.peer.serve(io.BytesIO())
         self.assertTrue(self.reply.sent.is_set())
         self.assertFalse(self.reply.finished.is_set())
+
+
+class CoalescedControls(unittest.TestCase):
+    def test_exact_baseline_descriptor_identity(self):
+        baseline = {"1": "pipe:[1]", "10": "socket:[42]"}
+        self.assertTrue(coalesced_fds(baseline, baseline, 0))
+        self.assertTrue(coalesced_fds({**baseline, "11": "socket:[43]"}, baseline, 1))
+        for actual, pending in (
+            (None, 0),
+            ({"1": "pipe:[1]", "10": "socket:[43]"}, 0),
+            ({**baseline, "11": "pipe:[2]"}, 1),
+            ({**baseline, "11": "socket:[43]"}, 0),
+            (baseline, 1),
+        ):
+            self.assertFalse(coalesced_fds(actual, baseline, pending))
+
+    def test_callback_fifo_types_failures_and_single_drain(self):
+        body = (
+            "EA_COALESCE get id=3 kind=4 failures=0\n"
+            "EA_COALESCE record id=1 kind=6 failures=1\n"
+            + reader_row("read", pending=0, tokens=0, parked=0)
+        )
+        begin = "EA_DRAIN begin id=7 fd=11 command=AA timer=1 due=100 reconnect=BB retry=0\n"
+        end = (
+            "EA_DRAIN end id=7 fd=-1 command=AA timer=1 due=100 reconnect=BB retry=0\n"
+        )
+        expected = [("get", "3", 4, 0), ("record", "1", 6, 1)]
+        valid = begin + body + end
+        self.assertEqual(coalesced_callbacks(valid), expected)
+        drain = coalesced_drain(valid, expected)
+        self.assertEqual(drain["id"], 7)
+        self.assertEqual(
+            (drain["begin_timer"], drain["begin_due"], drain["timer"], drain["due"]),
+            (1, 100, 1, 100),
+        )
+        for bad in (
+            valid.replace("get id=3", "get id=4"),
+            valid.replace("kind=6", "kind=4"),
+            valid.replace("failures=1", "failures=0"),
+            valid.replace(end, ""),
+            begin + body + body + end,
+            begin
+            + body.splitlines()[0]
+            + "\n"
+            + end
+            + begin
+            + "\n".join(body.splitlines()[1:])
+            + end,
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(coalesced_drain(bad, expected))
+        for bad in (
+            valid.replace(
+                "command=AA timer=1 due=100 reconnect=BB retry=0\n",
+                "command=CC timer=1 due=100 reconnect=BB retry=0\n",
+                1,
+            ),
+            valid.replace("timer=1", "timer=0", 1),
+            valid.replace("due=100", "due=999", 1),
+            valid.replace("retry=0", "retry=1"),
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "drain timer/due transition drift"
+            ):
+                coalesced_drain(bad, expected)
+
+    def test_frame_relative_prefix_and_exact_pending_owner(self):
+        first = b"$-1\r\n"
+        last = integer_reply(1, 10, 1234567890, 1)
+        split = len(last) - 1
+        pos, task = coalesced_position(last, split)
+        base = {"length": 94, "pos": 94, "bytes": (b"b" * 32).hex()}
+        prefix = first + last[:split]
+        callback = "EA_COALESCE get id=3 kind=4 failures=0\n"
+        expected = [("get", "3", 4, 0)]
+        reader = reader_row(
+            "read",
+            length=94 + len(prefix),
+            pos=94 + len(first) + pos,
+            task=task,
+            pending=1,
+            tokens=0,
+            parked=0,
+            timer=1,
+            bytes=(b"b" * 32 + prefix)[-32:].hex(),
+        )
+        self.assertIsNotNone(
+            coalesced_prefix(callback + reader, base, first, last, split, expected, 0)
+        )
+        for bad in (
+            reader.replace("pending=1", "pending=0"),
+            reader.replace("timer=1", "timer=0"),
+            reader.replace("tokens=0", "tokens=1"),
+            reader.replace("pos=" + str(94 + len(first) + pos), "pos=" + str(94 + pos)),
+            reader.replace("task=1", "task=0"),
+            reader.replace("len=" + str(94 + len(prefix)), "len=" + str(len(prefix))),
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(
+                    coalesced_prefix(
+                        callback + bad, base, first, last, split, expected, 0
+                    )
+                )
+        for bad in (
+            callback + callback + reader,
+            reader,
+            callback.replace("id=3", "id=4") + reader,
+        ):
+            with self.assertRaisesRegex(AssertionError, "ownership/count"):
+                coalesced_prefix(bad, base, first, last, split, expected, 0)
+        for split in (0, len(last)):
+            with self.assertRaisesRegex(AssertionError, "internal prefix"):
+                coalesced_position(last, split)
+        self.assertEqual(
+            coalesced_position(b"$40\r\n" + b"x" * 40 + b"\r\n", 46), (1, 0)
+        )
+
+    def test_final_idle_must_follow_final_drain(self):
+        get = reader_row("timeout", pending=0, tokens=0, parked=0, timer=0)
+        script = (
+            "EA_SCRIPT state=timeout gen=1 slot=0 queued=2 called=2 "
+            "outstanding=0 ready=1 connected=1 timer=0 disconnecting=0 "
+            "reconnect=0 cleanup=0 kind=0 length=0 bytes=\n"
+        )
+        end = (
+            "EA_DRAIN end id=9 fd=-1 command=AA timer=1 due=100 reconnect=BB retry=0\n"
+        )
+        self.assertIsNone(coalesced_final_idle(get + script + end, 9))
+        final = coalesced_final_idle(end + get + script, 9)
+        self.assertEqual(final["get"]["where"], "timeout")
+        self.assertEqual(final["script"]["where"], "timeout")
+
+    def test_peer_requires_each_ack_and_exact_vectors(self):
+        scripts_ = (b"check", b"record")
+        for missing in ("release", "suffix", "ack", None):
+            batch = CoalescedBatch(
+                [
+                    CoalescedFrame("script", "0", b"$1\r\nx\r\n"),
+                    CoalescedFrame("script", "1", b"$1\r\ny\r\n"),
+                ],
+                1,
+            )
+            peer = CoalescedPeer(*scripts_, [batch], ack_timeout=0.001)
+            for name in ("release", "suffix", "ack"):
+                if name != missing:
+                    getattr(batch, name).set()
+            with mock.patch(
+                "test_runtime_protocol.read_command",
+                side_effect=[[b"SCRIPT", b"LOAD", s] for s in scripts_],
+            ):
+                if missing:
+                    label = {"ack": "settlement", "suffix": "prefix-consumed"}.get(
+                        missing, missing
+                    )
+                    with self.assertRaisesRegex(
+                        AssertionError, f"missing COALESCE {label} acknowledgement"
+                    ):
+                        peer.serve(io.BytesIO())
+                else:
+                    peer.serve(io.BytesIO())
+                    self.assertTrue(batch.queued.is_set())
+                    self.assertTrue(batch.sent.is_set())
+        for malformed, error, message in (
+            (b"*10\r\n", ValueError, "malformed RESP command array"),
+            (
+                b"*3\r\n$6\r\nSCRIPT\r\n$4\r\nLOAD\r\n$5\r\ncut",
+                ValueError,
+                "truncated RESP command",
+            ),
+            (
+                command(b"SCRIPT", b"LOAD", b"wrong"),
+                AssertionError,
+                "wrong COALESCE exact vector/FIFO",
+            ),
+        ):
+            batch = CoalescedBatch([CoalescedFrame("script", "0", b"+OK\r\n")])
+            peer = CoalescedPeer(*scripts_, [batch], ack_timeout=0.001)
+            with (
+                self.subTest(malformed=malformed),
+                self.assertRaisesRegex(error, message),
+            ):
+                peer.serve(io.BytesIO(malformed))
+        batch = CoalescedBatch([CoalescedFrame("record", "x", b"+OK\r\n")])
+        with self.assertRaisesRegex(ValueError, "truncated record"):
+            CoalescedPeer(*scripts_, [batch]).serve(io.BytesIO(b"*10\r\n$5\r\ncut"))
 
 
 if __name__ == "__main__":
