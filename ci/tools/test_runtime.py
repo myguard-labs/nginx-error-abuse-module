@@ -1360,8 +1360,12 @@ class HostileRedisServer:
     CHECK_ERROR = b"CHECK-HOSTILE-SECRET\x00tail"
     EVAL_ERROR = b"EVAL-HOSTILE-SECRET\x00tail"
     HANDSHAKE_ERROR = b"HANDSHAKE-HOSTILE-SECRET\x00tail"
+    CHECK_SCRIPT = b"redis.pcall('GET',KEYS[1])"
+    RECORD_SCRIPT = b"redis.pcall('GET',KEYS[2])"
 
-    def __init__(self, handshake_error: bool = False, listen_port: int = 0) -> None:
+    def __init__(
+        self, handshake_error: bytes | None = None, listen_port: int = 0
+    ) -> None:
         self.handshake_error = handshake_error
         self.listen_port = listen_port
         self.commands: list[bytes] = []
@@ -1392,9 +1396,12 @@ class HostileRedisServer:
     def _response(self, command: list[bytes]) -> bytes:
         name = command[0].upper()
         if name == b"SCRIPT":
-            if self.handshake_error:
-                return b"-" + self.HANDSHAKE_ERROR + b"\r\n"
-            digest = b"0" * 40
+            if self.handshake_error is not None:
+                if len(command) != 3 or command[1].upper() != b"LOAD":
+                    raise ValueError(f"unexpected SCRIPT command: {command!r}")
+                if self.handshake_error in command[2]:
+                    return b"-" + self.HANDSHAKE_ERROR + b"\r\n"
+            digest = hashlib.sha1(command[2]).hexdigest().encode("ascii")
             return b"$40\r\n" + digest + b"\r\n"
         if name == b"EVALSHA":
             if len(command) == 4:
@@ -2618,10 +2625,45 @@ def _assert_handshake_log_safety(error_log: pathlib.Path) -> None:
     marker = (
         b"Redis handshake (AUTH/SELECT) failed (type=6, detail_len=29); disconnecting"
     )
-    if data.count(marker) != 2:
+    if data.count(marker) != 1:
         raise AssertionError(
-            f"log safety: expected two Redis handshake records, got {data.count(marker)}"
+            f"log safety: expected one Redis handshake record, got {data.count(marker)}"
         )
+
+
+def test_handshake_log_safety_control(root: pathlib.Path) -> None:
+    """Check both script selectors and the single-record log oracle."""
+    scripts = (HostileRedisServer.CHECK_SCRIPT, HostileRedisServer.RECORD_SCRIPT)
+    for target in scripts:
+        peer = HostileRedisServer(handshake_error=target)
+        for script in scripts:
+            response = peer._response([b"SCRIPT", b"LOAD", script])
+            expected = (
+                b"-" + peer.HANDSHAKE_ERROR + b"\r\n"
+                if script == target
+                else b"$40\r\n"
+                + hashlib.sha1(script).hexdigest().encode("ascii")
+                + b"\r\n"
+            )
+            if response != expected:
+                raise AssertionError(
+                    f"handshake peer selected wrong script: {target!r}"
+                )
+
+    marker = (
+        b"Redis handshake (AUTH/SELECT) failed (type=6, detail_len=29); disconnecting"
+    )
+    log = root / "handshake-log-control"
+    log.write_bytes(marker + b"\n")
+    _assert_handshake_log_safety(log)
+    log.write_bytes((marker + b"\n") * 2)
+    try:
+        _assert_handshake_log_safety(log)
+    except AssertionError as exc:
+        if "expected one Redis handshake record, got 2" not in str(exc):
+            raise
+    else:
+        raise AssertionError("handshake oracle accepted duplicate records")
 
 
 def test_redis_ban_counter(
@@ -2871,6 +2913,7 @@ def test_log_safety(
     runner: str,
     nginx_port: int,
 ) -> None:
+    test_handshake_log_safety_control(root)
     redis = HostileRedisServer()
     nginx: Nginx | None = None
     try:
@@ -2907,33 +2950,38 @@ def test_log_safety(
             nginx.stop()
         redis.stop()
 
-    handshake_redis = HostileRedisServer(handshake_error=True)
-    handshake_nginx: Nginx | None = None
-    try:
-        handshake_redis.start()
-        handshake_nginx = Nginx(
-            binary,
-            module,
-            root / "log-safety-handshake",
-            nginx_port + 1,
-            runner,
-            True,
-            handshake_redis.port,
-            f"error-abuse-log-handshake-{os.getpid()}:",
-        )
-        handshake_nginx.start()
-        handshake_redis.wait_for(b"SCRIPT")
-        _wait_for_log(
-            handshake_nginx.root / "logs" / "error.log",
-            b"Redis handshake (AUTH/SELECT) failed",
-        )
-        handshake_nginx.stop()
-        _assert_handshake_log_safety(handshake_nginx.root / "logs" / "error.log")
-        handshake_nginx.assert_clean_logs()
-    finally:
-        if handshake_nginx is not None:
+    # Distinguish the scripts by their Redis keys, not by arrival order. Each
+    # session returns one hostile reply, so disconnect cannot hide a second one.
+    for name, marker in (
+        ("check", HostileRedisServer.CHECK_SCRIPT),
+        ("record", HostileRedisServer.RECORD_SCRIPT),
+    ):
+        handshake_redis = HostileRedisServer(handshake_error=marker)
+        handshake_nginx: Nginx | None = None
+        try:
+            handshake_redis.start()
+            handshake_nginx = Nginx(
+                binary,
+                module,
+                root / f"log-safety-handshake-{name}",
+                nginx_port + 1,
+                runner,
+                True,
+                handshake_redis.port,
+                f"error-abuse-log-handshake-{name}-{os.getpid()}:",
+            )
+            handshake_nginx.start()
+            _wait_for_log(
+                handshake_nginx.root / "logs" / "error.log",
+                b"Redis handshake (AUTH/SELECT) failed",
+            )
             handshake_nginx.stop()
-        handshake_redis.stop()
+            _assert_handshake_log_safety(handshake_nginx.root / "logs" / "error.log")
+            handshake_nginx.assert_clean_logs()
+        finally:
+            if handshake_nginx is not None:
+                handshake_nginx.stop()
+            handshake_redis.stop()
 
 
 def test_redis_multi_host(
