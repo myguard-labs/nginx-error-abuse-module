@@ -13,9 +13,11 @@ import argparse
 import dataclasses
 import io
 import json
+import os
 import pathlib
 import re
 import select
+import signal
 import socket
 import threading
 import time
@@ -1472,17 +1474,820 @@ http {{
     print(f"OK: RECORD {case}", flush=True)
 
 
+@dataclasses.dataclass
+class CoalescedFrame:
+    kind: str
+    identity: str
+    wire: bytes
+    status: int = 200
+    delta: int = 0
+
+
+@dataclasses.dataclass
+class CoalescedBatch:
+    frames: list[CoalescedFrame]
+    split: int = 0
+    queued: threading.Event = dataclasses.field(default_factory=threading.Event)
+    release: threading.Event = dataclasses.field(default_factory=threading.Event)
+    sent: threading.Event = dataclasses.field(default_factory=threading.Event)
+    suffix: threading.Event = dataclasses.field(default_factory=threading.Event)
+    ack: threading.Event = dataclasses.field(default_factory=threading.Event)
+
+
+class CoalescedPeer(RecordPeer):
+    """Read every exact vector before one write, then require live settlement ack."""
+
+    def __init__(self, check, record, batches, ack_timeout=2.0):
+        super().__init__(check, record, 10, ack_timeout)
+        self.batches = batches
+
+    def gate(self, event, label):
+        if not event.wait(self.ack_timeout):
+            raise AssertionError(f"missing COALESCE {label} acknowledgement")
+
+    def serve(self, stream):
+        for batch in self.batches:
+            if (
+                not batch.frames
+                or batch.split
+                and not 0 < batch.split < len(batch.frames[-1].wire)
+            ):
+                raise AssertionError("invalid COALESCE batch/split")
+            for frame in batch.frames:
+                if frame.kind == "record":
+                    command = read_record_command(stream)
+                    reply = RecordReply(frame.identity, frame.wire, 0, frame.delta, 4)
+                    self.record_vector(command, reply)
+                    self.record_vectors.append(command)
+                else:
+                    command = read_command(stream)
+                    if frame.kind == "script":
+                        expected = [
+                            b"SCRIPT",
+                            b"LOAD",
+                            self.expected_scripts[int(frame.identity)],
+                        ]
+                    else:
+                        expected = [
+                            b"EVALSHA",
+                            digest(self.expected_scripts[0]),
+                            b"1",
+                            block_key(frame.identity),
+                        ]
+                    if command != expected:
+                        raise AssertionError("wrong COALESCE exact vector/FIFO")
+                self.history.append(command)
+                with self.condition:
+                    self.condition.notify_all()
+            self.notify(batch.queued)
+            self.gate(batch.release, "release")
+            if self.stopping.is_set():
+                return
+            wire = b"".join(frame.wire for frame in batch.frames)
+            if batch.split:
+                cut = len(wire) - len(batch.frames[-1].wire) + batch.split
+                stream.write(wire[:cut])
+                stream.flush()
+                self.notify(batch.sent)
+                self.gate(batch.suffix, "prefix-consumed")
+                if self.stopping.is_set():
+                    return
+                stream.write(wire[cut:])
+                stream.flush()
+            else:
+                stream.write(wire)
+                stream.flush()
+                self.notify(batch.sent)
+            self.gate(batch.ack, "settlement")
+            if self.stopping.is_set():
+                return
+        # Keep the original connection alive for the adapter's idle timer.
+        if stream.read(1) and not self.stopping.is_set():
+            raise AssertionError("unexpected COALESCE extra command")
+
+    def stop(self):
+        self.stopping.set()
+        for batch in self.batches:
+            for event in (batch.release, batch.suffix, batch.ack):
+                event.set()
+        super().stop()
+
+
+def coalesced_callbacks(log):
+    """One unified ordered ledger, including native reply type and failure state."""
+    rows = []
+    pattern = re.compile(
+        r"EA_SCRIPT state=callback gen=\d+ slot=(\d+).*? kind=(\d+)"
+        r"|EA_COALESCE (get|record) id=(\d+) kind=(\d+) failures=(\d+)"
+    )
+    for match in pattern.finditer(log):
+        if match[1] is not None:
+            rows.append(("script", match[1], int(match[2]), 0))
+        else:
+            rows.append((match[3], match[4], int(match[5]), int(match[6])))
+    return rows
+
+
+def coalesced_drain(log, expected, require_partial=False):
+    """Require the complete ordered callbacks inside one actual read handler."""
+    for match in re.finditer(
+        r"EA_DRAIN begin id=(\d+) fd=(\d+) command=(\S+) timer=([01]) due=(\d+) reconnect=(\S+) retry=([01])",
+        log,
+    ):
+        end = re.search(
+            rf"EA_DRAIN end id={match[1]} fd=-1 command=(\S+) timer=([01]) due=(\d+) reconnect=(\S+) retry=([01])",
+            log[match.end() :],
+        )
+        if end is None:
+            continue
+        body = log[match.end() : match.end() + end.start()]
+        if "EA_DRAIN begin" in body or coalesced_callbacks(body) != expected:
+            continue
+        begin_timer, begin_due = int(match[4]), int(match[5])
+        end_timer, end_due = int(end[2]), int(end[3])
+        if (
+            (match[3], match[6]) != (end[1], end[4])
+            or begin_timer != end_timer
+            or begin_due > end_due
+            or match[7] != end[5]
+            or end[5] != "0"
+        ):
+            raise AssertionError("COALESCE drain timer/due transition drift")
+        readers = [row for row in states(body) if row["where"] == "read"]
+        if not readers:
+            raise AssertionError("COALESCE missing post-hiredis drain witness")
+        # Each post-hiredis snapshot ends one redisAsyncHandleRead/recv call.
+        # A callback-only handler witness cannot prove a native read boundary.
+        iterations = []
+        start = 0
+        for reader in re.finditer(r"EA_GET state=read[^\n]*", body):
+            iterations.append(coalesced_callbacks(body[start : reader.start()]))
+            start = reader.end()
+        if coalesced_callbacks(body[start:]):
+            continue
+        if require_partial:
+            if (
+                len(readers) < 2
+                or iterations[0]
+                or readers[0]["length"] <= readers[0]["pos"]
+                or readers[0]["pending"] != 1
+                or expected not in iterations[1:]
+            ):
+                continue
+        elif expected not in iterations:
+            continue
+        return {
+            "id": int(match[1]),
+            "fd": int(match[2]),
+            "command": match[3],
+            "begin_timer": begin_timer,
+            "begin_due": begin_due,
+            "timer": end_timer,
+            "due": end_due,
+            "reconnect": match[6],
+            "readers": readers,
+        }
+    return None
+
+
+def coalesced_final_idle(log, drain_id):
+    """Return paired GET/SCRIPT timeout state after the final drain only."""
+    marker = re.search(rf"EA_DRAIN end id={drain_id} fd=-1 .*", log)
+    if marker is None:
+        return None
+    tail = log[marker.end() :]
+    # Snapshot emits GET then SCRIPT in the same timeout callback. Pair before
+    # filtering, so a stale latest GET cannot borrow an earlier clean state.
+    latest = None
+    pending = None
+    for line in tail.splitlines():
+        if "EA_GET state=timeout " in line:
+            pending = states(line)[0]
+        elif "EA_SCRIPT state=timeout " in line and pending is not None:
+            latest = {"get": pending, "script": script_states(line)[0]}
+            pending = None
+    if (
+        latest is None
+        or pending is not None
+        or latest["script"]["ready"] != 1
+        or any(latest["get"][key] for key in ("pending", "tokens", "parked", "timer"))
+    ):
+        return None
+    return latest
+
+
+def coalesced_drain_order(previous, current):
+    if previous is not None and current <= previous:
+        raise AssertionError("COALESCE drain IDs must increase strictly")
+    return current
+
+
+def coalesced_receive_queue(proc, inode, expected):
+    """Observe the full batch on the exact worker-owned Redis socket."""
+    for line in (proc / "net/tcp").read_text().splitlines()[1:]:
+        fields = line.split()
+        if f"socket:[{fields[9]}]" == inode and fields[3] == "01":
+            queued = int(fields[4].split(":")[1], 16)
+            if queued > expected:
+                raise AssertionError("COALESCE unexpected receive queue bytes")
+            if queued == expected:
+                return {"inode": inode, "queued": queued}
+    return None
+
+
+def coalesced_release(proc, inode, batch, peer):
+    """Hold the owned worker until TCP has delivered the complete sent prefix."""
+    pid = int(proc.name)
+    if not 1 < pid <= 2147483647:
+        raise AssertionError("COALESCE invalid owned worker PID")
+    expected = sum(len(frame.wire) for frame in batch.frames)
+    if batch.split:
+        expected -= len(batch.frames[-1].wire) - batch.split
+    os.kill(pid, signal.SIGSTOP)
+    try:
+        wait_until(
+            lambda: re.search(
+                r"^State:\s+T", (proc / "status").read_text(), re.MULTILINE
+            ),
+            "COALESCE worker did not stop",
+            peer,
+            0.6,
+        )
+        batch.release.set()
+        peer.wait(batch.sent, "COALESCE one write")
+        return wait_until(
+            lambda: coalesced_receive_queue(proc, inode, expected),
+            "COALESCE full receive queue missing",
+            peer,
+            0.6,
+        )
+    finally:
+        os.kill(pid, signal.SIGCONT)
+
+
+def coalesced_fds(actual, baseline, pending):
+    if actual is None or any(actual.get(fd) != value for fd, value in baseline.items()):
+        return False
+    extra = {fd: value for fd, value in actual.items() if fd not in baseline}
+    return len(extra) == pending and all(
+        value.startswith("socket:[") for value in extra.values()
+    )
+
+
+def coalesced_position(wire, split):
+    if not 0 < split < len(wire):
+        raise AssertionError("invalid COALESCE internal prefix")
+    if wire.startswith(b"*"):
+        return record_reader_position(wire, split)
+    if wire.startswith(b"$"):
+        # hiredis processBulkItem commits its line only with the entire payload.
+        return 1, 0
+    if wire.startswith(b"-"):
+        return 1, 0
+    raise AssertionError("unsupported COALESCE prefix frame")
+
+
+def coalesced_prefix(log, base, first, last, split, expected, remaining_gets):
+    if coalesced_callbacks(log) != expected:
+        raise AssertionError("COALESCE prefix callback ownership/count")
+    position, task = coalesced_position(last, split)
+    prefix = first + last[:split]
+    for row in states(log):
+        if row["where"] == "read" and (
+            row["length"] - base["length"],
+            row["pos"] - base["pos"],
+            row["task"],
+            row["pending"],
+            row["tokens"],
+            row["parked"],
+            row["timer"],
+            row["bytes"],
+        ) == (
+            len(prefix),
+            len(first) + position,
+            task,
+            1,
+            remaining_gets,
+            remaining_gets,
+            1,
+            (bytes.fromhex(base["bytes"]) + prefix)[-32:].hex(),
+        ):
+            return row
+    return None
+
+
+def coalesced_scenarios(check, record, case, split=0):
+    script = CoalescedBatch(
+        [
+            CoalescedFrame("script", str(i), b"$40\r\n" + digest(s) + b"\r\n")
+            for i, s in enumerate((check, record))
+        ],
+        split,
+    )
+    nil = b"$-1\r\n"
+    deadline = str(int(time.time()) + 45).encode()
+    blocked = b"$" + str(len(deadline)).encode() + b"\r\n" + deadline + b"\r\n"
+
+    def get(name, wire=nil):
+        return CoalescedFrame(
+            "get", name, wire, 429 if wire == blocked or len(wire) > 16384 else 200
+        )
+
+    def rec(name, armed=0, error=False):
+        return CoalescedFrame(
+            "record",
+            name,
+            ERROR
+            if error
+            else integer_reply(
+                1 if armed else 0,
+                10 if armed else 1,
+                int(deadline) if armed else 0,
+                armed,
+            ),
+            404,
+            armed,
+        )
+
+    if case == "drain":
+        large = b"$20000\r\n" + b"9" * 20000 + b"\r\n"
+        return [
+            CoalescedBatch(script.frames),
+            CoalescedBatch([get("large", large), get("after-large")]),
+        ]
+    if case == "errors":
+        return [
+            script,
+            CoalescedBatch(
+                [get("good-a"), get("error-b", ERROR), get("blocked-c", blocked)]
+            ),
+            CoalescedBatch(
+                [rec("record-a"), rec("record-error", error=True), rec("record-c", 1)]
+            ),
+            CoalescedBatch(
+                [
+                    get("mixed-a"),
+                    rec("mixed-error", error=True),
+                    get("mixed-c", blocked),
+                ]
+            ),
+            CoalescedBatch(
+                [rec("reverse-a"), get("reverse-error", ERROR), rec("reverse-c", 1)]
+            ),
+        ]
+    return [
+        script,
+        CoalescedBatch([get("allow"), get("blocked", blocked)], split),
+        CoalescedBatch([rec("normal"), rec("armed", 1)], split),
+        CoalescedBatch([get("mixed"), rec("mixed-record", 1)], split),
+        CoalescedBatch([rec("reverse"), get("reverse-get", blocked)], split),
+    ]
+
+
+def coalesced_http(client, frame):
+    client.settimeout(0.6)
+    response = b""
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    try:
+        header, body = response.split(b"\r\n\r\n", 1)
+        lines = header.split(b"\r\n")
+        status = lines[0].split(b" ", 2)
+        lengths = [
+            line.split(b":", 1)[1].strip()
+            for line in lines[1:]
+            if line.lower().startswith(b"content-length:")
+        ]
+        if (
+            len(status) != 3
+            or status[0] not in (b"HTTP/1.0", b"HTTP/1.1")
+            or status[1] != str(frame.status).encode()
+            or len(lengths) != 1
+            or not lengths[0].isdigit()
+            or len(body) != int(lengths[0])
+            or any(line.lower().startswith(b"transfer-encoding:") for line in lines[1:])
+        ):
+            raise ValueError("invalid response framing/status")
+    except ValueError as error:
+        raise AssertionError("COALESCE GET FIFO HTTP outcome/framing") from error
+    finally:
+        client.close()
+
+
+def test_coalesced(binary, module, root, port, case, split=0):
+    if case == "splits":
+        # Type-only and final-delimiter boundaries for every pair family.
+        # -1 is converted per frame rather than imposing a common length.
+        for boundary in (1, -1):
+            test_coalesced(
+                binary, module, root / f"prefix-{boundary}", port, "partial", boundary
+            )
+        return
+    check, record = scripts(
+        pathlib.Path(__file__).resolve().parents[2]
+        / "src/ngx_http_error_abuse_module.c"
+    )
+    batches = coalesced_scenarios(check, record, case)
+    if split:
+        for batch in batches:
+            batch.split = split if split > 0 else len(batch.frames[-1].wire) - 1
+    peer = CoalescedPeer(check, record, batches)
+    peer.start()
+    nginx = Nginx(binary, module, root, port, "", False, peer.port)
+    clients = []
+    evidence = []
+    try:
+        (root / "conf").mkdir(parents=True)
+        (root / "logs").mkdir()
+        (root / "conf/nginx.conf").write_text(
+            f"""load_module {module};
+worker_processes 1;
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log debug;
+events {{ worker_connections 64; }}
+http {{
+ log_format protocol '$arg_client $status';
+ access_log {root}/access.log protocol;
+ error_abuse_redis host=127.0.0.1 port={peer.port} prefix=ea02-get: timeout=1s;
+ error_abuse_zone zone=get:1m key=$arg_client statuses=404 interval=60s threshold=10 block=60s inactive=120s redis=on;
+ server {{ listen 127.0.0.1:{port};
+ location = /get.gif {{ error_abuse zone=get; empty_gif; }}
+ location = /record.gif {{ error_abuse zone=get; return 404; }}
+ location = /health.gif {{ empty_gif; }}
+ location = /stats {{ error_abuse_stats get; }}
+ }}
+}}
+""",
+            encoding="ascii",
+        )
+        log_path = root / "logs/error.log"
+        access = root / "access.log"
+
+        def log():
+            return log_path.read_text(encoding="ascii", errors="replace")
+
+        with mock.patch.object(nginx, "write_config"):
+            nginx.start()
+        fetch(port, "/health.gif")
+        assert nginx.process is not None
+        children = (
+            pathlib.Path(f"/proc/{nginx.process.pid}/task/{nginx.process.pid}/children")
+            .read_text()
+            .split()
+        )
+        if len(children) != 1:
+            raise AssertionError("COALESCE requires one normal worker")
+        proc = pathlib.Path(f"/proc/{children[0]}")
+        peer.wait(batches[0].queued, "COALESCE initial SCRIPT vectors")
+        baseline = wait_until(
+            lambda: record_fd_baseline(proc, port), "COALESCE initial fd baseline", peer
+        )
+        redis_inodes = {
+            f"socket:[{fields[9]}]"
+            for row in (proc / "net/tcp").read_text().splitlines()[1:]
+            if (fields := row.split()) and int(fields[2].split(":")[1], 16) == peer.port
+        }
+        redis_fds = [int(fd) for fd, value in baseline.items() if value in redis_inodes]
+        if len(redis_fds) != 1:
+            raise AssertionError("COALESCE connected Redis inode identity")
+        record_id = 0
+        all_expected = []
+        connection_identity = None
+        timer_identity = None
+        previous_drain = None
+        get_ids = []
+        for batch in batches:
+            offset = len(log())
+            sockets = []
+            expected = []
+            before = record_stats(port)["bans"]
+            for frame in batch.frames:
+                if frame.kind == "script":
+                    expected.append(("script", str(int(frame.identity) + 1), 1, 0))
+                    continue
+                if frame.kind == "record":
+                    record_id += 1
+                    expected.append(
+                        (
+                            "record",
+                            str(record_id),
+                            6 if frame.wire == ERROR else 2,
+                            1 if frame.wire == ERROR else 0,
+                        )
+                    )
+                    status, _, _ = http_call(
+                        port, f"/record.gif?client={frame.identity}"
+                    )
+                    if status != 404:
+                        raise AssertionError("COALESCE record HTTP status")
+                else:
+                    client = socket.create_connection(("127.0.0.1", port))
+                    clients.append(client)
+                    client.sendall(
+                        f"GET /get.gif?client={frame.identity} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode()
+                    )
+                    sockets.append((client, frame))
+                    count = len(get_ids) + 1
+                    wait_until(
+                        lambda count=count: (
+                            len([e for e in events(log()) if e[0] == "park"]) >= count
+                        ),
+                        "COALESCE GET did not park",
+                        peer,
+                    )
+                    identity = [e[1] for e in events(log()) if e[0] == "park"][-1]
+                    get_ids.append(identity)
+                    expected.append(
+                        (
+                            "get",
+                            identity,
+                            6
+                            if frame.wire == ERROR
+                            else 1
+                            if frame.status == 429
+                            else 4,
+                            1 if frame.wire == ERROR else 0,
+                        )
+                    )
+            peer.wait(batch.queued, "COALESCE full queued vectors")
+            segment = log()[offset:]
+            if coalesced_callbacks(segment):
+                raise AssertionError("COALESCE callback before release")
+            base = (
+                states(log())[-1]
+                if states(log())
+                else {"length": 0, "pos": 0, "bytes": ""}
+            )
+            if base["length"] != base["pos"]:
+                raise AssertionError("COALESCE prior reader not at frame boundary")
+            receive = coalesced_release(proc, baseline[str(redis_fds[0])], batch, peer)
+            prefix = None
+            drains = []
+            if batch.split:
+                prior = expected[:-1]
+                first = b"".join(f.wire for f in batch.frames[:-1])
+                remaining = int(batch.frames[-1].kind == "get")
+
+                def prefix_witness(
+                    offset=offset,
+                    base=base,
+                    first=first,
+                    batch=batch,
+                    prior=prior,
+                    remaining=remaining,
+                ):
+                    return coalesced_prefix(
+                        log()[offset:],
+                        base,
+                        first,
+                        batch.frames[-1].wire,
+                        batch.split,
+                        prior,
+                        remaining,
+                    )
+
+                # The first frame callback must arrive before testing the exact prefix ledger.
+                wait_until(
+                    lambda offset=offset, prior=prior: (
+                        len(coalesced_callbacks(log()[offset:])) >= len(prior)
+                    ),
+                    "COALESCE first callback missing",
+                    peer,
+                    0.6,
+                )
+                prefix = wait_until(
+                    prefix_witness,
+                    "COALESCE exact frame-relative prefix not consumed",
+                    peer,
+                    0.6,
+                )
+                prefix_drain = wait_until(
+                    lambda offset=offset, prior=prior: coalesced_drain(
+                        log()[offset:], prior
+                    ),
+                    "COALESCE prefix outside single readable drain",
+                    peer,
+                    0.6,
+                )
+                if prefix not in prefix_drain["readers"]:
+                    raise AssertionError(
+                        "COALESCE prefix reader outside callback drain"
+                    )
+                drains.append(prefix_drain)
+                # Settle every complete GET before permitting the next frame suffix.
+                complete_sockets = sockets if not remaining else sockets[:-1]
+                for client, frame in complete_sockets:
+                    coalesced_http(client, frame)
+                    assert_one_completion(
+                        access.read_text().splitlines(),
+                        frame.identity,
+                        str(frame.status),
+                    )
+                sockets = sockets[-1:] if remaining else []
+                if remaining and select.select([sockets[0][0]], [], [], 0)[0]:
+                    raise AssertionError("COALESCE partial next GET completed early")
+                prefix_delta = sum(f.delta for f in batch.frames[:-1])
+                if record_stats(port)["bans"] - before != prefix_delta:
+                    raise AssertionError("COALESCE partial next record changed bans")
+                wait_until(
+                    lambda remaining=remaining: coalesced_fds(
+                        record_fd_baseline(proc, 0), baseline, remaining
+                    ),
+                    "COALESCE prefix fd identity baseline drift",
+                    peer,
+                )
+                batch.suffix.set()
+                # Remaining frame must have its own observed readable drain.
+                wait_until(
+                    lambda offset=offset, expected=expected: (
+                        len(coalesced_callbacks(log()[offset:])) == len(expected)
+                    ),
+                    "COALESCE suffix callback missing",
+                    peer,
+                    0.6,
+                )
+                drain = wait_until(
+                    lambda offset=offset, expected=expected: coalesced_drain(
+                        log()[offset:], expected[-1:]
+                    ),
+                    "COALESCE suffix drain witness missing",
+                    peer,
+                    0.6,
+                )
+            else:
+                drain = wait_until(
+                    lambda offset=offset, expected=expected: coalesced_drain(
+                        log()[offset:],
+                        expected,
+                        require_partial=case == "drain" and len(evidence) == 1,
+                    ),
+                    "COALESCE single-drain FIFO progress missing",
+                    peer,
+                    0.6,
+                )
+            if drain is None:
+                raise AssertionError("COALESCE suffix drain witness missing")
+            drains.append(drain)
+            for observed in drains:
+                previous_drain = coalesced_drain_order(previous_drain, observed["id"])
+                identity = (
+                    observed["fd"],
+                    observed["command"],
+                    observed["reconnect"],
+                )
+                if connection_identity is None:
+                    connection_identity = identity
+                if identity != connection_identity or observed["fd"] != redis_fds[0]:
+                    raise AssertionError("COALESCE fd/command/reconnect identity drift")
+                begin_identity = (observed["begin_timer"], observed["begin_due"])
+                if timer_identity is not None and (
+                    begin_identity[0] != timer_identity[0]
+                    or begin_identity[1] < timer_identity[1]
+                ):
+                    raise AssertionError("COALESCE command timer/due continuity drift")
+                timer_identity = (observed["timer"], observed["due"])
+            completed = drain["readers"][-1]
+            if completed["length"] != completed["pos"] or any(
+                completed[k] for k in ("pending", "tokens", "parked", "task")
+            ):
+                raise AssertionError("COALESCE completed batch retained reader/owner")
+            if batch.split and completed["length"] - base["length"] != sum(
+                len(f.wire) for f in batch.frames
+            ):
+                raise AssertionError("COALESCE suffix frame-relative completion drift")
+            for client, frame in sockets:
+                coalesced_http(client, frame)
+            for frame in batch.frames:
+                if frame.kind != "script":
+                    wait_until(
+                        lambda frame=frame: (
+                            f"{frame.identity} {frame.status}"
+                            in access.read_text().splitlines()
+                        ),
+                        "COALESCE HTTP completion missing",
+                        peer,
+                    )
+                    assert_one_completion(
+                        access.read_text().splitlines(),
+                        frame.identity,
+                        str(frame.status),
+                    )
+            all_expected.extend(expected)
+            expected_records = [
+                f
+                for b in batches[: len(evidence) + 1]
+                for f in b.frames
+                if f.kind == "record"
+            ]
+            callbacks = [r for r in record_states(log()) if r["where"] == "callback"]
+            if [
+                (r["id"], r["gen"], r["local"], r["nulls"], r["delta"])
+                for r in callbacks
+            ] != [(i, 1, 0, 0, f.delta) for i, f in enumerate(expected_records, 1)]:
+                raise AssertionError("COALESCE record callback FIFO ban ownership")
+            if len(events(log())) != 4 * len(get_ids) or {
+                i for _, i in events(log())
+            } != set(get_ids):
+                raise AssertionError("COALESCE non-GET callback acquired lifecycle")
+            if coalesced_callbacks(log()) != all_expected:
+                raise AssertionError("COALESCE duplicate or wrong FIFO callback")
+            for identity in get_ids:
+                assert_completion(
+                    "\n".join(
+                        f"EA_GET {kind} id={i}"
+                        for kind, i in events(log())
+                        if i == identity
+                    )
+                )
+            if record_stats(port)["bans"] - before != sum(
+                f.delta for f in batch.frames
+            ):
+                raise AssertionError("COALESCE record FIFO ban effect")
+            wait_until(
+                lambda: worker_fds(proc, port) == baseline,
+                "COALESCE fd baseline drift",
+                peer,
+            )
+            evidence.append(
+                {
+                    "expected": expected,
+                    "drain": drain,
+                    "prefix": prefix,
+                    "receive": receive,
+                    "split": batch.split,
+                }
+            )
+            batch.ack.set()
+        final = wait_until(
+            lambda drain_id=drain["id"]: coalesced_final_idle(log(), drain_id),
+            "COALESCE idle resources did not settle",
+            peer,
+        )
+        assert_resources(final["script"], True)
+        assert_fds(worker_fds(proc, port), baseline)
+        if coalesced_callbacks(log()) != all_expected or peer.sessions != 1:
+            raise AssertionError("COALESCE duplicate settlement/reconnect")
+        # Error neighbours must traverse the real native failure branch exactly once.
+        failures = sum(
+            frame.wire == ERROR for batch in batches for frame in batch.frames
+        )
+        if (
+            len(re.findall(r"Redis (?:check|EVAL) returned unexpected reply", log()))
+            != failures
+        ):
+            raise AssertionError("COALESCE real error-owner failure path")
+        for line in log().splitlines():
+            if (
+                re.search(r"\[(?:emerg|alert|crit|error|warn)\]", line)
+                and "returned unexpected reply" not in line
+            ):
+                raise AssertionError(f"unexpected COALESCE error log: {line}")
+        assert_ledger(
+            log(),
+            [(i, 1, digest(script)) for i, script in enumerate((check, record), 1)],
+        )
+        peer.check()
+        (root / "coalesced-evidence.json").write_text(
+            json.dumps(
+                {
+                    "case": case,
+                    "worker": children[0],
+                    "rows": evidence,
+                    "final": final,
+                    "fd_baseline": baseline,
+                    "history_hex": [[v.hex() for v in c] for c in peer.history],
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    finally:
+        for client in clients:
+            client.close()
+        try:
+            nginx.stop()
+        finally:
+            peer.stop()
+    print(f"OK: COALESCE {case} split={split}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nginx-binary", type=pathlib.Path, required=True)
     parser.add_argument("--module", type=pathlib.Path, required=True)
     parser.add_argument("--root", type=pathlib.Path, required=True)
     parser.add_argument("--port", type=int, default=18968)
-    parser.add_argument("--family", choices=("script", "record"), required=True)
+    parser.add_argument(
+        "--family", choices=("script", "record", "coalesced"), required=True
+    )
     parser.add_argument(
         "--case",
         choices=(
             "whole",
+            "drain",
             "splits",
             "errors",
             "noscript",
@@ -1494,8 +2299,18 @@ def main() -> None:
         required=True,
     )
     args = parser.parse_args()
-    if args.family == "script":
-        if args.case in ("splits", "errors", "noscript", "null"):
+    if args.family == "coalesced":
+        if args.case not in ("whole", "splits", "errors", "drain"):
+            parser.error(f"case {args.case} is not valid for COALESCE")
+        test_coalesced(
+            args.nginx_binary.resolve(),
+            args.module.resolve(),
+            args.root.resolve(),
+            args.port,
+            args.case,
+        )
+    elif args.family == "script":
+        if args.case in ("splits", "errors", "noscript", "null", "drain"):
             parser.error(f"case {args.case} is not valid for SCRIPT")
         test_script(
             args.nginx_binary.resolve(),
@@ -1505,7 +2320,7 @@ def main() -> None:
             args.case,
         )
     else:
-        if args.case.startswith("error-"):
+        if args.case.startswith("error-") or args.case == "drain":
             parser.error(f"case {args.case} is not valid for RECORD")
         arguments = (
             args.nginx_binary.resolve(),

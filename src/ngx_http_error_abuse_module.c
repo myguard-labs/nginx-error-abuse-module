@@ -390,6 +390,22 @@ static ngx_http_error_abuse_redis_worker_t ngx_http_error_abuse_redis_worker;
  * timer, which may remain armed until its scheduled idle wakeup. */
 static ngx_uint_t ngx_http_error_abuse_test_get_tokens;
 static ngx_uint_t ngx_http_error_abuse_test_get_parked;
+static ngx_uint_t ngx_http_error_abuse_test_drain;
+
+static void
+ngx_http_error_abuse_test_drain_snapshot(const char *where, ngx_socket_t fd)
+{
+    ngx_http_error_abuse_redis_worker_t  *worker;
+
+    worker = &ngx_http_error_abuse_redis_worker;
+    ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
+                  "EA_DRAIN %s id=%ui fd=%i command=%p timer=%d due=%M "
+                  "reconnect=%p retry=%d", where,
+                  ngx_http_error_abuse_test_drain, (ngx_int_t) fd,
+                  &worker->adapter.timeout, worker->adapter.timeout.timer_set,
+                  worker->adapter.timeout.timer.key, &worker->reconnect,
+                  worker->reconnect.timer_set);
+}
 
 /* Two initial SCRIPT callbacks only. Static tokens carry no request/context
  * pointer and remain valid through disconnect's NULL callback drain. A new
@@ -4228,6 +4244,12 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
      * touches r either. run_posted_requests(c) then runs LAST, off the
      * pre-captured connection, the same way ngx_http_request_handler() calls
      * it after its event handler, never re-touching r itself. */
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_COALESCE get id=%uA kind=%d failures=%ui", test_id,
+                  reply != NULL ? reply->type : 0,
+                  ngx_http_error_abuse_redis_worker.consecutive_failures);
+#endif
     r->write_event_handler = ngx_http_core_run_phases;
     ngx_http_finalize_request(r, NGX_DONE);
 #if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
@@ -4350,6 +4372,11 @@ ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
     ngx_http_error_abuse_test_record_nulls += (data == NULL);
     ngx_http_error_abuse_redis_record_callback_impl(ac, data, zone, 0);
     after = ngx_http_error_abuse_test_record_bans(zone);
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_COALESCE record id=%ui kind=%d failures=%ui",
+                  ngx_http_error_abuse_test_record_called,
+                  data != NULL ? ((redisReply *) data)->type : 0,
+                  ngx_http_error_abuse_redis_worker.consecutive_failures);
     ngx_http_error_abuse_test_record_snapshot("callback", 0, data, before,
                                                after);
 #else
@@ -4370,6 +4397,11 @@ ngx_http_error_abuse_redis_record_local_callback(redisAsyncContext *ac,
     ngx_http_error_abuse_test_record_nulls += (data == NULL);
     ngx_http_error_abuse_redis_record_callback_impl(ac, data, zone, 1);
     after = ngx_http_error_abuse_test_record_bans(zone);
+    ngx_log_error(NGX_LOG_NOTICE, ngx_http_error_abuse_redis_worker.log, 0,
+                  "EA_COALESCE record id=%ui kind=%d failures=%ui",
+                  ngx_http_error_abuse_test_record_called,
+                  data != NULL ? ((redisReply *) data)->type : 0,
+                  ngx_http_error_abuse_redis_worker.consecutive_failures);
     ngx_http_error_abuse_test_record_snapshot("callback", 1, data, before,
                                                after);
 #else
@@ -4491,6 +4523,10 @@ ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev)
     c = rev->data;
     ev = c->data;
 
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    ngx_http_error_abuse_test_drain++;
+    ngx_http_error_abuse_test_drain_snapshot("begin", c->fd);
+#endif
     while (ev->context != NULL) {
         redisAsyncHandleRead(ev->context);
 
@@ -4516,6 +4552,10 @@ ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev)
             break;
         }
     }
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    /* The connection may have been released by a callback; do not touch c. */
+    ngx_http_error_abuse_test_drain_snapshot("end", -1);
+#endif
 }
 
 static void
