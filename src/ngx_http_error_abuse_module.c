@@ -405,6 +405,14 @@ static ngx_uint_t ngx_http_error_abuse_test_script_called;
 static ngx_uint_t ngx_http_error_abuse_test_script_cleanup;
 static ngx_http_error_abuse_test_script_t ngx_http_error_abuse_test_scripts[2];
 
+/* Record callbacks retain only the production zone pointer.  The single
+ * worker event loop and hiredis FIFO therefore provide a bounded observer
+ * without adding request ownership or changing callback data. */
+static ngx_uint_t ngx_http_error_abuse_test_record_generation;
+static ngx_uint_t ngx_http_error_abuse_test_record_queued;
+static ngx_uint_t ngx_http_error_abuse_test_record_called;
+static ngx_uint_t ngx_http_error_abuse_test_record_nulls;
+
 static void
 ngx_http_error_abuse_test_script_snapshot(const char *where, ngx_uint_t slot,
     redisReply *reply)
@@ -451,6 +459,58 @@ ngx_http_error_abuse_test_script_queue(int rc, ngx_uint_t slot)
         ngx_http_error_abuse_test_script_queued++;
         ngx_http_error_abuse_test_script_snapshot("queue", slot, NULL);
     }
+}
+
+static uint64_t
+ngx_http_error_abuse_test_record_bans(ngx_http_error_abuse_zone_t *zone)
+{
+    uint64_t  bans;
+
+    ngx_shmtx_lock(&zone->shpool->mutex);
+    bans = zone->sh->stats.bans;
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+
+    return bans;
+}
+
+static void
+ngx_http_error_abuse_test_record_snapshot(const char *where,
+    ngx_flag_t local_armed, redisReply *reply, uint64_t bans_before,
+    uint64_t bans_after)
+{
+    ngx_int_t                             armed;
+    ngx_uint_t                            id;
+    ngx_http_error_abuse_redis_worker_t  *worker;
+
+    worker = &ngx_http_error_abuse_redis_worker;
+    armed = -1;
+    if (reply != NULL && reply->type == REDIS_REPLY_ARRAY
+        && reply->elements == 4 && reply->element != NULL
+        && reply->element[3] != NULL
+        && reply->element[3]->type == REDIS_REPLY_INTEGER)
+    {
+        armed = (ngx_int_t) reply->element[3]->integer;
+    }
+    id = ngx_strcmp(where, "queue") == 0
+         ? ngx_http_error_abuse_test_record_queued
+         : ngx_http_error_abuse_test_record_called;
+    ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
+                  "EA_RECORD state=%s gen=%ui id=%ui queued=%ui called=%ui "
+                  "outstanding=%ui nulls=%ui local=%i type=%d elements=%uz "
+                  "armed=%i bans=%uL delta=%uL ready=%ui connected=%d "
+                  "timer=%d", where,
+                  ngx_http_error_abuse_test_record_generation, id,
+                  ngx_http_error_abuse_test_record_queued,
+                  ngx_http_error_abuse_test_record_called,
+                  ngx_http_error_abuse_test_record_queued
+                      - ngx_http_error_abuse_test_record_called,
+                  ngx_http_error_abuse_test_record_nulls, local_armed,
+                  reply != NULL ? reply->type : 0,
+                  reply != NULL && reply->type == REDIS_REPLY_ARRAY
+                      ? reply->elements : 0,
+                  armed, bans_after, bans_after - bans_before,
+                  (ngx_uint_t) worker->ready, worker->adapter.conn != NULL,
+                  worker->adapter.timeout.timer_set);
 }
 
 static void
@@ -4201,7 +4261,8 @@ ngx_http_error_abuse_redis_record_callback_impl(redisAsyncContext *ac,
     }
 
     if (reply->type == REDIS_REPLY_ARRAY
-        && reply->elements >= 2
+        && (reply->elements == 2 || reply->elements == 3
+            || reply->elements == 4)
         && reply->element != NULL
         && reply->element[0] != NULL
         && reply->element[1] != NULL
@@ -4210,9 +4271,10 @@ ngx_http_error_abuse_redis_record_callback_impl(redisAsyncContext *ac,
         && reply->element[0]->integer >= 0
         && reply->element[0]->integer <= 1
         && reply->element[1]->integer >= 0
-        && (reply->elements != 3
+        && (reply->elements < 3
             || (reply->element[2] != NULL
-                && reply->element[2]->type == REDIS_REPLY_INTEGER))
+                && reply->element[2]->type == REDIS_REPLY_INTEGER
+                && reply->element[2]->integer >= 0))
         && (reply->elements < 4
             || (reply->element[2] != NULL
                 && reply->element[3] != NULL
@@ -4279,14 +4341,40 @@ static void
 ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
     void *privdata)
 {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    uint64_t                       before, after;
+    ngx_http_error_abuse_zone_t   *zone = privdata;
+
+    before = ngx_http_error_abuse_test_record_bans(zone);
+    ngx_http_error_abuse_test_record_called++;
+    ngx_http_error_abuse_test_record_nulls += (data == NULL);
+    ngx_http_error_abuse_redis_record_callback_impl(ac, data, zone, 0);
+    after = ngx_http_error_abuse_test_record_bans(zone);
+    ngx_http_error_abuse_test_record_snapshot("callback", 0, data, before,
+                                               after);
+#else
     ngx_http_error_abuse_redis_record_callback_impl(ac, data, privdata, 0);
+#endif
 }
 
 static void
 ngx_http_error_abuse_redis_record_local_callback(redisAsyncContext *ac,
     void *data, void *privdata)
 {
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    uint64_t                       before, after;
+    ngx_http_error_abuse_zone_t   *zone = privdata;
+
+    before = ngx_http_error_abuse_test_record_bans(zone);
+    ngx_http_error_abuse_test_record_called++;
+    ngx_http_error_abuse_test_record_nulls += (data == NULL);
+    ngx_http_error_abuse_redis_record_callback_impl(ac, data, zone, 1);
+    after = ngx_http_error_abuse_test_record_bans(zone);
+    ngx_http_error_abuse_test_record_snapshot("callback", 1, data, before,
+                                               after);
+#else
     ngx_http_error_abuse_redis_record_callback_impl(ac, data, privdata, 1);
+#endif
 }
 
 static void
@@ -4370,6 +4458,16 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
             ngx_http_error_abuse_stats_count_ban(ctx->zone);
         }
     }
+#if (NGX_HTTP_ERROR_ABUSE_TEST_GET_TRACE)
+    else {
+        uint64_t  bans;
+
+        ngx_http_error_abuse_test_record_queued++;
+        bans = ngx_http_error_abuse_test_record_bans(ctx->zone);
+        ngx_http_error_abuse_test_record_snapshot("queue", local_armed, NULL,
+                                                   bans, bans);
+    }
+#endif
 
 #undef NGX_ERROR_ABUSE_REDIS_NUMBER
 }
@@ -4677,6 +4775,10 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
         ngx_http_error_abuse_test_script_generation++;
         ngx_http_error_abuse_test_script_queued = 0;
         ngx_http_error_abuse_test_script_called = 0;
+        ngx_http_error_abuse_test_record_generation++;
+        ngx_http_error_abuse_test_record_queued = 0;
+        ngx_http_error_abuse_test_record_called = 0;
+        ngx_http_error_abuse_test_record_nulls = 0;
 #endif
         worker->ready = 1;
         worker->reconnect_backoff = 0;   /* PERF-4: reset on success */

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Live initial SCRIPT whole/error controls; splits remain a separate gate.
+"""Live initial SCRIPT and RECORD-WHOLE protocol controls.
 
 Only the existing GET helpers decode commands and witness request ownership.
 SCRIPT replies are released one at a time after the previous live callback is
 acknowledged. Error cases close the peer only after the post-branch witness,
 settling the remaining callbacks via hiredis's actual NULL-failure drain.
+Record commands use a separate bounded ten-element decoder and hold their
+callbacks until the counted HTTP response has completed.
 """
 
 import argparse
 import dataclasses
+import io
 import json
 import pathlib
 import re
@@ -18,7 +21,7 @@ import threading
 import time
 from unittest import mock
 
-from test_runtime import Nginx, fetch
+from test_runtime import Nginx, fetch, http_call
 from test_runtime_get import (
     TIMEOUT,
     GetPeer,
@@ -340,6 +343,222 @@ class ScriptPeer(GetPeer):
         super().stop()
 
 
+RECORD_FIELDS = (
+    "gen",
+    "id",
+    "queued",
+    "called",
+    "outstanding",
+    "nulls",
+    "local",
+    "type",
+    "elements",
+    "armed",
+    "bans",
+    "delta",
+    "ready",
+    "connected",
+    "timer",
+)
+RECORD_STATE = re.compile(
+    r"EA_RECORD state=(\w+) "
+    + " ".join(
+        rf"{name}=(-?\d+)" if name == "armed" else rf"{name}=(\d+)"
+        for name in RECORD_FIELDS
+    )
+)
+
+
+def record_states(log: str) -> list[dict]:
+    return [
+        {
+            "where": match[1],
+            **dict(zip(RECORD_FIELDS, map(int, match.groups()[1:]), strict=True)),
+        }
+        for match in RECORD_STATE.finditer(log)
+    ]
+
+
+def read_record_command(stream: io.BufferedIOBase) -> list[bytes] | None:
+    """Decode exactly one bounded ten-element record EVALSHA command."""
+    line = stream.readline(32)
+    if not line:
+        return None
+    if line != b"*10\r\n":
+        raise ValueError("malformed record RESP command array")
+    command = []
+    total = 0
+    for _ in range(10):
+        line = stream.readline(32)
+        if not re.fullmatch(rb"\$(0|[1-9][0-9]{0,3})\r\n", line):
+            raise ValueError("malformed record RESP command length")
+        length = int(line[1:-2])
+        total += length
+        if length > 4096 or total > 16384:
+            raise ValueError("record RESP command element too large")
+        value = stream.read(length)
+        if len(value) != length or stream.read(2) != b"\r\n":
+            raise ValueError("truncated record RESP command")
+        command.append(value)
+    return command
+
+
+def record_keys(identity: str) -> tuple[bytes, bytes]:
+    block = block_key(identity)
+    return block.rsplit(b":", 1)[0] + b":events", block
+
+
+def integer_reply(*values: int) -> bytes:
+    return f"*{len(values)}\r\n".encode() + b"".join(
+        f":{value}\r\n".encode() for value in values
+    )
+
+
+@dataclasses.dataclass
+class RecordReply:
+    identity: str
+    wire: bytes | None
+    local: int
+    delta: int
+    elements: int
+    request_id: str = ""
+    armed: int = -1
+    reply_type: int = 2
+    reload: bool = False
+    unexpected: bool = False
+    received: threading.Event = dataclasses.field(default_factory=threading.Event)
+    release: threading.Event = dataclasses.field(default_factory=threading.Event)
+    sent: threading.Event = dataclasses.field(default_factory=threading.Event)
+    reloaded: threading.Event = dataclasses.field(default_factory=threading.Event)
+    finished: threading.Event = dataclasses.field(default_factory=threading.Event)
+
+
+class RecordPeer(GetPeer):
+    """One connection with strict record vectors and held callbacks."""
+
+    def __init__(
+        self, check: bytes, record: bytes, threshold: int, ack_timeout: float = 2.0
+    ):
+        super().__init__(check, record, ack_timeout)
+        self.threshold = threshold
+        self.primed = threading.Event()
+        self.record_vectors: list[list[bytes]] = []
+        self.nonce_prefix: bytes | None = None
+
+    def record_vector(self, command: list[bytes] | None, reply: RecordReply) -> None:
+        event_key, blocked_key = record_keys(reply.identity)
+        if command is None or len(command) != 10:
+            raise AssertionError("wrong RECORD vector arity")
+        expected = [
+            b"EVALSHA",
+            digest(self.expected_scripts[1]),
+            b"2",
+            event_key,
+            blocked_key,
+            b"60000",
+            str(self.threshold).encode(),
+            b"60000",
+            b"120000",
+        ]
+        if command[:9] != expected:
+            raise AssertionError("wrong RECORD SHA/keys/units/vector")
+        match = re.fullmatch(rb"([0-9]+):([1-9][0-9]*)", command[9])
+        if match is None:
+            raise AssertionError("wrong RECORD nonce format")
+        if self.nonce_prefix is None:
+            self.nonce_prefix = match[1]
+        if match[1] != self.nonce_prefix:
+            raise AssertionError("RECORD nonce worker prefix changed")
+        if int(match[2]) != len(self.record_vectors) + 1:
+            raise AssertionError("RECORD nonce unique ordered sequence")
+        tag = b"{get:" + blocked_key.split(b"{get:", 1)[1].split(b"}", 1)[0] + b"}"
+        if tag not in event_key or tag not in blocked_key:
+            raise AssertionError("RECORD keys do not share exact hash tag")
+
+    def serve(self, stream) -> None:
+        for script in self.expected_scripts:
+            command = read_command(stream)
+            if command != [b"SCRIPT", b"LOAD", script]:
+                raise AssertionError("wrong RECORD initial SCRIPT vector")
+            self.history.append(command)
+            stream.write(b"$40\r\n" + digest(script) + b"\r\n")
+            stream.flush()
+        self.notify(self.primed)
+
+        while not self.stopping.is_set():
+            command = read_record_command(stream)
+            if command is None:
+                if not self.stopping.is_set():
+                    raise AssertionError("unexpected RECORD Redis EOF")
+                return
+            with self.condition:
+                reply = self.current
+            if not isinstance(reply, RecordReply) or reply.finished.is_set():
+                raise AssertionError("unexpected RECORD without prepared reply")
+            self.record_vector(command, reply)
+            self.record_vectors.append(command)
+            self.history.append(command)
+            self.notify(reply.received)
+            if not reply.release.wait(self.ack_timeout):
+                raise AssertionError("missing RECORD callback release")
+            if self.stopping.is_set():
+                return
+            if reply.wire is None:
+                self.notify(reply.sent)
+                self.notify(reply.finished)
+                return
+            stream.write(reply.wire)
+            stream.flush()
+            self.notify(reply.sent)
+            if reply.reload:
+                command = read_command(stream)
+                expected = [b"SCRIPT", b"LOAD", self.expected_scripts[1]]
+                if command != expected:
+                    raise AssertionError("NOSCRIPT loaded other than record script")
+                self.history.append(command)
+                stream.write(b"$40\r\n" + digest(self.expected_scripts[1]) + b"\r\n")
+                stream.flush()
+                self.notify(reply.reloaded)
+            self.notify(reply.finished)
+
+
+def assert_record_callback(log: str, reply: RecordReply, identity: int) -> dict:
+    rows = record_states(log)
+    queues = [row for row in rows if row["where"] == "queue" and row["id"] == identity]
+    callbacks = [
+        row for row in rows if row["where"] == "callback" and row["id"] == identity
+    ]
+    if len(queues) != 1 or len(callbacks) != 1:
+        raise AssertionError("RECORD unique queue/callback identity")
+    queue = queues[0]
+    callback = callbacks[0]
+    if (
+        queue["gen"] != 1
+        or callback["gen"] != 1
+        or (queue["queued"], queue["called"], queue["outstanding"])
+        != (identity, identity - 1, 1)
+        or (callback["queued"], callback["called"], callback["outstanding"])
+        != (identity, identity, 0)
+    ):
+        raise AssertionError("RECORD FIFO generation/settlement")
+    if queue["local"] != reply.local or callback["local"] != reply.local:
+        raise AssertionError("RECORD local-armed callback wrapper")
+    if callback["delta"] != reply.delta:
+        if reply.armed == 1:
+            raise AssertionError("RECORD armed_now ban-counter effect")
+        raise AssertionError("RECORD exact ban-counter effect")
+    expected_nulls = 1 if reply.wire is None else 0
+    if callback["nulls"] != expected_nulls:
+        raise AssertionError("RECORD NULL callback settlement")
+    if (
+        callback["type"] != reply.reply_type
+        or callback["elements"] != reply.elements
+        or callback["armed"] != reply.armed
+    ):
+        raise AssertionError("RECORD reply shape observer")
+    return callback
+
+
 def clean_logs(log: str, error: bool) -> None:
     expected = [
         r"error_abuse: Redis handshake \(AUTH/SELECT\) failed \(type=6, detail_len=18\); disconnecting$",
@@ -459,7 +678,7 @@ http {{
             ):
                 raise AssertionError("SCRIPT GET exactly-once HTTP 200")
             wait_until(
-                lambda: (
+                lambda reply=reply: (
                     access_path.exists()
                     and f"{reply.identity} 200\n" in access_path.read_text()
                 ),
@@ -660,26 +879,385 @@ http {{
     print(f"OK: SCRIPT {case}", flush=True)
 
 
+def raw_reply(*atoms: bytes) -> bytes:
+    return f"*{len(atoms)}\r\n".encode() + b"".join(atoms)
+
+
+def record_scenario(case: str) -> tuple[int, list[RecordReply], int, int]:
+    deadline = 2_000_000_000
+    if case == "whole":
+        replies = [
+            RecordReply("whole-a", integer_reply(0, 1, 0, 0), 0, 0, 4, armed=0),
+            RecordReply("whole-b", integer_reply(1, 1, deadline, 1), 0, 1, 4, armed=1),
+            RecordReply("whole-a", integer_reply(1, 2, deadline, 0), 1, 0, 4, armed=0),
+            RecordReply("whole-b", integer_reply(1, 2, deadline, 1), 1, 1, 4, armed=1),
+            RecordReply("legacy-two", integer_reply(0, 1), 0, 0, 2),
+            RecordReply("legacy-two", integer_reply(1, 2), 1, 1, 2),
+            RecordReply("legacy-three", integer_reply(0, 1, 0), 0, 0, 3),
+            RecordReply("legacy-three", integer_reply(1, 2, deadline), 1, 1, 3),
+        ]
+        return 2, replies, 0, 0
+    if case == "noscript":
+        return (
+            1,
+            [
+                RecordReply(
+                    "noscript-lost",
+                    b"-NOSCRIPT record fixture\r\n",
+                    1,
+                    1,
+                    0,
+                    reply_type=6,
+                    reload=True,
+                ),
+                RecordReply(
+                    "noscript-recovered",
+                    integer_reply(1, 1, deadline, 1),
+                    1,
+                    1,
+                    4,
+                    armed=1,
+                ),
+            ],
+            0,
+            1,
+        )
+    if case == "null":
+        return (
+            1,
+            [RecordReply("null-settlement", None, 1, 1, 0, reply_type=0)],
+            0,
+            0,
+        )
+    if case != "errors":
+        raise AssertionError(f"unknown RECORD case: {case}")
+
+    def integer(value: int) -> bytes:
+        return f":{value}\r\n".encode()
+
+    malformed = [
+        (raw_reply(integer(0)), 1, -1),
+        (raw_reply(*(integer(value) for value in (0, 1, 0, 0, 0))), 5, -1),
+        (raw_reply(b"$1\r\nx\r\n", integer(1), integer(0), integer(0)), 4, 0),
+        (raw_reply(integer(0), b"$1\r\nx\r\n", integer(0), integer(0)), 4, 0),
+        (integer_reply(-1, 1, 0, 0), 4, 0),
+        (integer_reply(0, -1, 0, 0), 4, 0),
+        (integer_reply(0, 1, -1, 0), 4, 0),
+        (integer_reply(1, 1, 0, -1), 4, -1),
+        (integer_reply(1, 1, 0, 2), 4, 2),
+        (integer_reply(0, 1, 0, 1), 4, 1),
+    ]
+    replies = []
+    for index, (wire, elements, armed) in enumerate(malformed, 1):
+        replies.append(
+            RecordReply(
+                f"malformed-{index}",
+                wire,
+                1,
+                1,
+                elements,
+                armed=armed,
+                unexpected=True,
+            )
+        )
+        replies.append(
+            RecordReply(
+                f"error-reset-{index}",
+                integer_reply(0, 1, 0, 0),
+                1,
+                0,
+                4,
+                armed=0,
+            )
+        )
+    return 1, replies, len(malformed), 0
+
+
+def record_stats(port: int) -> dict[str, int]:
+    status, _, body = http_call(port, "/stats")
+    if status != 200:
+        raise AssertionError(f"RECORD stats endpoint returned {status}")
+    return json.loads(body)
+
+
+def clean_record_logs(log: str, unexpected: int, noscript: int) -> None:
+    counts = {"unexpected": 0, "noscript": 0}
+    for line in log.splitlines():
+        if re.search(r"AddressSanitizer|runtime error:|LeakSanitizer", line):
+            raise AssertionError(f"unexpected RECORD sanitizer log: {line}")
+        if not re.search(r"\[(?:emerg|alert|crit|error|warn)\]", line):
+            continue
+        if "Redis EVAL returned unexpected reply" in line:
+            counts["unexpected"] += 1
+        elif "Redis script cache miss (NOSCRIPT); reloading record script" in line:
+            counts["noscript"] += 1
+        else:
+            raise AssertionError(f"unexpected RECORD error log: {line}")
+    if counts != {"unexpected": unexpected, "noscript": noscript}:
+        raise AssertionError(f"RECORD expected error log counts: {counts}")
+
+
+def test_record(
+    binary: pathlib.Path, module: pathlib.Path, root: pathlib.Path, port: int, case: str
+) -> None:
+    check, record = scripts(
+        pathlib.Path(__file__).resolve().parents[2]
+        / "src/ngx_http_error_abuse_module.c"
+    )
+    threshold, replies, unexpected_logs, noscript_logs = record_scenario(case)
+    for identity, reply in enumerate(replies, 1):
+        reply.request_id = f"record-{identity}"
+    peer = RecordPeer(check, record, threshold)
+    peer.start()
+    nginx = Nginx(binary, module, root, port, "", False, peer.port)
+    try:
+        (root / "conf").mkdir(parents=True)
+        (root / "logs").mkdir()
+        (root / "conf/nginx.conf").write_text(
+            f"""load_module {module};
+worker_processes 1;
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log debug;
+events {{ worker_connections 64; }}
+http {{
+    log_format protocol '$arg_request $status';
+    access_log {root}/access.log protocol;
+    error_abuse_redis host=127.0.0.1 port={peer.port} prefix=ea02-get: timeout=1s;
+    error_abuse_zone zone=get:1m key=$arg_client statuses=404 interval=60s
+        threshold={threshold} block=60s inactive=120s redis=on;
+    server {{
+        listen 127.0.0.1:{port};
+        location = /record.gif {{ error_abuse zone=get; return 404; }}
+        location = /health.gif {{ empty_gif; }}
+        location = /stats {{ error_abuse_stats get; }}
+    }}
+}}
+""",
+            encoding="ascii",
+        )
+        error_path = root / "logs/error.log"
+        access_path = root / "access.log"
+
+        def log():
+            return error_path.read_text(encoding="ascii", errors="replace")
+
+        with mock.patch.object(nginx, "write_config"):
+            nginx.start()
+        peer.wait(peer.primed, "initial RECORD SCRIPT LOAD pair")
+        fetch(port, "/health.gif")
+        assert nginx.process is not None
+        children = (
+            pathlib.Path(f"/proc/{nginx.process.pid}/task/{nginx.process.pid}/children")
+            .read_text(encoding="ascii")
+            .split()
+        )
+        if len(children) != 1:
+            raise AssertionError("RECORD fixture requires exactly one normal worker")
+        proc = pathlib.Path(f"/proc/{children[0]}")
+        baseline = wait_until(
+            lambda: worker_fds(proc, port), "RECORD warmup socket did not close", peer
+        )
+        redis_inodes = set()
+        for line in (proc / "net/tcp").read_text().splitlines()[1:]:
+            fields = line.split()
+            if int(fields[2].split(":")[1], 16) == peer.port:
+                redis_inodes.add(f"socket:[{fields[9]}]")
+        redis_fds = [fd for fd, value in baseline.items() if value in redis_inodes]
+        if len(redis_fds) != 1:
+            raise AssertionError("RECORD connected Redis fd identity")
+        disconnected = {
+            fd: value for fd, value in baseline.items() if fd not in redis_fds
+        }
+
+        evidence_rows = []
+        for identity, reply in enumerate(replies, 1):
+            peer.prepare(reply)
+            before = record_stats(port)
+            offset = len(log())
+            status, _ = fetch(
+                port,
+                f"/record.gif?client={reply.identity}&request={reply.request_id}",
+            )
+            if status != 404:
+                raise AssertionError(f"RECORD counted response status: {status}")
+            peer.wait(reply.received, "ten-element RECORD EVALSHA")
+            wait_until(
+                lambda reply=reply: (
+                    access_path.exists()
+                    and f"{reply.request_id} 404\n" in access_path.read_text()
+                ),
+                "RECORD HTTP completion before callback",
+                peer,
+            )
+            assert_one_completion(
+                access_path.read_text().splitlines(), reply.request_id, "404"
+            )
+            wait_until(
+                lambda: worker_fds(proc, port) == baseline,
+                "RECORD worker fd drift before callback",
+                peer,
+            )
+            rows = record_states(log())
+            if not any(
+                row["where"] == "queue" and row["id"] == identity for row in rows
+            ):
+                raise AssertionError("RECORD queue observer missing")
+            if any(
+                row["where"] == "callback" and row["id"] == identity for row in rows
+            ):
+                raise AssertionError("RECORD callback preceded HTTP completion")
+            if events(log()[offset:]):
+                raise AssertionError("RECORD callback acquired request lifecycle")
+
+            reply.release.set()
+            peer.wait(reply.sent, "RECORD reply release")
+            wait_until(
+                lambda identity=identity: any(
+                    row["where"] == "callback" and row["id"] == identity
+                    for row in record_states(log())
+                ),
+                "RECORD callback observer missing",
+                peer,
+            )
+            callback = assert_record_callback(log(), reply, identity)
+            if events(log()[offset:]):
+                raise AssertionError("RECORD callback resumed or finalized request")
+            peer.wait(reply.finished, "RECORD callback/reload settlement")
+            if reply.reload:
+                peer.wait(reply.reloaded, "record-only NOSCRIPT reload")
+            after = record_stats(port)
+            if after["bans"] - before["bans"] != reply.delta:
+                if reply.armed == 1:
+                    raise AssertionError("RECORD armed_now ban-counter effect")
+                raise AssertionError("RECORD exact ban-counter effect")
+            evidence_rows.append(
+                {
+                    "identity": reply.identity,
+                    "request": reply.request_id,
+                    "local": reply.local,
+                    "delta": reply.delta,
+                    "callback": callback,
+                    "vector_hex": [value.hex() for value in peer.record_vectors[-1]],
+                }
+            )
+
+        if case == "null":
+            wait_until(
+                lambda: worker_fds(proc, port) == disconnected,
+                "RECORD NULL fd settlement",
+                peer,
+            )
+            final = wait_until(
+                lambda: next(
+                    (
+                        row
+                        for row in reversed(script_states(log()))
+                        if row["where"] == "drained"
+                    ),
+                    None,
+                ),
+                "RECORD NULL adapter drain",
+                peer,
+            )
+            assert_resources(final, False)
+        else:
+
+            def idle():
+                script = script_states(log())
+                get = states(log())
+                return (
+                    script
+                    and get
+                    and script[-1]["where"] == "timeout"
+                    and not any(
+                        get[-1][key] for key in ("pending", "tokens", "parked", "timer")
+                    )
+                    and script[-1]
+                )
+
+            final = wait_until(idle, "RECORD idle timer did not settle", peer)
+            assert_resources(final, True)
+            wait_until(
+                lambda: worker_fds(proc, port) == baseline,
+                "RECORD final worker fd drift",
+                peer,
+            )
+        if peer.sessions != 1:
+            raise AssertionError("RECORD same-session reuse")
+        if len(peer.record_vectors) != len(replies):
+            raise AssertionError("RECORD exact FIFO command count")
+        expected_history = 2 + len(replies) + sum(reply.reload for reply in replies)
+        if len(peer.history) != expected_history:
+            raise AssertionError("RECORD lost-event no-replay history")
+        peer.check()
+        combined_log = log() + nginx.output_path.read_text()
+        clean_record_logs(combined_log, unexpected_logs, noscript_logs)
+        evidence = {
+            "case": case,
+            "sessions": peer.sessions,
+            "worker": children[0],
+            "history_hex": [[value.hex() for value in row] for row in peer.history],
+            "record_states": record_states(log()),
+            "get_states": states(log()),
+            "rows": evidence_rows,
+            "fd_connected": baseline,
+            "fd_disconnected": disconnected,
+        }
+        (root / "record-evidence.json").write_text(
+            json.dumps(evidence, indent=2) + "\n"
+        )
+    finally:
+        try:
+            nginx.stop()
+        finally:
+            peer.stop()
+    clean_record_logs(
+        log() + nginx.output_path.read_text(), unexpected_logs, noscript_logs
+    )
+    print(f"OK: RECORD {case}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nginx-binary", type=pathlib.Path, required=True)
     parser.add_argument("--module", type=pathlib.Path, required=True)
     parser.add_argument("--root", type=pathlib.Path, required=True)
     parser.add_argument("--port", type=int, default=18968)
-    parser.add_argument("--family", choices=("script",), required=True)
+    parser.add_argument("--family", choices=("script", "record"), required=True)
     parser.add_argument(
         "--case",
-        choices=("whole", "error-check", "error-record", "error-split"),
+        choices=(
+            "whole",
+            "errors",
+            "noscript",
+            "null",
+            "error-check",
+            "error-record",
+            "error-split",
+        ),
         required=True,
     )
     args = parser.parse_args()
-    test_script(
-        args.nginx_binary.resolve(),
-        args.module.resolve(),
-        args.root.resolve(),
-        args.port,
-        args.case,
-    )
+    if args.family == "script":
+        if args.case in ("errors", "noscript", "null"):
+            parser.error(f"case {args.case} is not valid for SCRIPT")
+        test_script(
+            args.nginx_binary.resolve(),
+            args.module.resolve(),
+            args.root.resolve(),
+            args.port,
+            args.case,
+        )
+    else:
+        if args.case.startswith("error-"):
+            parser.error(f"case {args.case} is not valid for RECORD")
+        test_record(
+            args.nginx_binary.resolve(),
+            args.module.resolve(),
+            args.root.resolve(),
+            args.port,
+            args.case,
+        )
 
 
 if __name__ == "__main__":
