@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Causal malformed/negative controls for SCRIPT fixture and live oracles."""
+"""Causal malformed/negative controls for SCRIPT and RECORD fixtures."""
 
 import copy
 import dataclasses
@@ -15,15 +15,24 @@ from test_runtime_get import Reply, block_key, digest, scripts
 from test_runtime_protocol import (
     ERROR,
     FIELDS,
+    RECORD_FIELDS,
     ErrorContext,
+    RecordPeer,
+    RecordReply,
     ScriptPeer,
     assert_error_post,
     assert_fds,
     assert_ledger,
+    assert_record_callback,
     assert_resources,
     capture_error_snapshot,
     clean_logs,
     error_snapshot_evidence,
+    integer_reply,
+    read_record_command,
+    record_keys,
+    record_scenario,
+    record_states,
     script_states,
 )
 
@@ -61,6 +70,19 @@ def whole():
 
 
 EXPECTED = [(1, 1, b"a" * 40), (2, 1, b"b" * 40)]
+
+
+def record_row(where, **changes):
+    values = dict.fromkeys(RECORD_FIELDS, 0)
+    values.update(gen=1, ready=1, connected=1, armed=-1)
+    values.update(changes)
+    return (
+        "EA_RECORD state="
+        + where
+        + " "
+        + " ".join(f"{key}={values[key]}" for key in RECORD_FIELDS)
+        + "\n"
+    )
 
 
 class Oracles(unittest.TestCase):
@@ -446,6 +468,135 @@ class Fixture(unittest.TestCase):
             self.assertRaisesRegex(
                 AssertionError, "missing error-prefix-consumed acknowledgement"
             ),
+        ):
+            self.peer.serve(io.BytesIO())
+
+
+class RecordOracles(unittest.TestCase):
+    def setUp(self):
+        self.reply = RecordReply(
+            "armed", integer_reply(1, 1, 2_000_000_000, 1), 0, 1, 4, armed=1
+        )
+        self.valid = record_row(
+            "queue", id=1, queued=1, called=0, outstanding=1, local=0
+        ) + record_row(
+            "callback",
+            id=1,
+            queued=1,
+            called=1,
+            local=0,
+            type=2,
+            elements=4,
+            armed=1,
+            bans=1,
+            delta=1,
+        )
+
+    def test_armed_now_ban_counter_control_is_named_and_causal(self):
+        self.assertEqual(assert_record_callback(self.valid, self.reply, 1)["delta"], 1)
+        with self.assertRaisesRegex(
+            AssertionError, "RECORD armed_now ban-counter effect"
+        ):
+            assert_record_callback(
+                self.valid.replace("delta=1", "delta=0"), self.reply, 1
+            )
+
+    def test_record_ledger_rejects_identity_generation_wrapper_and_shape(self):
+        alterations = (
+            self.valid.replace("state=queue", "state=missing", 1),
+            self.valid.replace("state=callback", "state=missing", 1),
+            self.valid + self.valid.splitlines(keepends=True)[1],
+            self.valid.replace("gen=1", "gen=2", 1),
+            self.valid.replace("outstanding=1", "outstanding=0", 1),
+            self.valid.replace("called=1", "called=0", 1),
+            self.valid.replace("local=0", "local=1", 1),
+            self.valid.replace("type=2", "type=6", 1),
+            self.valid.replace("elements=4", "elements=3", 1),
+            self.valid.replace("armed=1", "armed=0", 1),
+        )
+        for altered in alterations:
+            with self.subTest(altered=altered), self.assertRaises(AssertionError):
+                assert_record_callback(altered, self.reply, 1)
+        self.assertEqual(len(record_states(self.valid)), 2)
+
+    def test_record_scenarios_cover_current_legacy_error_noscript_and_null(self):
+        threshold, whole_replies, unexpected, noscript = record_scenario("whole")
+        self.assertEqual((threshold, unexpected, noscript), (2, 0, 0))
+        self.assertEqual(
+            [reply.elements for reply in whole_replies], [4, 4, 4, 4, 2, 2, 3, 3]
+        )
+        self.assertEqual({reply.local for reply in whole_replies}, {0, 1})
+        self.assertEqual({reply.armed for reply in whole_replies[:4]}, {0, 1})
+        threshold, errors, unexpected, _ = record_scenario("errors")
+        self.assertEqual(threshold, 1)
+        self.assertEqual(sum(reply.unexpected for reply in errors), unexpected)
+        self.assertGreater(unexpected, 0)
+        _, noscript_replies, _, noscript = record_scenario("noscript")
+        self.assertEqual(noscript, 1)
+        self.assertTrue(noscript_replies[0].reload)
+        self.assertIsNone(record_scenario("null")[1][0].wire)
+
+
+class RecordFixture(unittest.TestCase):
+    def setUp(self):
+        self.scripts = scripts(
+            pathlib.Path(__file__).resolve().parents[2]
+            / "src/ngx_http_error_abuse_module.c"
+        )
+        self.peer = RecordPeer(*self.scripts, threshold=2, ack_timeout=0.01)
+        self.reply = RecordReply(
+            "record-vector", integer_reply(0, 1, 0, 0), 0, 0, 4, armed=0
+        )
+        event_key, blocked_key = record_keys(self.reply.identity)
+        self.vector = [
+            b"EVALSHA",
+            digest(self.scripts[1]),
+            b"2",
+            event_key,
+            blocked_key,
+            b"60000",
+            b"2",
+            b"60000",
+            b"120000",
+            b"123:1",
+        ]
+
+    def test_bounded_ten_element_decoder(self):
+        wire = command(*self.vector)
+        self.assertEqual(read_record_command(io.BytesIO(wire)), self.vector)
+        for malformed in (
+            command(*self.vector[:-1]),
+            b"*10\r\n$1\r\na\r\n",
+            b"*10\r\n$+1\r\na\r\n",
+            b"*10\r\n$5000\r\n" + b"a" * 5000 + b"\r\n",
+            wire[:-1],
+        ):
+            with self.subTest(malformed=malformed[:80]), self.assertRaises(ValueError):
+                read_record_command(io.BytesIO(malformed))
+
+    def test_exact_record_vector_and_nonce_controls(self):
+        self.peer.record_vector(self.vector, self.reply)
+        for index in range(9):
+            mutated = list(self.vector)
+            mutated[index] = b"wrong"
+            with self.subTest(index=index), self.assertRaises(AssertionError):
+                self.peer.record_vector(mutated, self.reply)
+        for nonce in (b"bad", b"124:1", b"123:2", b"123:0"):
+            mutated = [*self.vector[:9], nonce]
+            with self.subTest(nonce=nonce), self.assertRaises(AssertionError):
+                self.peer.record_vector(mutated, self.reply)
+
+    def test_record_peer_requires_callback_release(self):
+        self.peer.current = self.reply
+        with (
+            mock.patch(
+                "test_runtime_protocol.read_command",
+                side_effect=[[b"SCRIPT", b"LOAD", script] for script in self.scripts],
+            ),
+            mock.patch(
+                "test_runtime_protocol.read_record_command", return_value=self.vector
+            ),
+            self.assertRaisesRegex(AssertionError, "missing RECORD callback release"),
         ):
             self.peer.serve(io.BytesIO())
 
