@@ -7,7 +7,9 @@ import io
 import math
 import pathlib
 import re
+import signal
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -34,10 +36,14 @@ from test_runtime_protocol import (
     clean_logs,
     coalesced_callbacks,
     coalesced_drain,
+    coalesced_drain_order,
     coalesced_fds,
     coalesced_final_idle,
+    coalesced_http,
     coalesced_position,
     coalesced_prefix,
+    coalesced_receive_queue,
+    coalesced_release,
     error_snapshot_evidence,
     integer_reply,
     read_record_command,
@@ -957,7 +963,8 @@ class CoalescedControls(unittest.TestCase):
         first = b"$-1\r\n"
         last = integer_reply(1, 10, 1234567890, 1)
         split = len(last) - 1
-        pos, task = coalesced_position(last, split)
+        pos, task = 27, 1
+        self.assertEqual(coalesced_position(last, split), (pos, task))
         base = {"length": 94, "pos": 94, "bytes": (b"b" * 32).hex()}
         prefix = first + last[:split]
         callback = "EA_COALESCE get id=3 kind=4 failures=0\n"
@@ -1018,6 +1025,175 @@ class CoalescedControls(unittest.TestCase):
         final = coalesced_final_idle(end + get + script, 9)
         self.assertEqual(final["get"]["where"], "timeout")
         self.assertEqual(final["script"]["where"], "timeout")
+
+    def test_native_read_boundary_and_oversized_partial_handler(self):
+        begin = "EA_DRAIN begin id=7 fd=11 command=AA timer=1 due=100 reconnect=BB retry=0\n"
+        end = (
+            "EA_DRAIN end id=7 fd=-1 command=AA timer=1 due=100 reconnect=BB retry=0\n"
+        )
+        first = "EA_COALESCE get id=1 kind=1 failures=0\n"
+        second = "EA_COALESCE get id=2 kind=4 failures=0\n"
+        complete = reader_row("read", pending=0, tokens=0, parked=0)
+        partial = reader_row("read", length=16384, pos=1, pending=1)
+        expected = [("get", "1", 1, 0), ("get", "2", 4, 0)]
+        whole = begin + first + second + complete + end
+        self.assertIsNotNone(coalesced_drain(whole, expected))
+        self.assertIsNone(
+            coalesced_drain(begin + first + partial + second + complete + end, expected)
+        )
+        large = begin + partial + first + second + complete + end
+        self.assertIsNotNone(coalesced_drain(large, expected, require_partial=True))
+        for bad in (
+            whole,
+            begin + partial + end + whole,
+            begin + first + partial + second + complete + end,
+            begin + partial + first + partial + second + complete + end,
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(coalesced_drain(bad, expected, require_partial=True))
+
+    def test_latest_timeout_pair_cannot_borrow_clean_get(self):
+        get = reader_row("timeout", pending=0, tokens=0, parked=0, timer=0)
+        script = row("timeout", timer=0)
+        end = (
+            "EA_DRAIN end id=9 fd=-1 command=AA timer=1 due=100 reconnect=BB retry=0\n"
+        )
+        for key in ("pending", "tokens", "parked", "timer"):
+            stale = get.replace(f"{key}=0", f"{key}=1")
+            with self.subTest(key=key):
+                self.assertIsNone(
+                    coalesced_final_idle(end + get + script + stale + script, 9)
+                )
+        self.assertIsNone(coalesced_final_idle(end + get + script + get, 9))
+        latest = coalesced_final_idle(
+            end + get + script + get + script.replace("gen=1", "gen=2"), 9
+        )
+        self.assertEqual(latest["script"]["gen"], 2)
+        self.assertIsNone(coalesced_final_idle(end + script, 9))
+
+    def test_one_complete_http_response_only(self):
+        frame = CoalescedFrame("get", "x", b"$-1\r\n")
+        valid = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ngif"
+        for response in (valid, valid.replace(b"HTTP/1.1", b"HTTP/1.0")):
+            client = mock.Mock()
+            client.recv.side_effect = [response[:17], response[17:], b""]
+            coalesced_http(client, frame)
+            client.close.assert_called_once()
+        for response in (
+            valid + valid,
+            valid + b"H",
+            valid[:-1],
+            valid.replace(b"200", b"429"),
+            valid.replace(b"Content-Length: 3", b"Content-Length: bad"),
+            valid.replace(
+                b"Content-Length: 3", b"Content-Length: 3\r\nContent-Length: 3"
+            ),
+            valid.replace(b"Content-Length: 3", b"Transfer-Encoding: chunked"),
+            b"HTTP/1.1 200 OK\r\n",
+            b"",
+        ):
+            client = mock.Mock()
+            client.recv.side_effect = [response, b""]
+            with (
+                self.subTest(response=response),
+                self.assertRaisesRegex(AssertionError, "HTTP outcome/framing"),
+            ):
+                coalesced_http(client, frame)
+            client.close.assert_called_once()
+
+    def test_drain_ids_increase_across_batches_and_split_suffix(self):
+        previous = None
+        for current in (7, 9, 20, 21):
+            previous = coalesced_drain_order(previous, current)
+        for previous, current in ((7, 7), (9, 7), (20, 20), (21, 20)):
+            with (
+                self.subTest(previous=previous, current=current),
+                self.assertRaisesRegex(AssertionError, "increase strictly"),
+            ):
+                coalesced_drain_order(previous, current)
+
+    def test_full_receive_queue_uses_exact_inode_and_length(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = pathlib.Path(directory)
+            (proc / "net").mkdir()
+            tcp = proc / "net/tcp"
+            for inode, state, queued, accepted in (
+                ("42", "01", 20, True),
+                ("43", "01", 20, False),
+                ("42", "01", 19, False),
+                ("42", "01", 0, False),
+                ("42", "08", 20, False),
+            ):
+                tcp.write_text(
+                    f"header\n0: local remote {state} 00000000:{queued:08X} 0 0 0 0 {inode}\n"
+                )
+                self.assertEqual(
+                    bool(coalesced_receive_queue(proc, "socket:[42]", 20)), accepted
+                )
+            tcp.write_text("header\n0: local remote 01 00000000:00000015 0 0 0 0 42\n")
+            with self.assertRaisesRegex(AssertionError, "unexpected receive queue"):
+                coalesced_receive_queue(proc, "socket:[42]", 20)
+            tcp.write_text("header\n")
+            self.assertIsNone(coalesced_receive_queue(proc, "socket:[42]", 20))
+
+    def test_receive_gate_waits_for_delivery_and_resumes_on_error(self):
+        batch = CoalescedBatch([CoalescedFrame("get", "x", b"$-1\r\n")])
+        peer = mock.Mock()
+        receipt = {"inode": "socket:[42]", "queued": 5}
+
+        def wait(predicate, *args):
+            result = predicate()
+            if not result:
+                result = predicate()
+            if not result:
+                raise AssertionError("COALESCE full receive queue missing")
+            return result
+
+        for observations, success in (([None, receipt], True), ([None, None], False)):
+            batch.release.clear()
+            with (
+                mock.patch("test_runtime_protocol.os.kill") as kill,
+                mock.patch(
+                    "pathlib.Path.read_text", return_value="State:\tT (stopped)\n"
+                ),
+                mock.patch("test_runtime_protocol.wait_until", side_effect=wait),
+                mock.patch(
+                    "test_runtime_protocol.coalesced_receive_queue",
+                    side_effect=observations,
+                ) as queue,
+            ):
+                if success:
+                    self.assertEqual(
+                        coalesced_release(
+                            pathlib.Path("/proc/123"), "socket:[42]", batch, peer
+                        ),
+                        receipt,
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        AssertionError, "full receive queue missing"
+                    ):
+                        coalesced_release(
+                            pathlib.Path("/proc/123"), "socket:[42]", batch, peer
+                        )
+                self.assertTrue(batch.release.is_set())
+                self.assertEqual(queue.call_count, 2)
+                self.assertEqual(
+                    kill.call_args_list,
+                    [mock.call(123, signal.SIGSTOP), mock.call(123, signal.SIGCONT)],
+                )
+
+    def test_receive_gate_rejects_invalid_pid_without_signal(self):
+        for pid in ("0", "1", "-1", "2147483648"):
+            with (
+                self.subTest(pid=pid),
+                mock.patch("test_runtime_protocol.os.kill") as kill,
+                self.assertRaisesRegex(AssertionError, "invalid owned worker PID"),
+            ):
+                coalesced_release(
+                    pathlib.Path("/proc") / pid, "socket:[42]", None, None
+                )
+            kill.assert_not_called()
 
     def test_peer_requires_each_ack_and_exact_vectors(self):
         scripts_ = (b"check", b"record")

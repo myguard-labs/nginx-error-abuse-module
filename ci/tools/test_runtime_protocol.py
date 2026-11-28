@@ -13,9 +13,11 @@ import argparse
 import dataclasses
 import io
 import json
+import os
 import pathlib
 import re
 import select
+import signal
 import socket
 import threading
 import time
@@ -1586,7 +1588,7 @@ def coalesced_callbacks(log):
     return rows
 
 
-def coalesced_drain(log, expected):
+def coalesced_drain(log, expected, require_partial=False):
     """Require the complete ordered callbacks inside one actual read handler."""
     for match in re.finditer(
         r"EA_DRAIN begin id=(\d+) fd=(\d+) command=(\S+) timer=([01]) due=(\d+) reconnect=(\S+) retry=([01])",
@@ -1599,7 +1601,7 @@ def coalesced_drain(log, expected):
         if end is None:
             continue
         body = log[match.end() : match.end() + end.start()]
-        if coalesced_callbacks(body) != expected:
+        if "EA_DRAIN begin" in body or coalesced_callbacks(body) != expected:
             continue
         begin_timer, begin_due = int(match[4]), int(match[5])
         end_timer, end_due = int(end[2]), int(end[3])
@@ -1614,6 +1616,26 @@ def coalesced_drain(log, expected):
         readers = [row for row in states(body) if row["where"] == "read"]
         if not readers:
             raise AssertionError("COALESCE missing post-hiredis drain witness")
+        # Each post-hiredis snapshot ends one redisAsyncHandleRead/recv call.
+        # A callback-only handler witness cannot prove a native read boundary.
+        iterations = []
+        start = 0
+        for reader in re.finditer(r"EA_GET state=read[^\n]*", body):
+            iterations.append(coalesced_callbacks(body[start : reader.start()]))
+            start = reader.end()
+        if coalesced_callbacks(body[start:]):
+            continue
+        if require_partial:
+            if (
+                len(readers) < 2
+                or iterations[0]
+                or readers[0]["length"] <= readers[0]["pos"]
+                or readers[0]["pending"] != 1
+                or expected not in iterations[1:]
+            ):
+                continue
+        elif expected not in iterations:
+            continue
         return {
             "id": int(match[1]),
             "fd": int(match[2]),
@@ -1634,16 +1656,71 @@ def coalesced_final_idle(log, drain_id):
     if marker is None:
         return None
     tail = log[marker.end() :]
-    get_rows = [
-        row
-        for row in states(tail)
-        if row["where"] == "timeout"
-        and all(row[key] == 0 for key in ("pending", "tokens", "parked", "timer"))
-    ]
-    script_rows = [row for row in script_states(tail) if row["where"] == "timeout"]
-    if not get_rows or not script_rows:
+    # Snapshot emits GET then SCRIPT in the same timeout callback. Pair before
+    # filtering, so a stale latest GET cannot borrow an earlier clean state.
+    latest = None
+    pending = None
+    for line in tail.splitlines():
+        if "EA_GET state=timeout " in line:
+            pending = states(line)[0]
+        elif "EA_SCRIPT state=timeout " in line and pending is not None:
+            latest = {"get": pending, "script": script_states(line)[0]}
+            pending = None
+    if (
+        latest is None
+        or pending is not None
+        or any(latest["get"][key] for key in ("pending", "tokens", "parked", "timer"))
+    ):
         return None
-    return {"get": get_rows[-1], "script": script_rows[-1]}
+    return latest
+
+
+def coalesced_drain_order(previous, current):
+    if previous is not None and current <= previous:
+        raise AssertionError("COALESCE drain IDs must increase strictly")
+    return current
+
+
+def coalesced_receive_queue(proc, inode, expected):
+    """Observe the full batch on the exact worker-owned Redis socket."""
+    for line in (proc / "net/tcp").read_text().splitlines()[1:]:
+        fields = line.split()
+        if f"socket:[{fields[9]}]" == inode and fields[3] == "01":
+            queued = int(fields[4].split(":")[1], 16)
+            if queued > expected:
+                raise AssertionError("COALESCE unexpected receive queue bytes")
+            if queued == expected:
+                return {"inode": inode, "queued": queued}
+    return None
+
+
+def coalesced_release(proc, inode, batch, peer):
+    """Hold the owned worker until TCP has delivered the whole unsplit batch."""
+    pid = int(proc.name)
+    if not 1 < pid <= 2147483647:
+        raise AssertionError("COALESCE invalid owned worker PID")
+    os.kill(pid, signal.SIGSTOP)
+    try:
+        wait_until(
+            lambda: re.search(
+                r"^State:\s+T", (proc / "status").read_text(), re.MULTILINE
+            ),
+            "COALESCE worker did not stop",
+            peer,
+            0.6,
+        )
+        batch.release.set()
+        peer.wait(batch.sent, "COALESCE one write")
+        return wait_until(
+            lambda: coalesced_receive_queue(
+                proc, inode, sum(len(frame.wire) for frame in batch.frames)
+            ),
+            "COALESCE full receive queue missing",
+            peer,
+            0.6,
+        )
+    finally:
+        os.kill(pid, signal.SIGCONT)
 
 
 def coalesced_fds(actual, baseline, pending):
@@ -1773,11 +1850,29 @@ def coalesced_http(client, frame):
         if not chunk:
             break
         response += chunk
-    if not response.startswith(
-        f"HTTP/1.1 {frame.status} ".encode()
-    ) and not response.startswith(f"HTTP/1.0 {frame.status} ".encode()):
-        raise AssertionError("COALESCE GET FIFO HTTP outcome")
-    client.close()
+    try:
+        header, body = response.split(b"\r\n\r\n", 1)
+        lines = header.split(b"\r\n")
+        status = lines[0].split(b" ", 2)
+        lengths = [
+            line.split(b":", 1)[1].strip()
+            for line in lines[1:]
+            if line.lower().startswith(b"content-length:")
+        ]
+        if (
+            len(status) != 3
+            or status[0] not in (b"HTTP/1.0", b"HTTP/1.1")
+            or status[1] != str(frame.status).encode()
+            or len(lengths) != 1
+            or not lengths[0].isdigit()
+            or len(body) != int(lengths[0])
+            or any(line.lower().startswith(b"transfer-encoding:") for line in lines[1:])
+        ):
+            raise ValueError("invalid response framing/status")
+    except ValueError as error:
+        raise AssertionError("COALESCE GET FIFO HTTP outcome/framing") from error
+    finally:
+        client.close()
 
 
 def test_coalesced(binary, module, root, port, case, split=0):
@@ -1860,6 +1955,7 @@ http {{
         all_expected = []
         connection_identity = None
         timer_identity = None
+        previous_drain = None
         get_ids = []
         for batch in batches:
             offset = len(log())
@@ -1925,8 +2021,14 @@ http {{
             )
             if base["length"] != base["pos"]:
                 raise AssertionError("COALESCE prior reader not at frame boundary")
-            batch.release.set()
-            peer.wait(batch.sent, "COALESCE one write")
+            receive = None
+            if batch.split:
+                batch.release.set()
+                peer.wait(batch.sent, "COALESCE one write")
+            else:
+                receive = coalesced_release(
+                    proc, baseline[str(redis_fds[0])], batch, peer
+                )
             prefix = None
             drains = []
             if batch.split:
@@ -2023,7 +2125,9 @@ http {{
             else:
                 drain = wait_until(
                     lambda offset=offset, expected=expected: coalesced_drain(
-                        log()[offset:], expected
+                        log()[offset:],
+                        expected,
+                        require_partial=case == "drain" and len(evidence) == 1,
                     ),
                     "COALESCE single-drain FIFO progress missing",
                     peer,
@@ -2033,6 +2137,7 @@ http {{
                 raise AssertionError("COALESCE suffix drain witness missing")
             drains.append(drain)
             for observed in drains:
+                previous_drain = coalesced_drain_order(previous_drain, observed["id"])
                 identity = (
                     observed["fd"],
                     observed["command"],
@@ -2116,6 +2221,7 @@ http {{
                     "expected": expected,
                     "drain": drain,
                     "prefix": prefix,
+                    "receive": receive,
                     "split": batch.split,
                 }
             )
