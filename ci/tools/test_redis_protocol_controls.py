@@ -1025,6 +1025,9 @@ class CoalescedControls(unittest.TestCase):
         final = coalesced_final_idle(end + get + script, 9)
         self.assertEqual(final["get"]["where"], "timeout")
         self.assertEqual(final["script"]["where"], "timeout")
+        self.assertIsNone(
+            coalesced_final_idle(end + get + script.replace("ready=1", "ready=0"), 9)
+        )
 
     def test_native_read_boundary_and_oversized_partial_handler(self):
         begin = "EA_DRAIN begin id=7 fd=11 command=AA timer=1 due=100 reconnect=BB retry=0\n"
@@ -1137,30 +1140,57 @@ class CoalescedControls(unittest.TestCase):
             self.assertIsNone(coalesced_receive_queue(proc, "socket:[42]", 20))
 
     def test_receive_gate_waits_for_delivery_and_resumes_on_error(self):
-        batch = CoalescedBatch([CoalescedFrame("get", "x", b"$-1\r\n")])
         peer = mock.Mock()
         receipt = {"inode": "socket:[42]", "queued": 5}
 
-        def wait(predicate, *args):
-            result = predicate()
-            if not result:
-                result = predicate()
-            if not result:
-                raise AssertionError("COALESCE full receive queue missing")
-            return result
+        for split, observations, success in (
+            (0, [None, receipt], True),
+            (0, [None, None], False),
+            (1, [None, receipt], True),
+            (1, [None, None], False),
+        ):
+            frames = [CoalescedFrame("get", "x", b"$-1\r\n")]
+            if split:
+                frames.append(CoalescedFrame("get", "y", b"$-1\r\n"))
+                receipt = {"inode": "socket:[42]", "queued": 6}
+                observations = [receipt if item else None for item in observations]
+            batch = CoalescedBatch(frames, split)
+            events = []
+            replies = iter(observations)
 
-        for observations, success in (([None, receipt], True), ([None, None], False)):
-            batch.release.clear()
+            def wait(predicate, *args, events=events):
+                result = predicate()
+                if not result:
+                    result = predicate()
+                if not result:
+                    events.append("wait-failed")
+                    raise AssertionError("COALESCE full receive queue missing")
+                return result
+
+            def poll(
+                proc, inode, expected, split=split, replies=replies, events=events
+            ):
+                self.assertEqual(
+                    (proc, inode, expected),
+                    (pathlib.Path("/proc/123"), "socket:[42]", 6 if split else 5),
+                )
+                result = next(replies)
+                events.append("full" if result else "partial")
+                return result
+
             with (
-                mock.patch("test_runtime_protocol.os.kill") as kill,
+                self.subTest(split=split, success=success),
+                mock.patch(
+                    "test_runtime_protocol.os.kill",
+                    side_effect=lambda pid, sig, events=events: events.append(sig),
+                ),
                 mock.patch(
                     "pathlib.Path.read_text", return_value="State:\tT (stopped)\n"
                 ),
                 mock.patch("test_runtime_protocol.wait_until", side_effect=wait),
                 mock.patch(
-                    "test_runtime_protocol.coalesced_receive_queue",
-                    side_effect=observations,
-                ) as queue,
+                    "test_runtime_protocol.coalesced_receive_queue", side_effect=poll
+                ),
             ):
                 if success:
                     self.assertEqual(
@@ -1177,10 +1207,15 @@ class CoalescedControls(unittest.TestCase):
                             pathlib.Path("/proc/123"), "socket:[42]", batch, peer
                         )
                 self.assertTrue(batch.release.is_set())
-                self.assertEqual(queue.call_count, 2)
                 self.assertEqual(
-                    kill.call_args_list,
-                    [mock.call(123, signal.SIGSTOP), mock.call(123, signal.SIGCONT)],
+                    events,
+                    [
+                        signal.SIGSTOP,
+                        "partial",
+                        "full" if success else "partial",
+                        *([] if success else ["wait-failed"]),
+                        signal.SIGCONT,
+                    ],
                 )
 
     def test_receive_gate_rejects_invalid_pid_without_signal(self):

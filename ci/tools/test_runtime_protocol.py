@@ -1669,6 +1669,7 @@ def coalesced_final_idle(log, drain_id):
     if (
         latest is None
         or pending is not None
+        or latest["script"]["ready"] != 1
         or any(latest["get"][key] for key in ("pending", "tokens", "parked", "timer"))
     ):
         return None
@@ -1695,10 +1696,13 @@ def coalesced_receive_queue(proc, inode, expected):
 
 
 def coalesced_release(proc, inode, batch, peer):
-    """Hold the owned worker until TCP has delivered the whole unsplit batch."""
+    """Hold the owned worker until TCP has delivered the complete sent prefix."""
     pid = int(proc.name)
     if not 1 < pid <= 2147483647:
         raise AssertionError("COALESCE invalid owned worker PID")
+    expected = sum(len(frame.wire) for frame in batch.frames)
+    if batch.split:
+        expected -= len(batch.frames[-1].wire) - batch.split
     os.kill(pid, signal.SIGSTOP)
     try:
         wait_until(
@@ -1712,9 +1716,7 @@ def coalesced_release(proc, inode, batch, peer):
         batch.release.set()
         peer.wait(batch.sent, "COALESCE one write")
         return wait_until(
-            lambda: coalesced_receive_queue(
-                proc, inode, sum(len(frame.wire) for frame in batch.frames)
-            ),
+            lambda: coalesced_receive_queue(proc, inode, expected),
             "COALESCE full receive queue missing",
             peer,
             0.6,
@@ -2021,14 +2023,7 @@ http {{
             )
             if base["length"] != base["pos"]:
                 raise AssertionError("COALESCE prior reader not at frame boundary")
-            receive = None
-            if batch.split:
-                batch.release.set()
-                peer.wait(batch.sent, "COALESCE one write")
-            else:
-                receive = coalesced_release(
-                    proc, baseline[str(redis_fds[0])], batch, peer
-                )
+            receive = coalesced_release(proc, baseline[str(redis_fds[0])], batch, peer)
             prefix = None
             drains = []
             if batch.split:
