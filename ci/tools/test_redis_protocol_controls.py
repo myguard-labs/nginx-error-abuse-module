@@ -6,6 +6,8 @@ import dataclasses
 import io
 import math
 import pathlib
+import re
+import sys
 import threading
 import unittest
 from unittest import mock
@@ -30,10 +32,17 @@ from test_runtime_protocol import (
     error_snapshot_evidence,
     integer_reply,
     read_record_command,
+    record_fd_baseline,
     record_keys,
+    record_prefix_state,
+    record_reader_position,
     record_scenario,
+    record_split_frames,
     record_states,
     script_states,
+)
+from test_runtime_protocol import (
+    main as protocol_main,
 )
 
 
@@ -537,6 +546,258 @@ class RecordOracles(unittest.TestCase):
         self.assertIsNone(record_scenario("null")[1][0].wire)
 
 
+def reader_row(where, **changes):
+    values = {
+        "length": 94,
+        "pos": 94,
+        "task": 0,
+        "pending": 1,
+        "tokens": 0,
+        "parked": 0,
+        "timer": 1,
+        "bytes": "",
+    }
+    values.update(changes)
+    return (
+        f"EA_GET state={where} len={values['length']} pos={values['pos']} "
+        + " ".join(
+            f"{key}={values[key]}"
+            for key in ("task", "pending", "tokens", "parked", "timer", "bytes")
+        )
+        + "\n"
+    )
+
+
+class RecordPrefixes(unittest.TestCase):
+    def setUp(self):
+        self.reply = RecordReply(
+            "prefix",
+            integer_reply(1, 9223372036854775807, 9223372036854775807, 1),
+            0,
+            1,
+            4,
+            armed=1,
+            split=35,
+        )
+        self.queue = record_row("queue", id=2, queued=2, called=1, outstanding=1)
+        self.base = reader_row("record_queue")
+
+    def prefix(self, reply):
+        position, task = record_reader_position(reply.wire, reply.split)
+        return reader_row(
+            "read",
+            length=94 + reply.split,
+            pos=94 + position,
+            task=task,
+            bytes=reply.wire[: reply.split][-32:].hex(),
+        )
+
+    def test_frozen_frames_every_internal_position_and_tail(self):
+        frames = record_split_frames()
+        self.assertEqual({frame.elements for frame in frames}, {2, 3, 4})
+        self.assertEqual(
+            {(frame.local, frame.armed) for frame in frames if frame.elements == 4},
+            {(0, 0), (0, 1), (1, 0), (1, 1)},
+        )
+        for frame in frames:
+            for split in range(1, len(frame.wire)):
+                frame.split = split
+                accepted = record_prefix_state(
+                    self.queue + self.base + self.prefix(frame), frame, 2
+                )
+                self.assertEqual(accepted["split"], split)
+                self.assertEqual(accepted["wire_hex"], frame.wire.hex())
+        wire = integer_reply(0, 1)
+        for split, expected in (
+            (1, (1, 0)),
+            (3, (1, 0)),
+            (4, (4, 1)),
+            (5, (5, 1)),
+            (7, (5, 1)),
+            (8, (8, 1)),
+            (9, (9, 1)),
+            (11, (9, 1)),
+        ):
+            self.assertEqual(record_reader_position(wire, split), expected)
+        for split in (-1, 0, len(wire), len(wire) + 1):
+            with self.assertRaisesRegex(AssertionError, "invalid RECORD"):
+                record_reader_position(wire, split)
+        for wire in (b"*2\r\n:0\r\n", b"*1\r\n:0\r\n", b"*2\r\n+x\r\n:1\r\n"):
+            with self.assertRaisesRegex(AssertionError, "invalid RECORD"):
+                record_reader_position(wire, 1)
+
+    def test_aggregate_tail_without_exact_epoch_and_reader_state_rejects(self):
+        prefix = self.prefix(self.reply)
+        for key, value in (
+            ("length", 35),
+            ("length", 130),
+            ("pos", 94),
+            ("task", -1),
+            ("pending", 0),
+            ("timer", 0),
+            ("tokens", 1),
+            ("parked", 1),
+            ("bytes", "00"),
+        ):
+            # Change only the named field of the genuine live-reader-shaped row.
+            field = "len" if key == "length" else key
+            altered = re.sub(rf"{field}=[^ \n]*", f"{field}={value}", prefix)
+            with self.subTest(key=key, value=value):
+                self.assertIsNone(
+                    record_prefix_state(self.queue + self.base + altered, self.reply, 2)
+                )
+        self.assertIsNone(record_prefix_state(self.queue + self.base, self.reply, 2))
+        for base in (
+            "",
+            self.base + self.base,
+            self.base.replace("pos=94", "pos=93"),
+            self.base.replace("task=0", "task=1"),
+            self.base.replace("pending=1", "pending=0"),
+            self.base.replace("tokens=0", "tokens=1"),
+            self.base.replace("parked=0", "parked=1"),
+        ):
+            with self.subTest(base=base), self.assertRaises(AssertionError):
+                record_prefix_state(self.queue + base + prefix, self.reply, 2)
+
+    def test_pending_owner_generation_callback_and_lifecycle_controls(self):
+        prefix = self.base + self.prefix(self.reply)
+        for queue in (
+            self.queue.replace("id=2", "id=1"),
+            self.queue.replace("gen=1", "gen=2"),
+            self.queue.replace("called=1", "called=2"),
+            self.queue.replace("outstanding=1", "outstanding=0"),
+            self.queue.replace("nulls=0", "nulls=1"),
+            self.queue + record_row("callback"),
+            self.queue + self.queue,
+        ):
+            with (
+                self.subTest(queue=queue),
+                self.assertRaisesRegex(AssertionError, "pending callback"),
+            ):
+                record_prefix_state(queue + prefix, self.reply, 2)
+        with self.assertRaisesRegex(AssertionError, "request lifecycle"):
+            record_prefix_state(
+                self.queue + prefix + "EA_GET resume id=1\n", self.reply, 2
+            )
+
+
+class RecordBaseline(unittest.TestCase):
+    def test_stale_then_settled_baseline(self):
+        settled = {"4": "socket:[redis]", "6": "socket:[listener]"}
+        stale = {**settled, "3": "socket:[closed-http]"}
+        with mock.patch(
+            "test_runtime_protocol.worker_fds",
+            side_effect=[stale, settled, settled, settled],
+        ) as snapshots:
+            self.assertIsNone(
+                record_fd_baseline(pathlib.Path("/worker"), 1234),
+                "RECORD phantom HTTP fd became baseline",
+            )
+            self.assertEqual(record_fd_baseline(pathlib.Path("/worker"), 1234), settled)
+        self.assertEqual(snapshots.call_count, 4)
+
+    def test_incomplete_or_never_settled_baseline_rejects(self):
+        settled = {"4": "socket:[redis]"}
+        stale = {**settled, "3": "socket:[closed-http]"}
+        for observations in (
+            [None],
+            [settled, None],
+            [stale, settled],
+            [settled, stale],
+        ):
+            with (
+                self.subTest(observations=observations),
+                mock.patch(
+                    "test_runtime_protocol.worker_fds", side_effect=observations
+                ),
+            ):
+                self.assertIsNone(
+                    record_fd_baseline(pathlib.Path("/worker"), 1234),
+                    "RECORD unstable fd baseline accepted",
+                )
+
+
+class ProtocolSelectors(unittest.TestCase):
+    def test_family_case_dispatch(self):
+        for family, case, selected in (
+            ("record", "splits", "test_record_splits"),
+            ("record", "whole", "test_record"),
+            ("script", "whole", "test_script"),
+        ):
+            with (
+                self.subTest(family=family, case=case),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "protocol",
+                        "--nginx-binary",
+                        "/binary",
+                        "--module",
+                        "/module",
+                        "--root",
+                        "/case",
+                        "--family",
+                        family,
+                        "--case",
+                        case,
+                    ],
+                ),
+                mock.patch("test_runtime_protocol.test_record") as record,
+                mock.patch("test_runtime_protocol.test_record_splits") as splits,
+                mock.patch("test_runtime_protocol.test_script") as script,
+            ):
+                protocol_main()
+                methods = {
+                    "test_record": record,
+                    "test_record_splits": splits,
+                    "test_script": script,
+                }
+                methods.pop(selected).assert_called_once()
+                for other in methods.values():
+                    other.assert_not_called()
+                self.assertEqual(
+                    (
+                        record
+                        if family == "record" and case == "whole"
+                        else splits
+                        if case == "splits"
+                        else script
+                    ).call_args.args[:4],
+                    (
+                        pathlib.Path("/binary"),
+                        pathlib.Path("/module"),
+                        pathlib.Path("/case"),
+                        18968,
+                    ),
+                )
+
+    def test_record_splits_are_not_script_credit(self):
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "protocol",
+                    "--nginx-binary",
+                    "/binary",
+                    "--module",
+                    "/module",
+                    "--root",
+                    "/case",
+                    "--family",
+                    "script",
+                    "--case",
+                    "splits",
+                ],
+            ),
+            mock.patch("sys.stderr", new_callable=io.StringIO),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            protocol_main()
+        self.assertEqual(stopped.exception.code, 2)
+
+
 class RecordFixture(unittest.TestCase):
     def setUp(self):
         self.scripts = scripts(
@@ -599,6 +860,24 @@ class RecordFixture(unittest.TestCase):
             self.assertRaisesRegex(AssertionError, "missing RECORD callback release"),
         ):
             self.peer.serve(io.BytesIO())
+
+    def test_record_peer_requires_consumption_before_suffix(self):
+        self.reply.split = 1
+        self.reply.release.set()
+        self.peer.current = self.reply
+        with (
+            mock.patch(
+                "test_runtime_protocol.read_command",
+                side_effect=[[b"SCRIPT", b"LOAD", script] for script in self.scripts],
+            ),
+            mock.patch(
+                "test_runtime_protocol.read_record_command", return_value=self.vector
+            ),
+            self.assertRaisesRegex(AssertionError, "prefix-consumed acknowledgement"),
+        ):
+            self.peer.serve(io.BytesIO())
+        self.assertTrue(self.reply.sent.is_set())
+        self.assertFalse(self.reply.finished.is_set())
 
 
 if __name__ == "__main__":

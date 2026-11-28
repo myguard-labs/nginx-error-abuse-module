@@ -4466,6 +4466,10 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
         bans = ngx_http_error_abuse_test_record_bans(ctx->zone);
         ngx_http_error_abuse_test_record_snapshot("queue", local_armed, NULL,
                                                    bans, bans);
+        /* Establish the completed previous frame before the peer releases
+         * any record bytes; CI derives frame-relative decoder state from it. */
+        ngx_http_error_abuse_test_get_snapshot(
+            &ngx_http_error_abuse_redis_worker.adapter, "record_queue");
     }
 #endif
 

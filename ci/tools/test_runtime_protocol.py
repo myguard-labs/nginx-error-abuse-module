@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live initial SCRIPT and RECORD-WHOLE protocol controls.
+"""Live initial SCRIPT and record protocol controls.
 
 Only the existing GET helpers decode commands and witness request ownership.
 SCRIPT replies are released one at a time after the previous live callback is
@@ -422,6 +422,9 @@ class RecordReply:
     delta: int
     elements: int
     request_id: str = ""
+    split: int = 0
+    after_idle: bool = False
+    suffix: threading.Event = dataclasses.field(default_factory=threading.Event)
     armed: int = -1
     reply_type: int = 2
     reload: bool = False
@@ -507,7 +510,20 @@ class RecordPeer(GetPeer):
                 self.notify(reply.sent)
                 self.notify(reply.finished)
                 return
-            stream.write(reply.wire)
+            if reply.split:
+                record_reader_position(reply.wire, reply.split)
+                stream.write(reply.wire[: reply.split])
+                stream.flush()
+                self.notify(reply.sent)
+                if not reply.suffix.wait(self.ack_timeout):
+                    raise AssertionError(
+                        "missing RECORD prefix-consumed acknowledgement"
+                    )
+                if self.stopping.is_set():
+                    return
+                stream.write(reply.wire[reply.split :])
+            else:
+                stream.write(reply.wire)
             stream.flush()
             self.notify(reply.sent)
             if reply.reload:
@@ -520,6 +536,138 @@ class RecordPeer(GetPeer):
                 stream.flush()
                 self.notify(reply.reloaded)
             self.notify(reply.finished)
+
+    def stop(self) -> None:
+        self.stopping.set()
+        if isinstance(self.current, RecordReply):
+            self.current.suffix.set()
+        super().stop()
+
+
+def record_reader_position(wire: bytes, split: int) -> tuple[int, int]:
+    """Pinned hiredis integer-array decoder: type byte, then CRLF line.
+
+    Do not derive consumed position from the observed reader. At an incomplete
+    line hiredis has consumed its type byte, and leaves the line unconsumed.
+    The array header uses task 0; integer children use task 1.
+    """
+    if not 0 < split < len(wire) or not re.fullmatch(
+        rb"\*[234]\r\n(?::[0-9]+\r\n){2,4}", wire
+    ):
+        raise AssertionError("invalid RECORD frame/internal split")
+    if int(wire[1:2]) != wire.count(b":"):
+        raise AssertionError("invalid RECORD integer-array arity")
+    offset = 0
+    task = 0
+    while offset < split:
+        end = wire.index(b"\r\n", offset) + 2
+        if end > split:
+            return offset + 1, task
+        offset = end
+        task = 1
+    return offset, task
+
+
+def record_prefix_state(log: str, reply: RecordReply, identity: int) -> dict | None:
+    """Require a fresh record-owned decoder epoch and exact consumed prefix."""
+    if reply.wire is None:
+        raise AssertionError("RECORD NULL has no prefix")
+    position, task = record_reader_position(reply.wire, reply.split)
+    readers = states(log)
+    bases = [state for state in readers if state["where"] == "record_queue"]
+    if len(bases) != 1:
+        raise AssertionError("RECORD unique frame reader baseline")
+    base = bases[0]
+    if (
+        base["length"] != base["pos"]
+        or base["task"] != 0
+        or base["pending"] != 1
+        or base["tokens"] != 0
+        or base["parked"] != 0
+    ):
+        raise AssertionError("RECORD previous frame not acknowledged complete")
+    rows = record_states(log)
+    if len(rows) != 1 or (
+        rows[0]["where"],
+        rows[0]["gen"],
+        rows[0]["id"],
+        rows[0]["queued"],
+        rows[0]["called"],
+        rows[0]["outstanding"],
+        rows[0]["nulls"],
+    ) != ("queue", 1, identity, identity, identity - 1, 1, 0):
+        raise AssertionError("RECORD prefix must retain one pending callback")
+    if events(log):
+        raise AssertionError("RECORD prefix acquired request lifecycle")
+    prefix = reply.wire[: reply.split]
+    for state in readers:
+        if (
+            state["where"] == "read"
+            and state["length"] - base["length"] == len(prefix)
+            and state["pos"] - base["pos"] == position
+            and state["task"] == task
+            and state["pending"] == state["timer"] == 1
+            and state["tokens"] == state["parked"] == 0
+            and state["bytes"].endswith(prefix[-32:].hex())
+        ):
+            return {
+                "base": base,
+                "prefix": state,
+                "frame_pos": position,
+                "split": reply.split,
+                "wire_hex": reply.wire.hex(),
+            }
+    return None
+
+
+def record_split_frames() -> list[RecordReply]:
+    """Frozen two/three/four-integer boundary frames and accounting owners."""
+    maximum = 9_223_372_036_854_775_807
+    return [
+        RecordReply("two-unarmed", integer_reply(0, maximum), 0, 0, 2),
+        RecordReply("two-local", integer_reply(1, maximum), 1, 1, 2),
+        RecordReply("three-unarmed", integer_reply(0, maximum, maximum), 0, 0, 3),
+        RecordReply("three-local", integer_reply(1, maximum, maximum), 1, 1, 3),
+        RecordReply("four-unarmed", integer_reply(0, maximum, 0, 0), 0, 0, 4, armed=0),
+        RecordReply(
+            "four-remote", integer_reply(1, maximum, maximum, 1), 0, 1, 4, armed=1
+        ),
+        RecordReply(
+            "four-local-zero", integer_reply(1, maximum, maximum, 0), 1, 0, 4, armed=0
+        ),
+        RecordReply(
+            "four-local-one", integer_reply(1, maximum, maximum, 1), 1, 1, 4, armed=1
+        ),
+    ]
+
+
+def test_record_splits(binary, module, root, port):
+    root.mkdir(parents=True)
+    census = []
+    for frame in record_split_frames():
+        assert frame.wire is not None
+        for split in range(1, len(frame.wire)):
+            selected = RecordReply(
+                frame.identity,
+                frame.wire,
+                frame.local,
+                frame.delta,
+                frame.elements,
+                armed=frame.armed,
+                split=split,
+            )
+            case_root = root / f"{frame.identity}-{split}"
+            test_record(binary, module, case_root, port, "splits", selected)
+            census.append(
+                {
+                    "frame": frame.identity,
+                    "split": split,
+                    "wire_hex": frame.wire.hex(),
+                    "root": str(case_root),
+                }
+            )
+    (root / "split-census.json").write_text(json.dumps(census, indent=2) + "\n")
+    print(f"OK: RECORD every internal split ({len(census)} cases)", flush=True)
 
 
 def assert_record_callback(log: str, reply: RecordReply, identity: int) -> dict:
@@ -973,6 +1121,14 @@ def record_scenario(case: str) -> tuple[int, list[RecordReply], int, int]:
     return 1, replies, len(malformed), 0
 
 
+def record_fd_baseline(proc: pathlib.Path, port: int) -> dict[str, str] | None:
+    """Reject an HTTP fd closed between descriptor and TCP-table snapshots."""
+    first = worker_fds(proc, port)
+    if first is not None and first == worker_fds(proc, port):
+        return first
+    return None
+
+
 def record_stats(port: int) -> dict[str, int]:
     status, _, body = http_call(port, "/stats")
     if status != 200:
@@ -998,13 +1154,45 @@ def clean_record_logs(log: str, unexpected: int, noscript: int) -> None:
 
 
 def test_record(
-    binary: pathlib.Path, module: pathlib.Path, root: pathlib.Path, port: int, case: str
+    binary: pathlib.Path,
+    module: pathlib.Path,
+    root: pathlib.Path,
+    port: int,
+    case: str,
+    selected: RecordReply | None = None,
 ) -> None:
     check, record = scripts(
         pathlib.Path(__file__).resolve().parents[2]
         / "src/ngx_http_error_abuse_module.c"
     )
-    threshold, replies, unexpected_logs, noscript_logs = record_scenario(case)
+    if selected is None:
+        threshold, replies, unexpected_logs, noscript_logs = record_scenario(case)
+    else:
+        threshold, unexpected_logs, noscript_logs = 2, 0, 0
+        replies = []
+        if selected.local:
+            replies.append(
+                RecordReply(
+                    selected.identity, integer_reply(0, 1, 0, 0), 0, 0, 4, armed=0
+                )
+            )
+        replies.extend(
+            [
+                selected,
+                RecordReply(
+                    "reuse-before", integer_reply(0, 1, 0, 0), 0, 0, 4, armed=0
+                ),
+                RecordReply(
+                    "reuse-after",
+                    integer_reply(0, 1, 0, 0),
+                    0,
+                    0,
+                    4,
+                    armed=0,
+                    after_idle=True,
+                ),
+            ]
+        )
     for identity, reply in enumerate(replies, 1):
         reply.request_id = f"record-{identity}"
     peer = RecordPeer(check, record, threshold)
@@ -1045,6 +1233,14 @@ http {{
             nginx.start()
         peer.wait(peer.primed, "initial RECORD SCRIPT LOAD pair")
         fetch(port, "/health.gif")
+        wait_until(
+            lambda: any(
+                row["where"] == "post" and row["slot"] == 2
+                for row in script_states(log())
+            ),
+            "RECORD initial SCRIPT callbacks not acknowledged",
+            peer,
+        )
         assert nginx.process is not None
         children = (
             pathlib.Path(f"/proc/{nginx.process.pid}/task/{nginx.process.pid}/children")
@@ -1055,7 +1251,9 @@ http {{
             raise AssertionError("RECORD fixture requires exactly one normal worker")
         proc = pathlib.Path(f"/proc/{children[0]}")
         baseline = wait_until(
-            lambda: worker_fds(proc, port), "RECORD warmup socket did not close", peer
+            lambda: record_fd_baseline(proc, port),
+            "RECORD warmup socket did not close",
+            peer,
         )
         redis_inodes = set()
         for line in (proc / "net/tcp").read_text().splitlines()[1:]:
@@ -1069,8 +1267,27 @@ http {{
             fd: value for fd, value in baseline.items() if fd not in redis_fds
         }
 
+        def idle():
+            script = script_states(log())
+            get = states(log())
+            return (
+                script
+                and get
+                and script[-1]["where"] == "timeout"
+                and not any(
+                    get[-1][key] for key in ("pending", "tokens", "parked", "timer")
+                )
+                and script[-1]
+            )
+
         evidence_rows = []
         for identity, reply in enumerate(replies, 1):
+            if reply.after_idle:
+                final = wait_until(
+                    idle, "RECORD pre-reuse idle timer did not settle", peer
+                )
+                assert_resources(final, True)
+                assert_fds(worker_fds(proc, port), baseline)
             peer.prepare(reply)
             before = record_stats(port)
             offset = len(log())
@@ -1111,6 +1328,23 @@ http {{
 
             reply.release.set()
             peer.wait(reply.sent, "RECORD reply release")
+            prefix = None
+            if reply.split:
+                prefix = wait_until(
+                    lambda offset=offset, reply=reply, identity=identity: (
+                        record_prefix_state(log()[offset:], reply, identity)
+                    ),
+                    "RECORD exact frame-relative prefix not consumed",
+                    peer,
+                    TIMEOUT * 0.6,
+                )
+                assert_fds(worker_fds(proc, port), baseline)
+                if record_stats(port)["bans"] != before["bans"]:
+                    raise AssertionError("RECORD prefix changed ban counter")
+                assert_one_completion(
+                    access_path.read_text().splitlines(), reply.request_id, "404"
+                )
+                reply.suffix.set()
             wait_until(
                 lambda identity=identity: any(
                     row["where"] == "callback" and row["id"] == identity
@@ -1120,11 +1354,44 @@ http {{
                 peer,
             )
             callback = assert_record_callback(log(), reply, identity)
+            if prefix is not None:
+
+                def consumed_frame(prefix=prefix, offset=offset, reply=reply):
+                    base = prefix["base"]
+                    return next(
+                        (
+                            state
+                            for state in states(log()[offset:])
+                            if state["where"] == "read"
+                            and state["length"] - base["length"] == len(reply.wire)
+                            and state["pos"] == state["length"]
+                            and state["task"] == 0
+                            and state["pending"] == 0
+                            and state["tokens"] == state["parked"] == 0
+                        ),
+                        None,
+                    )
+
+                prefix["complete"] = wait_until(
+                    consumed_frame, "RECORD suffix not consumed", peer
+                )
             if events(log()[offset:]):
                 raise AssertionError("RECORD callback resumed or finalized request")
             peer.wait(reply.finished, "RECORD callback/reload settlement")
             if reply.reload:
                 peer.wait(reply.reloaded, "record-only NOSCRIPT reload")
+            assert_one_completion(
+                access_path.read_text().splitlines(), reply.request_id, "404"
+            )
+            wait_until(
+                lambda reply=reply: (
+                    worker_fds(proc, port) == baseline
+                    if reply.wire is not None
+                    else worker_fds(proc, port) == disconnected
+                ),
+                "RECORD worker fd drift after callback",
+                peer,
+            )
             after = record_stats(port)
             if after["bans"] - before["bans"] != reply.delta:
                 if reply.armed == 1:
@@ -1137,6 +1404,8 @@ http {{
                     "local": reply.local,
                     "delta": reply.delta,
                     "callback": callback,
+                    "prefix": prefix,
+                    "after_idle": reply.after_idle,
                     "vector_hex": [value.hex() for value in peer.record_vectors[-1]],
                 }
             )
@@ -1161,20 +1430,6 @@ http {{
             )
             assert_resources(final, False)
         else:
-
-            def idle():
-                script = script_states(log())
-                get = states(log())
-                return (
-                    script
-                    and get
-                    and script[-1]["where"] == "timeout"
-                    and not any(
-                        get[-1][key] for key in ("pending", "tokens", "parked", "timer")
-                    )
-                    and script[-1]
-                )
-
             final = wait_until(idle, "RECORD idle timer did not settle", peer)
             assert_resources(final, True)
             wait_until(
@@ -1228,6 +1483,7 @@ def main() -> None:
         "--case",
         choices=(
             "whole",
+            "splits",
             "errors",
             "noscript",
             "null",
@@ -1239,7 +1495,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.family == "script":
-        if args.case in ("errors", "noscript", "null"):
+        if args.case in ("splits", "errors", "noscript", "null"):
             parser.error(f"case {args.case} is not valid for SCRIPT")
         test_script(
             args.nginx_binary.resolve(),
@@ -1251,13 +1507,16 @@ def main() -> None:
     else:
         if args.case.startswith("error-"):
             parser.error(f"case {args.case} is not valid for RECORD")
-        test_record(
+        arguments = (
             args.nginx_binary.resolve(),
             args.module.resolve(),
             args.root.resolve(),
             args.port,
-            args.case,
         )
+        if args.case == "splits":
+            test_record_splits(*arguments)
+        else:
+            test_record(*arguments, args.case)
 
 
 if __name__ == "__main__":
